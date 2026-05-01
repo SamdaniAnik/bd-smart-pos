@@ -27,6 +27,19 @@ function Reports() {
     rows: [],
     summary: { redeemedPoints: 0, redeemedAmount: 0, tierDiscountAmount: 0, count: 0 },
   });
+  const [vatSummary, setVatSummary] = useState({
+    from: null,
+    to: null,
+    salesCount: 0,
+    zeroVatSales: 0,
+    taxableSales: 0,
+    outputVat: 0,
+    grossSales: 0,
+    inputVatTracked: 0,
+    netVatPayable: 0,
+    note: "",
+  });
+  const [vatSalesRegister, setVatSalesRegister] = useState([]);
 
   useEffect(() => {
     const load = async () => {
@@ -39,16 +52,20 @@ function Reports() {
       const loyaltyUrl = settlementQuery.toString()
         ? `/sales/loyalty/redemptions?${settlementQuery.toString()}`
         : "/sales/loyalty/redemptions";
-      const [agingRes, stockRes, settlementRes, loyaltyRes] = await Promise.all([
+      const [agingRes, stockRes, settlementRes, loyaltyRes, vatSummaryRes, vatRegisterRes] = await Promise.all([
         api.get("/reports/aging"),
         api.get("/reports/stock-valuation"),
         api.get(settlementUrl),
         api.get(loyaltyUrl),
+        api.get(`/reports/vat/summary${settlementQuery.toString() ? `?${settlementQuery.toString()}` : ""}`),
+        api.get(`/reports/vat/sales-register${settlementQuery.toString() ? `?${settlementQuery.toString()}` : ""}`),
       ]);
       setAging(agingRes.data);
       setStockValuation(stockRes.data);
       setSettlement(settlementRes.data);
       setLoyaltyRedemptions(loyaltyRes.data);
+      setVatSummary(vatSummaryRes.data || {});
+      setVatSalesRegister(vatRegisterRes.data || []);
     };
     load();
   }, [settlementRange.from, settlementRange.to]);
@@ -86,6 +103,19 @@ function Reports() {
     const endpoints = {
       csv: ["/sales/loyalty/redemptions/export.csv", "loyalty-redemption-history.csv"],
       pdf: ["/sales/loyalty/redemptions/export.pdf", "loyalty-redemption-history.pdf"],
+    };
+    const [url, filename] = endpoints[type];
+    await exportCSV(`${url}${suffix}`, filename);
+  };
+
+  const exportVatSalesRegister = async (type) => {
+    const query = new URLSearchParams();
+    if (settlementRange.from) query.set("from", settlementRange.from);
+    if (settlementRange.to) query.set("to", settlementRange.to);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const endpoints = {
+      csv: ["/reports/vat/sales-register/export.csv", "vat-sales-register.csv"],
+      pdf: ["/reports/vat/sales-register/export.pdf", "vat-sales-register.pdf"],
     };
     const [url, filename] = endpoints[type];
     await exportCSV(`${url}${suffix}`, filename);
@@ -145,6 +175,12 @@ function Reports() {
         </button>
         <button onClick={() => exportLoyaltyRedemption("pdf")}>
           Export Loyalty Redemption PDF
+        </button>
+        <button onClick={() => exportVatSalesRegister("csv")}>
+          Export VAT Sales Register CSV
+        </button>
+        <button onClick={() => exportVatSalesRegister("pdf")}>
+          Export VAT Sales Register PDF
         </button>
       </div>
       <div className="form-grid" style={{ marginBottom: "12px" }}>
@@ -212,6 +248,38 @@ function Reports() {
         <div className="stat">Redeemed Amount: ৳{Number(loyaltyRedemptions.summary?.redeemedAmount || 0).toFixed(2)}</div>
         <div className="stat">Tier Discount: ৳{Number(loyaltyRedemptions.summary?.tierDiscountAmount || 0).toFixed(2)}</div>
       </div>
+      <div className="quick-stats" style={{ marginBottom: "12px" }}>
+        <div className="stat">VAT Sales Count: {Number(vatSummary.salesCount || 0)}</div>
+        <div className="stat">Taxable Sales: ৳{Number(vatSummary.taxableSales || 0).toFixed(2)}</div>
+        <div className="stat">Output VAT: ৳{Number(vatSummary.outputVat || 0).toFixed(2)}</div>
+        <div className="stat">Input VAT Tracked: ৳{Number(vatSummary.inputVatTracked || 0).toFixed(2)}</div>
+        <div className="stat">Net VAT Payable: ৳{Number(vatSummary.netVatPayable || 0).toFixed(2)}</div>
+      </div>
+      {vatSummary.note ? (
+        <div className="page-card" style={{ marginBottom: "12px" }}>
+          <strong>VAT Note:</strong> {vatSummary.note}
+        </div>
+      ) : null}
+      <DataTable
+        title="VAT Sales Register"
+        rows={vatSalesRegister.map((row) => ({
+          ...row,
+          taxableAmountLabel: `৳${Number(row.taxableAmount || 0).toFixed(2)}`,
+          vatAmountLabel: `৳${Number(row.vatAmount || 0).toFixed(2)}`,
+          grossAmountLabel: `৳${Number(row.grossAmount || 0).toFixed(2)}`,
+        }))}
+        searchableKeys={["invoiceNo", "date", "customer", "customerPhone"]}
+        columns={[
+          { key: "serial", label: "SL" },
+          { key: "invoiceNo", label: "Invoice" },
+          { key: "date", label: "Date" },
+          { key: "customer", label: "Customer" },
+          { key: "customerPhone", label: "Phone" },
+          { key: "taxableAmountLabel", label: "Taxable Amount" },
+          { key: "vatAmountLabel", label: "Output VAT" },
+          { key: "grossAmountLabel", label: "Gross Amount" },
+        ]}
+      />
       <DataTable
         title="Loyalty Redemption & Tier Discount History"
         rows={(loyaltyRedemptions.rows || []).map((row, idx) => ({

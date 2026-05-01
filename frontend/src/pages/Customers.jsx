@@ -14,7 +14,10 @@ function Customers() {
   };
 
   useEffect(() => {
-    load();
+    const timer = setTimeout(() => {
+      load();
+    }, 0);
+    return () => clearTimeout(timer);
   }, []);
 
   const submit = async (e) => {
@@ -75,15 +78,31 @@ function Customers() {
       </form>
       {selected ? (
         <div className="page-card" style={{ marginTop: 12 }}>
-          <h4>Customer Details</h4>
-          <p><strong>Name:</strong> {selected.name}</p>
-          <p><strong>Phone:</strong> {selected.phone || "-"}</p>
-          <p><strong>Address:</strong> {selected.address || "-"}</p>
-          <p><strong>Due:</strong> ৳{Number(selected.balance || 0).toFixed(2)}</p>
-          <p><strong>Credit limit:</strong> ৳{Number(selected.creditLimit || 0).toFixed(2)} {Number(selected.creditLimit || 0) <= 0 ? "(no limit)" : ""}</p>
-          <p><strong>Loyalty Points:</strong> {Number(selected.loyaltyPoints || 0).toFixed(0)}</p>
-          <p><strong>Loyalty Tier:</strong> {selected.loyaltyTier || "REGULAR"}</p>
-          <p><strong>Total Spent:</strong> ৳{Number(selected.loyaltyTotalSpent || 0).toFixed(2)}</p>
+          {(() => {
+            const creditLimit = Number(selected.creditLimit || 0);
+            const due = Number(selected.balance || 0);
+            const available = creditLimit > 0 ? Math.max(0, creditLimit - due) : null;
+            const usagePercent = creditLimit > 0 ? Math.min(100, (due / creditLimit) * 100) : null;
+            return (
+              <>
+                <h4>Customer Details</h4>
+                <p><strong>Name:</strong> {selected.name}</p>
+                <p><strong>Phone:</strong> {selected.phone || "-"}</p>
+                <p><strong>Address:</strong> {selected.address || "-"}</p>
+                <p><strong>Due:</strong> ৳{due.toFixed(2)}</p>
+                <p><strong>Credit limit:</strong> ৳{creditLimit.toFixed(2)} {creditLimit <= 0 ? "(no limit)" : ""}</p>
+                {creditLimit > 0 ? (
+                  <>
+                    <p><strong>Available credit:</strong> ৳{available.toFixed(2)}</p>
+                    <p><strong>Credit usage:</strong> {usagePercent.toFixed(1)}%</p>
+                  </>
+                ) : null}
+                <p><strong>Loyalty Points:</strong> {Number(selected.loyaltyPoints || 0).toFixed(0)}</p>
+                <p><strong>Loyalty Tier:</strong> {selected.loyaltyTier || "REGULAR"}</p>
+                <p><strong>Total Spent:</strong> ৳{Number(selected.loyaltyTotalSpent || 0).toFixed(2)}</p>
+              </>
+            );
+          })()}
         </div>
       ) : null}
       <DataTable
@@ -99,6 +118,26 @@ function Customers() {
             key: "creditLimit",
             label: "Credit cap",
             render: (v) => (Number(v || 0) > 0 ? `৳${Number(v).toFixed(2)}` : "∞"),
+          },
+          {
+            key: "creditRemaining",
+            label: "Available Credit",
+            render: (_, row) => {
+              const creditLimit = Number(row.creditLimit || 0);
+              const balance = Number(row.balance || 0);
+              if (creditLimit <= 0) return "∞";
+              return `৳${Math.max(0, creditLimit - balance).toFixed(2)}`;
+            },
+          },
+          {
+            key: "creditUsage",
+            label: "Credit Usage",
+            render: (_, row) => {
+              const creditLimit = Number(row.creditLimit || 0);
+              const balance = Number(row.balance || 0);
+              if (creditLimit <= 0) return "-";
+              return `${Math.min(100, (balance / creditLimit) * 100).toFixed(1)}%`;
+            },
           },
           { key: "loyaltyPoints", label: "Points", render: (v) => Number(v || 0).toFixed(0) },
           { key: "loyaltyTier", label: "Tier", render: (v) => v || "REGULAR" },

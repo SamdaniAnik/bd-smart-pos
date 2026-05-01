@@ -225,7 +225,13 @@ label {
   padding: 12px 10px 6px;
 }
 
-.app-nav button {
+.app-nav-row {
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+  gap: 2px;
+}
+.app-nav .nav-route-btn {
   text-align: left;
   background: transparent;
   color: #cbd5e1;
@@ -237,16 +243,38 @@ label {
   display: flex;
   align-items: center;
   gap: 10px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
 }
-.app-nav button:hover {
+.app-nav .nav-route-btn:hover {
   background: rgba(255, 255, 255, 0.06);
   color: #fff;
 }
-.app-nav button.active {
+.app-nav .nav-route-btn.active {
   background: rgba(59, 130, 246, 0.18);
   color: #fff;
   box-shadow: inset 2px 0 0 #3b82f6;
+}
+.app-nav .nav-pin-btn {
+  flex: 0 0 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+.app-nav .nav-pin-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fbbf24;
+}
+.app-nav .nav-pin-btn.pinned {
+  color: #fbbf24;
 }
 .app-nav .nav-icon {
   width: 18px;
@@ -813,6 +841,86 @@ label {
 .flex-gap { gap: 8px; }
 .flex-between { display: flex; align-items: center; justify-content: space-between; }
 
+/* ===================== Shortcuts modal ===================== */
+.shortcuts-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 2000;
+  padding: 16px;
+}
+.shortcuts-modal {
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  width: 100%;
+  max-width: 440px;
+  max-height: 85vh;
+  overflow: auto;
+  padding: 18px 20px;
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--border);
+}
+.shortcuts-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.shortcuts-modal-head h3 {
+  margin: 0;
+  font-size: 17px;
+}
+.shortcuts-intro {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 14px;
+}
+.shortcuts-section {
+  margin-bottom: 16px;
+}
+.shortcuts-section:last-child {
+  margin-bottom: 0;
+}
+.shortcuts-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.shortcuts-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.shortcuts-row:last-child {
+  border-bottom: 0;
+}
+.shortcuts-keys {
+  flex: 0 0 auto;
+  min-width: 120px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-soft);
+}
+.shortcuts-desc {
+  flex: 1;
+  color: var(--text);
+  line-height: 1.45;
+}
+
 /* ===================== Responsive ===================== */
 @media (max-width: 1024px) {
   .app-shell { grid-template-columns: 1fr; }
@@ -835,7 +943,9 @@ label {
     overflow-x: auto;
   }
   .app-nav .nav-section { display: none; }
-  .app-nav button { white-space: nowrap; padding: 6px 10px; }
+  .app-nav-row { flex-shrink: 0; }
+  .app-nav .nav-route-btn { white-space: nowrap; padding: 6px 10px; }
+  .app-nav .nav-pin-btn { flex: 0 0 26px; font-size: 13px; }
   .app-sidebar-footer { display: none; }
   .app-content { padding: 12px; }
   .app-topbar { padding: 8px 12px; }

@@ -3,6 +3,9 @@ const {
   getStockLedger,
   adjustStock,
   transferStock,
+  getStockTransfers,
+  getLowStockAlerts,
+  getTransferBranchProducts,
   getStockAdjustments,
   updateStockAdjustment,
   deleteStockAdjustment,
@@ -49,5 +52,8 @@ router.put("/stock-count/sessions/:id/items", requireAuth, requirePermission("in
 router.post("/stock-count/sessions/:id/recount", requireAuth, requirePermission("inventory.adjust"), recountStockCountSession);
 router.post("/stock-count/sessions/:id/finalize", requireAuth, requirePermission("inventory.adjust"), finalizeStockCountSession);
 router.post("/transfers", requireAuth, requirePermission("inventory.transfer"), transferStock);
+router.get("/transfers", requireAuth, requirePermission("inventory.view"), getStockTransfers);
+router.get("/transfers/branch-products/:branchId", requireAuth, requirePermission("inventory.transfer"), getTransferBranchProducts);
+router.get("/alerts/low-stock", requireAuth, requirePermission("inventory.view"), getLowStockAlerts);
 
 module.exports = router;

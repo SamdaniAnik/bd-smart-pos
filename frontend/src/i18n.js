@@ -20,6 +20,7 @@ export const dictionary = {
     salesReturns: "Sales Returns",
     quotations: "Quotations",
     roleManagement: "Role Management",
+    pinned: "Pinned",
   },
   bn: {
     appTitle: "বিডি স্মার্ট পস এন্টারপ্রাইজ",
@@ -42,6 +43,7 @@ export const dictionary = {
     salesReturns: "বিক্রয় রিটার্ন",
     quotations: "কোটেশন",
     roleManagement: "রোল ম্যানেজমেন্ট",
+    pinned: "পিন করা",
   },
 };
 

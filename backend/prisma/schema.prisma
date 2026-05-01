@@ -1,0 +1,418 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id            Int            @id @default(autoincrement())
+  branchId      Int
+  categoryId    Int?
+  taxProfileId  Int?
+  name          String
+  price         Float
+  stock         Int            @default(0)
+  reorderLevel  Int            @default(0)
+  category      String?
+  sku           String?
+  vatRate       Float          @default(0)
+  defaultDiscountType  String?
+  defaultDiscountValue Float    @default(0)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  saleItems     SaleItem[]
+  branch        Branch         @relation(fields: [branchId], references: [id])
+  categoryRef   ProductCategory? @relation(fields: [categoryId], references: [id])
+  taxProfile    TaxProfile?    @relation(fields: [taxProfileId], references: [id])
+  purchaseItems PurchaseItem[]
+  stockLedger   StockLedger[]
+  stockTransferFrom StockTransferItem[] @relation("TransferFromProduct")
+  stockTransferTo   StockTransferItem[] @relation("TransferToProduct")
+  saleReturnItems SaleReturnItem[]
+
+  @@unique([branchId, sku])
+}
+
+model Sale {
+  id             Int          @id @default(autoincrement())
+  branchId       Int
+  cashierId      Int?
+  invoiceNo      String?
+  subTotal       Float        @default(0)
+  vatAmount      Float        @default(0)
+  discount       Float        @default(0)
+  total          Float
+  paidAmount     Float        @default(0)
+  dueAmount      Float        @default(0)
+  paymentMethod  String       @default("Cash")
+  paymentChannel String?
+  notes          String?
+  customerId     Int?
+  status         String       @default("completed")
+  createdAt      DateTime     @default(now())
+
+  branch         Branch       @relation(fields: [branchId], references: [id])
+  cashier        User?        @relation(fields: [cashierId], references: [id])
+  customer       Customer?    @relation(fields: [customerId], references: [id])
+  items          SaleItem[]
+  journals       Journal[]
+  returns        SaleReturn[]
+
+  @@unique([branchId, invoiceNo])
+}
+
+model SaleItem {
+  id        Int      @id @default(autoincrement())
+  saleId    Int
+  productId Int
+  qty       Int
+  price     Float
+  cost      Float    @default(0)
+  sale      Sale     @relation(fields: [saleId], references: [id])
+  product   Product  @relation(fields: [productId], references: [id])
+}
+
+model Customer {
+  id             Int         @id @default(autoincrement())
+  branchId       Int
+  name           String
+  phone          String?
+  address        String?
+  balance        Float       @default(0)
+  creditLimit    Float       @default(0) // 0 = unlimited; >0 = max outstanding balance
+  createdAt      DateTime    @default(now())
+  branch    Branch      @relation(fields: [branchId], references: [id])
+  sales     Sale[]
+  receipts  ReceiptVoucher[]
+}
+
+model Branch {
+  id           Int              @id @default(autoincrement())
+  code         String           @unique
+  name         String
+  address      String?
+  phone        String?
+  isActive     Boolean          @default(true)
+  createdAt    DateTime         @default(now())
+  users        User[]
+  products     Product[]
+  sales        Sale[]
+  customers    Customer[]
+  suppliers    Supplier[]
+  purchases    Purchase[]
+  warehouses   Warehouse[]
+  registers    CashRegister[]
+  journals     Journal[]
+  expenses     Expense[]
+  accounts     Account[]
+  stockAdjustments StockAdjustment[]
+  stockTransfersFrom StockTransfer[] @relation("TransferFromBranch")
+  stockTransfersTo   StockTransfer[] @relation("TransferToBranch")
+  taxProfiles   TaxProfile[]
+}
+
+model Role {
+  id           Int              @id @default(autoincrement())
+  name         String           @unique
+  users        User[]
+  rolePermissions RolePermission[]
+}
+
+model Permission {
+  id            Int             @id @default(autoincrement())
+  code          String          @unique
+  description   String?
+  rolePermissions RolePermission[]
+}
+
+model RolePermission {
+  id           Int         @id @default(autoincrement())
+  roleId       Int
+  permissionId Int
+  role         Role        @relation(fields: [roleId], references: [id])
+  permission   Permission  @relation(fields: [permissionId], references: [id])
+
+  @@unique([roleId, permissionId])
+}
+
+model User {
+  id            Int              @id @default(autoincrement())
+  branchId      Int
+  roleId        Int
+  name          String
+  email         String           @unique
+  passwordHash  String
+  language      String           @default("en")
+  isActive      Boolean          @default(true)
+  createdAt     DateTime         @default(now())
+  branch        Branch           @relation(fields: [branchId], references: [id])
+  role          Role             @relation(fields: [roleId], references: [id])
+  sales         Sale[]
+  shifts        Shift[]
+  journals      Journal[]
+  expenses      Expense[]
+  auditLogs     AuditLog[]
+}
+
+model Shift {
+  id            Int         @id @default(autoincrement())
+  branchId      Int
+  userId        Int
+  registerId    Int
+  openedAt      DateTime    @default(now())
+  closedAt      DateTime?
+  openingCash   Float       @default(0)
+  closingCash   Float?
+  user          User        @relation(fields: [userId], references: [id])
+  register      CashRegister @relation(fields: [registerId], references: [id])
+}
+
+model CashRegister {
+  id            Int         @id @default(autoincrement())
+  branchId      Int
+  name          String
+  branch        Branch      @relation(fields: [branchId], references: [id])
+  shifts        Shift[]
+}
+
+model Warehouse {
+  id            Int           @id @default(autoincrement())
+  branchId      Int
+  name          String
+  branch        Branch        @relation(fields: [branchId], references: [id])
+  stockLedgers  StockLedger[]
+}
+
+model StockLedger {
+  id            Int           @id @default(autoincrement())
+  branchId      Int
+  warehouseId   Int?
+  productId     Int
+  refType       String
+  refId         Int?
+  inQty         Int           @default(0)
+  outQty        Int           @default(0)
+  unitCost      Float         @default(0)
+  createdAt     DateTime      @default(now())
+  product       Product       @relation(fields: [productId], references: [id])
+  warehouse     Warehouse?    @relation(fields: [warehouseId], references: [id])
+}
+
+model StockTransfer {
+  id              Int                @id @default(autoincrement())
+  fromBranchId    Int
+  toBranchId      Int
+  status          String             @default("draft")
+  createdAt       DateTime           @default(now())
+  fromBranch      Branch             @relation("TransferFromBranch", fields: [fromBranchId], references: [id])
+  toBranch        Branch             @relation("TransferToBranch", fields: [toBranchId], references: [id])
+  items           StockTransferItem[]
+}
+
+model StockTransferItem {
+  id              Int       @id @default(autoincrement())
+  transferId      Int
+  fromProductId   Int
+  toProductId     Int
+  qty             Int
+  transfer        StockTransfer @relation(fields: [transferId], references: [id])
+  fromProduct     Product   @relation("TransferFromProduct", fields: [fromProductId], references: [id])
+  toProduct       Product   @relation("TransferToProduct", fields: [toProductId], references: [id])
+}
+
+model StockAdjustment {
+  id              Int        @id @default(autoincrement())
+  branchId        Int
+  productId       Int
+  qtyChange       Int
+  reason          String
+  createdAt       DateTime   @default(now())
+  branch          Branch     @relation(fields: [branchId], references: [id])
+}
+
+model Supplier {
+  id              Int            @id @default(autoincrement())
+  branchId        Int
+  name            String
+  phone           String?
+  address         String?
+  payableBalance  Float          @default(0)
+  createdAt       DateTime       @default(now())
+  branch          Branch         @relation(fields: [branchId], references: [id])
+  purchases       Purchase[]
+  payments        PaymentVoucher[]
+}
+
+model Purchase {
+  id              Int            @id @default(autoincrement())
+  branchId        Int
+  supplierId      Int
+  invoiceNo       String?
+  total           Float
+  paidAmount      Float          @default(0)
+  dueAmount       Float          @default(0)
+  createdAt       DateTime       @default(now())
+  branch          Branch         @relation(fields: [branchId], references: [id])
+  supplier        Supplier       @relation(fields: [supplierId], references: [id])
+  items           PurchaseItem[]
+  journals        Journal[]
+  returns         PurchaseReturn[]
+
+  @@unique([branchId, invoiceNo])
+}
+
+model PurchaseItem {
+  id              Int       @id @default(autoincrement())
+  purchaseId      Int
+  productId       Int
+  qty             Int
+  cost            Float
+  purchase        Purchase  @relation(fields: [purchaseId], references: [id])
+  product         Product   @relation(fields: [productId], references: [id])
+}
+
+model PurchaseReturn {
+  id              Int       @id @default(autoincrement())
+  purchaseId      Int
+  amount          Float
+  reason          String?
+  createdAt       DateTime  @default(now())
+  purchase        Purchase  @relation(fields: [purchaseId], references: [id])
+}
+
+model SaleReturn {
+  id              Int              @id @default(autoincrement())
+  saleId          Int
+  amount          Float
+  reason          String?
+  createdAt       DateTime         @default(now())
+  sale            Sale             @relation(fields: [saleId], references: [id])
+  items           SaleReturnItem[]
+}
+
+model SaleReturnItem {
+  id              Int         @id @default(autoincrement())
+  saleReturnId    Int
+  productId       Int
+  qty             Int
+  amount          Float
+  saleReturn      SaleReturn  @relation(fields: [saleReturnId], references: [id])
+  product         Product     @relation(fields: [productId], references: [id])
+}
+
+model ProductCategory {
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  name            String
+  products        Product[]
+}
+
+model TaxProfile {
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  name            String
+  rate            Float
+  branch          Branch    @relation(fields: [branchId], references: [id])
+  products        Product[]
+}
+
+model FiscalPeriod {
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  name            String
+  startDate       DateTime
+  endDate         DateTime
+  isClosed        Boolean   @default(false)
+}
+
+model Account {
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  code            String
+  name            String
+  type            String
+  isSystem        Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  branch          Branch    @relation(fields: [branchId], references: [id])
+  journalLines    JournalLine[]
+
+  @@unique([branchId, code])
+}
+
+model Journal {
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  saleId          Int?
+  purchaseId      Int?
+  createdBy       Int?
+  refType         String
+  refId           Int?
+  narration       String?
+  createdAt       DateTime  @default(now())
+  branch          Branch    @relation(fields: [branchId], references: [id])
+  sale            Sale?     @relation(fields: [saleId], references: [id])
+  purchase        Purchase? @relation(fields: [purchaseId], references: [id])
+  creator         User?     @relation(fields: [createdBy], references: [id])
+  lines           JournalLine[]
+}
+
+model Expense {
+  id            Int       @id @default(autoincrement())
+  branchId      Int
+  createdBy     Int?
+  category      String
+  description   String?
+  amount        Float
+  paymentMethod String    @default("Cash")
+  expenseDate   DateTime
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  branch        Branch    @relation(fields: [branchId], references: [id])
+  creator       User?     @relation(fields: [createdBy], references: [id])
+}
+
+model JournalLine {
+  id              Int       @id @default(autoincrement())
+  journalId       Int
+  accountId       Int
+  debit           Float     @default(0)
+  credit          Float     @default(0)
+  journal         Journal   @relation(fields: [journalId], references: [id])
+  account         Account   @relation(fields: [accountId], references: [id])
+}
+
+model PaymentVoucher {
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  supplierId      Int?
+  amount          Float
+  method          String
+  note            String?
+  createdAt       DateTime  @default(now())
+  supplier        Supplier? @relation(fields: [supplierId], references: [id])
+}
+
+model ReceiptVoucher {
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  customerId      Int?
+  amount          Float
+  method          String
+  note            String?
+  createdAt       DateTime  @default(now())
+  customer        Customer? @relation(fields: [customerId], references: [id])
+}
+
+model AuditLog {
+  id              Int       @id @default(autoincrement())
+  userId          Int?
+  action          String
+  entity          String
+  entityId        Int?
+  payload         Json?
+  createdAt       DateTime  @default(now())
+  user            User?     @relation(fields: [userId], references: [id])
+}

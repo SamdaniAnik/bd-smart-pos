@@ -1,0 +1,183 @@
+const prisma = require("../../utils/prisma");
+const bcrypt = require("bcrypt");
+const { writeAuditLog } = require("../../utils/audit");
+
+const roleTemplates = {
+  Cashier: ["sale.view", "sale.create", "product.view", "customer.view"],
+  Manager: [
+    "sale.view",
+    "sale.create",
+    "sale.return",
+    "product.view",
+    "product.create",
+    "inventory.view",
+    "inventory.adjust",
+    "purchase.view",
+    "report.view",
+    "supplier.view",
+    "customer.view",
+  ],
+  Accountant: [
+    "accounting.view",
+    "accounting.journal.create",
+    "accounting.report",
+    "purchase.view",
+    "sale.view",
+    "report.view",
+  ],
+  Admin: ["*"],
+};
+
+exports.getRoles = async (_req, res) => {
+  try {
+    const roles = await prisma.role.findMany({
+      include: {
+        rolePermissions: { include: { permission: true } },
+      },
+      orderBy: { name: "asc" },
+    });
+    res.json(roles);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.createRole = async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: "Role name is required" });
+    const role = await prisma.role.create({ data: { name } });
+    res.status(201).json(role);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getPermissions = async (_req, res) => {
+  try {
+    const permissions = await prisma.permission.findMany({ orderBy: { code: "asc" } });
+    res.json(permissions);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.assignPermissionsToRole = async (req, res) => {
+  try {
+    const roleId = Number(req.params.roleId);
+    const { permissionIds } = req.body;
+    if (!Array.isArray(permissionIds)) {
+      return res.status(400).json({ error: "permissionIds must be an array" });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.rolePermission.deleteMany({ where: { roleId } });
+      for (const permissionId of permissionIds) {
+        await tx.rolePermission.create({
+          data: { roleId, permissionId: Number(permissionId) },
+        });
+      }
+    });
+
+    res.json({ message: "Role permissions updated" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getUsers = async (_req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      include: { role: true, branch: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.createUser = async (req, res) => {
+  try {
+    const { name, email, password, roleId, branchId, language } = req.body;
+    if (!name || !email || !password || !roleId || !branchId) {
+      return res.status(400).json({ error: "name, email, password, roleId, branchId are required" });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await prisma.user.create({
+      data: {
+        name,
+        email,
+        passwordHash,
+        roleId: Number(roleId),
+        branchId: Number(branchId),
+        language: language || "en",
+      },
+    });
+    res.status(201).json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.updateUserRole = async (req, res) => {
+  try {
+    const userId = Number(req.params.userId);
+    const { roleId } = req.body;
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { roleId: Number(roleId) },
+    });
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getRoleTemplates = async (_req, res) => {
+  res.json(roleTemplates);
+};
+
+exports.applyRoleTemplate = async (req, res) => {
+  try {
+    const roleId = Number(req.params.roleId);
+    const { templateName } = req.body;
+    const codes = roleTemplates[templateName];
+    if (!codes) {
+      return res.status(400).json({ error: "Unknown template" });
+    }
+
+    const role = await prisma.role.findUnique({ where: { id: roleId } });
+    if (!role) return res.status(404).json({ error: "Role not found" });
+
+    let permissions = [];
+    if (codes.includes("*")) {
+      permissions = await prisma.permission.findMany();
+    } else {
+      permissions = await prisma.permission.findMany({
+        where: { code: { in: codes } },
+      });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.rolePermission.deleteMany({ where: { roleId } });
+      for (const permission of permissions) {
+        await tx.rolePermission.create({
+          data: { roleId, permissionId: permission.id },
+        });
+      }
+    });
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "ROLE_TEMPLATE_APPLY",
+      entity: "Role",
+      entityId: roleId,
+      payload: { templateName, permissionCount: permissions.length },
+    });
+
+    res.json({ message: "Role template applied" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};

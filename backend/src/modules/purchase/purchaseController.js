@@ -16,9 +16,24 @@ exports.createPurchase = async (req, res) => {
     }
     await ensureOpenFiscalPeriod(branchId);
 
+    let inputVatTotal = 0;
     const purchase = await prisma.$transaction(async (tx) => {
       let total = 0;
-      for (const item of items) total += Number(item.qty) * Number(item.cost);
+      for (const item of items) {
+        const qty = Number(item.qty || 0);
+        const cost = Number(item.cost || 0);
+        const vatRate = Number(item.vatRate || 0);
+        const vatType = String(item.vatType || "EXCLUSIVE").toUpperCase();
+        const lineBase = qty * cost;
+        total += lineBase;
+        if (vatRate > 0 && lineBase > 0) {
+          if (vatType === "INCLUSIVE") {
+            inputVatTotal += lineBase - lineBase / (1 + vatRate / 100);
+          } else {
+            inputVatTotal += (lineBase * vatRate) / 100;
+          }
+        }
+      }
       const dueAmount = Math.max(0, total - Number(paidAmount));
       const created = await tx.purchase.create({
         data: {
@@ -92,7 +107,33 @@ exports.createPurchase = async (req, res) => {
       action: "PURCHASE_CREATE",
       entity: "Purchase",
       entityId: purchase.id,
-      payload: { supplierId: Number(supplierId), total: purchase.total },
+      payload: {
+        branchId,
+        supplierId: Number(supplierId),
+        total: Number(purchase.total || 0),
+        inputVat: Number(inputVatTotal.toFixed(2)),
+        vatLines: (items || []).map((item) => ({
+          productId: Number(item.productId),
+          qty: Number(item.qty || 0),
+          cost: Number(item.cost || 0),
+          vatRate: Number(item.vatRate || 0),
+          vatType: String(item.vatType || "EXCLUSIVE").toUpperCase(),
+          vatAmount: Number(
+            (() => {
+              const qty = Number(item.qty || 0);
+              const cost = Number(item.cost || 0);
+              const vatRate = Number(item.vatRate || 0);
+              const vatType = String(item.vatType || "EXCLUSIVE").toUpperCase();
+              const lineBase = qty * cost;
+              if (vatRate <= 0 || lineBase <= 0) return 0;
+              if (vatType === "INCLUSIVE") {
+                return lineBase - lineBase / (1 + vatRate / 100);
+              }
+              return (lineBase * vatRate) / 100;
+            })().toFixed(2)
+          ),
+        })),
+      },
     });
     res.status(201).json(purchase);
   } catch (error) {
@@ -108,7 +149,122 @@ exports.getPurchases = async (req, res) => {
       include: { supplier: true, items: true },
       orderBy: { createdAt: "desc" },
     });
-    res.json(purchases);
+    const purchaseIds = purchases.map((p) => p.id);
+    const logs = purchaseIds.length
+      ? await prisma.auditLog.findMany({
+          where: {
+            action: "PURCHASE_CREATE",
+            entity: "Purchase",
+            entityId: { in: purchaseIds },
+          },
+          select: { entityId: true, payload: true },
+        })
+      : [];
+    const logByPurchaseId = new Map(
+      logs
+        .filter((x) => x.entityId != null)
+        .map((x) => [Number(x.entityId), x.payload || {}])
+    );
+    const withVat = purchases.map((purchase) => {
+      const payload = logByPurchaseId.get(Number(purchase.id)) || {};
+      const inputVat = Number(payload.inputVat || 0);
+      const grossAmount = Number(purchase.total || 0);
+      const taxableAmount = Math.max(0, grossAmount - inputVat);
+      return {
+        ...purchase,
+        vatBreakdown: {
+          taxableAmount: Number(taxableAmount.toFixed(2)),
+          inputVat: Number(inputVat.toFixed(2)),
+          grossAmount: Number(grossAmount.toFixed(2)),
+          vatSource: payload.inputVat != null ? "LOG" : "ESTIMATED_ZERO",
+        },
+      };
+    });
+    res.json(withVat);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getPurchaseDetails = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    if (Number.isNaN(id)) {
+      return res.status(400).json({ error: "Invalid purchase id" });
+    }
+    const purchase = await prisma.purchase.findFirst({
+      where: { id, branchId },
+      include: {
+        supplier: true,
+        items: {
+          include: {
+            product: { select: { id: true, name: true, vatRate: true } },
+          },
+        },
+      },
+    });
+    if (!purchase) return res.status(404).json({ error: "Purchase not found" });
+    const log = await prisma.auditLog.findFirst({
+      where: {
+        action: "PURCHASE_CREATE",
+        entity: "Purchase",
+        entityId: id,
+      },
+      orderBy: { createdAt: "desc" },
+      select: { payload: true },
+    });
+    const payload = log?.payload || {};
+    const vatLinesFromLog = Array.isArray(payload.vatLines) ? payload.vatLines : [];
+    const vatLineByProduct = new Map(
+      vatLinesFromLog.map((line) => [Number(line.productId), line])
+    );
+    const lines = (purchase.items || []).map((item) => {
+      const lineBase = Number(item.qty || 0) * Number(item.cost || 0);
+      const fromLog = vatLineByProduct.get(Number(item.productId));
+      const vatRate = Number(fromLog?.vatRate ?? item.product?.vatRate ?? 0);
+      const vatType = String(fromLog?.vatType || "EXCLUSIVE").toUpperCase();
+      const vatAmount =
+        fromLog?.vatAmount != null
+          ? Number(fromLog.vatAmount || 0)
+          : vatRate > 0
+            ? vatType === "INCLUSIVE"
+              ? lineBase - lineBase / (1 + vatRate / 100)
+              : (lineBase * vatRate) / 100
+            : 0;
+      const taxableAmount =
+        vatType === "INCLUSIVE" ? Math.max(0, lineBase - vatAmount) : Math.max(0, lineBase);
+      return {
+        productId: Number(item.productId),
+        productName: item.product?.name || `Product #${item.productId}`,
+        qty: Number(item.qty || 0),
+        cost: Number(item.cost || 0),
+        vatRate: Number(vatRate.toFixed(2)),
+        vatType,
+        taxableAmount: Number(taxableAmount.toFixed(2)),
+        vatAmount: Number(vatAmount.toFixed(2)),
+        grossAmount: Number(lineBase.toFixed(2)),
+      };
+    });
+    const totals = lines.reduce(
+      (acc, line) => {
+        acc.taxable += Number(line.taxableAmount || 0);
+        acc.vat += Number(line.vatAmount || 0);
+        acc.gross += Number(line.grossAmount || 0);
+        return acc;
+      },
+      { taxable: 0, vat: 0, gross: 0 }
+    );
+    res.json({
+      ...purchase,
+      vatBreakdown: {
+        taxableAmount: Number(totals.taxable.toFixed(2)),
+        inputVat: Number(totals.vat.toFixed(2)),
+        grossAmount: Number(totals.gross.toFixed(2)),
+        vatSource: vatLinesFromLog.length ? "LOG" : "ESTIMATED",
+      },
+      vatLines: lines,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

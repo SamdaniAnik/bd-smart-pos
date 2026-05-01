@@ -458,6 +458,115 @@ exports.transferStock = async (req, res) => {
   }
 };
 
+exports.getStockTransfers = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const logs = await prisma.stockTransfer.findMany({
+      where: {
+        OR: [{ fromBranchId: branchId }, { toBranchId: branchId }],
+      },
+      include: {
+        fromBranch: { select: { id: true, name: true } },
+        toBranch: { select: { id: true, name: true } },
+        items: {
+          include: {
+            fromProduct: { select: { id: true, name: true, sku: true } },
+            toProduct: { select: { id: true, name: true, sku: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    res.json(logs);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getLowStockAlerts = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const q = String(req.query.q || "").trim();
+    const onlyCritical = String(req.query.onlyCritical || "").toLowerCase() === "true";
+    const products = await prisma.product.findMany({
+      where: {
+        branchId,
+        reorderLevel: { gt: 0 },
+        ...(q
+          ? {
+              OR: [
+                { name: { contains: q } },
+                { sku: { contains: q } },
+                { category: { contains: q } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [{ stock: "asc" }, { name: "asc" }],
+      take: 300,
+    });
+
+    const rows = products
+      .map((p) => {
+        const stock = Number(p.stock || 0);
+        const reorderLevel = Number(p.reorderLevel || 0);
+        const shortageQty = Math.max(0, reorderLevel - stock);
+        const status = stock <= 0 ? "OUT" : stock <= reorderLevel ? "LOW" : "OK";
+        return {
+          ...p,
+          status,
+          shortageQty,
+          severityScore: reorderLevel > 0 ? shortageQty / reorderLevel : 0,
+        };
+      })
+      .filter((p) => (onlyCritical ? p.status !== "OK" : true))
+      .sort((a, b) => {
+        if (a.status !== b.status) {
+          const priority = { OUT: 0, LOW: 1, OK: 2 };
+          return priority[a.status] - priority[b.status];
+        }
+        if (b.severityScore !== a.severityScore) return b.severityScore - a.severityScore;
+        return a.name.localeCompare(b.name);
+      });
+
+    res.json({
+      rows,
+      summary: {
+        totalTracked: rows.length,
+        outOfStock: rows.filter((x) => x.status === "OUT").length,
+        lowStock: rows.filter((x) => x.status === "LOW").length,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getTransferBranchProducts = async (req, res) => {
+  try {
+    const branchId = Number(req.params.branchId);
+    if (Number.isNaN(branchId)) {
+      return res.status(400).json({ error: "Invalid branch id" });
+    }
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { id: true, isActive: true },
+    });
+    if (!branch || !branch.isActive) {
+      return res.status(404).json({ error: "Branch not found" });
+    }
+    const products = await prisma.product.findMany({
+      where: { branchId },
+      orderBy: { name: "asc" },
+      select: { id: true, name: true, sku: true, stock: true, price: true, reorderLevel: true },
+    });
+    res.json(products);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
 exports.createStockCountSession = async (req, res) => {
   try {
     const branchId = req.branchId;

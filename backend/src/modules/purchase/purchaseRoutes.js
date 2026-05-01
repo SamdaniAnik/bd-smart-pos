@@ -2,6 +2,7 @@ const express = require("express");
 const {
   createPurchase,
   getPurchases,
+  getPurchaseDetails,
   createPurchaseReturn,
   getPurchaseReturns,
   exportPurchaseReturnsCSV,
@@ -12,6 +13,7 @@ const { requireAuth, requirePermission } = require("../../middleware/auth");
 const router = express.Router();
 
 router.get("/", requireAuth, requirePermission("purchase.view"), getPurchases);
+router.get("/:id", requireAuth, requirePermission("purchase.view"), getPurchaseDetails);
 router.get("/returns", requireAuth, requirePermission("purchase.view"), getPurchaseReturns);
 router.get("/returns/export.csv", requireAuth, requirePermission("purchase.view"), exportPurchaseReturnsCSV);
 router.get("/returns/export.pdf", requireAuth, requirePermission("purchase.view"), exportPurchaseReturnsPDF);

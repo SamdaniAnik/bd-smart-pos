@@ -78,6 +78,105 @@ function writePdfTableReport(res, title, columns, rows) {
   doc.end();
 }
 
+function parseDateRange(query = {}) {
+  const from = query.from ? new Date(`${query.from}T00:00:00.000Z`) : null;
+  const to = query.to ? new Date(`${query.to}T23:59:59.999Z`) : null;
+  return { from, to };
+}
+
+function buildSaleWhere(branchId, from, to) {
+  const where = { branchId };
+  if (from || to) {
+    where.createdAt = {};
+    if (from) where.createdAt.gte = from;
+    if (to) where.createdAt.lte = to;
+  }
+  return where;
+}
+
+async function getVatSalesRows(branchId, from, to) {
+  const sales = await prisma.sale.findMany({
+    where: buildSaleWhere(branchId, from, to),
+    include: {
+      customer: { select: { name: true, phone: true } },
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  return sales.map((sale, idx) => {
+    const total = Number(sale.total || 0);
+    const vatAmount = Number(sale.vatAmount || 0);
+    const taxableAmount = Math.max(0, total - vatAmount);
+    return {
+      serial: idx + 1,
+      saleId: sale.id,
+      invoiceNo: sale.invoiceNo || `INV-${sale.id}`,
+      date: sale.createdAt.toISOString().slice(0, 10),
+      customer: sale.customer?.name || "Walk-in",
+      customerPhone: sale.customer?.phone || "-",
+      taxableAmount: Number(taxableAmount.toFixed(2)),
+      vatAmount: Number(vatAmount.toFixed(2)),
+      grossAmount: Number(total.toFixed(2)),
+    };
+  });
+}
+
+async function getInputVatFromPurchases(branchId, from, to) {
+  const purchases = await prisma.purchase.findMany({
+    where: buildSaleWhere(branchId, from, to),
+    include: {
+      items: {
+        include: {
+          product: { select: { vatRate: true } },
+        },
+      },
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  if (!purchases.length) {
+    return { inputVat: 0, estimatedCount: 0, exactCount: 0 };
+  }
+  const purchaseIds = purchases.map((p) => p.id);
+  const purchaseAuditLogs = await prisma.auditLog.findMany({
+    where: {
+      action: "PURCHASE_CREATE",
+      entity: "Purchase",
+      entityId: { in: purchaseIds },
+    },
+    select: { entityId: true, payload: true },
+  });
+  const inputVatByPurchaseId = new Map(
+    purchaseAuditLogs
+      .filter((x) => x.entityId != null)
+      .map((x) => [Number(x.entityId), Number(x.payload?.inputVat || 0)])
+  );
+
+  let inputVat = 0;
+  let estimatedCount = 0;
+  let exactCount = 0;
+  for (const purchase of purchases) {
+    const purchaseId = Number(purchase.id);
+    if (inputVatByPurchaseId.has(purchaseId)) {
+      inputVat += Number(inputVatByPurchaseId.get(purchaseId) || 0);
+      exactCount += 1;
+      continue;
+    }
+    const estimated = (purchase.items || []).reduce((sum, item) => {
+      const qty = Number(item.qty || 0);
+      const cost = Number(item.cost || 0);
+      const vatRate = Number(item.product?.vatRate || 0);
+      if (vatRate <= 0) return sum;
+      return sum + (qty * cost * vatRate) / 100;
+    }, 0);
+    inputVat += estimated;
+    estimatedCount += 1;
+  }
+  return {
+    inputVat: Number(inputVat.toFixed(2)),
+    estimatedCount,
+    exactCount,
+  };
+}
+
 exports.getDashboard = async (req, res) => {
   try {
     const branchId = req.branchId;
@@ -98,6 +197,188 @@ exports.getDashboard = async (req, res) => {
       stockAlerts,
     };
     res.json(totals);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getDashboardTrends = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const now = new Date();
+    const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+
+    const [todaySalesRows, yesterdaySalesRows, todayPurchasesRows, yesterdayPurchasesRows, products, todayLedgers] =
+      await Promise.all([
+        prisma.sale.findMany({
+          where: { branchId, createdAt: { gte: startToday } },
+          select: { total: true, paidAmount: true },
+        }),
+        prisma.sale.findMany({
+          where: { branchId, createdAt: { gte: startYesterday, lt: startToday } },
+          select: { total: true, paidAmount: true },
+        }),
+        prisma.purchase.findMany({
+          where: { branchId, createdAt: { gte: startToday } },
+          select: { total: true },
+        }),
+        prisma.purchase.findMany({
+          where: { branchId, createdAt: { gte: startYesterday, lt: startToday } },
+          select: { total: true },
+        }),
+        prisma.product.findMany({
+          where: { branchId },
+          select: { id: true, stock: true, reorderLevel: true },
+        }),
+        prisma.stockLedger.findMany({
+          where: { branchId, createdAt: { gte: startToday } },
+          select: { productId: true, inQty: true, outQty: true },
+        }),
+      ]);
+
+    const today = {
+      sales: todaySalesRows.reduce((sum, row) => sum + Number(row.total || 0), 0),
+      collections: todaySalesRows.reduce((sum, row) => sum + Number(row.paidAmount || 0), 0),
+      purchase: todayPurchasesRows.reduce((sum, row) => sum + Number(row.total || 0), 0),
+    };
+    const yesterday = {
+      sales: yesterdaySalesRows.reduce((sum, row) => sum + Number(row.total || 0), 0),
+      collections: yesterdaySalesRows.reduce((sum, row) => sum + Number(row.paidAmount || 0), 0),
+      purchase: yesterdayPurchasesRows.reduce((sum, row) => sum + Number(row.total || 0), 0),
+    };
+
+    const flowByProduct = new Map();
+    for (const row of todayLedgers) {
+      const productId = Number(row.productId);
+      if (!flowByProduct.has(productId)) {
+        flowByProduct.set(productId, { inQty: 0, outQty: 0 });
+      }
+      const existing = flowByProduct.get(productId);
+      existing.inQty += Number(row.inQty || 0);
+      existing.outQty += Number(row.outQty || 0);
+      flowByProduct.set(productId, existing);
+    }
+
+    const lowStockToday = products.filter((p) => Number(p.stock || 0) <= Number(p.reorderLevel || 0)).length;
+    const lowStockYesterdayApprox = products.filter((p) => {
+      const flow = flowByProduct.get(Number(p.id)) || { inQty: 0, outQty: 0 };
+      const openingStock = Number(p.stock || 0) - Number(flow.inQty || 0) + Number(flow.outQty || 0);
+      return openingStock <= Number(p.reorderLevel || 0);
+    }).length;
+
+    const compare = (todayVal, yesterdayVal) => {
+      const t = Number(todayVal || 0);
+      const y = Number(yesterdayVal || 0);
+      const diff = t - y;
+      const pct = y === 0 ? (t === 0 ? 0 : 100) : (diff / y) * 100;
+      return { today: t, yesterday: y, diff, pct };
+    };
+
+    res.json({
+      sales: compare(today.sales, yesterday.sales),
+      collections: compare(today.collections, yesterday.collections),
+      purchase: compare(today.purchase, yesterday.purchase),
+      lowStock: compare(lowStockToday, lowStockYesterdayApprox),
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getVatSummary = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const { from, to } = parseDateRange(req.query || {});
+    const rows = await getVatSalesRows(branchId, from, to);
+    const outputVat = rows.reduce((sum, row) => sum + Number(row.vatAmount || 0), 0);
+    const taxableSales = rows.reduce((sum, row) => sum + Number(row.taxableAmount || 0), 0);
+    const grossSales = rows.reduce((sum, row) => sum + Number(row.grossAmount || 0), 0);
+    const zeroVatSales = rows.filter((row) => Number(row.vatAmount || 0) <= 0).length;
+    const inputVatInfo = await getInputVatFromPurchases(branchId, from, to);
+    const inputVatTracked = Number(inputVatInfo.inputVat || 0);
+    const netVatPayable = outputVat - inputVatTracked;
+    res.json({
+      from: from ? from.toISOString().slice(0, 10) : null,
+      to: to ? to.toISOString().slice(0, 10) : null,
+      salesCount: rows.length,
+      zeroVatSales,
+      taxableSales: Number(taxableSales.toFixed(2)),
+      outputVat: Number(outputVat.toFixed(2)),
+      grossSales: Number(grossSales.toFixed(2)),
+      inputVatTracked: Number(inputVatTracked.toFixed(2)),
+      netVatPayable: Number(netVatPayable.toFixed(2)),
+      note:
+        inputVatInfo.estimatedCount > 0
+          ? `Input VAT is exact for ${inputVatInfo.exactCount} purchase(s) and estimated from product VAT rates for ${inputVatInfo.estimatedCount} older purchase(s).`
+          : `Input VAT is computed from purchase records (${inputVatInfo.exactCount} purchase(s)).`,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getVatSalesRegister = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const { from, to } = parseDateRange(req.query || {});
+    const rows = await getVatSalesRows(branchId, from, to);
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportVatSalesRegisterCSV = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const { from, to } = parseDateRange(req.query || {});
+    const rows = await getVatSalesRows(branchId, from, to);
+    const csvRows = rows.map((row) => ({
+      serial: row.serial,
+      sale_id: row.saleId,
+      invoice_no: row.invoiceNo,
+      date: row.date,
+      customer: row.customer,
+      customer_phone: row.customerPhone,
+      taxable_amount: Number(row.taxableAmount).toFixed(2),
+      output_vat: Number(row.vatAmount).toFixed(2),
+      gross_amount: Number(row.grossAmount).toFixed(2),
+    }));
+    const csv = toCSV(csvRows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="vat-sales-register.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportVatSalesRegisterPDF = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const { from, to } = parseDateRange(req.query || {});
+    const rows = await getVatSalesRows(branchId, from, to);
+    writePdfTableReport(
+      res,
+      "VAT Sales Register",
+      [
+        { key: "serial", label: "SL" },
+        { key: "invoiceNo", label: "Invoice" },
+        { key: "date", label: "Date" },
+        { key: "customer", label: "Customer" },
+        { key: "taxableAmount", label: "Taxable" },
+        { key: "vatAmount", label: "VAT" },
+        { key: "grossAmount", label: "Gross" },
+      ],
+      rows.map((row) => ({
+        ...row,
+        taxableAmount: Number(row.taxableAmount).toFixed(2),
+        vatAmount: Number(row.vatAmount).toFixed(2),
+        grossAmount: Number(row.grossAmount).toFixed(2),
+      }))
+    );
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

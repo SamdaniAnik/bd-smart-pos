@@ -11,6 +11,7 @@ function Products() {
     category: "",
     sku: "",
     vatRate: "",
+    reorderLevel: "",
     defaultDiscountType: "",
     defaultDiscountValue: "",
   });
@@ -23,7 +24,10 @@ function Products() {
   };
 
   useEffect(() => {
-    fetchProducts();
+    const timer = setTimeout(() => {
+      fetchProducts();
+    }, 0);
+    return () => clearTimeout(timer);
   }, []);
 
   const handleSubmit = async (e) => {
@@ -36,6 +40,7 @@ function Products() {
       category: form.category,
       sku: form.sku || null,
       vatRate: Number(form.vatRate || 0),
+      reorderLevel: Number(form.reorderLevel || 0),
       defaultDiscountType: form.defaultDiscountType || null,
       defaultDiscountValue: Number(form.defaultDiscountValue || 0),
     };
@@ -53,6 +58,7 @@ function Products() {
       category: "",
       sku: "",
       vatRate: "",
+      reorderLevel: "",
       defaultDiscountType: "",
       defaultDiscountValue: "",
     });
@@ -72,6 +78,7 @@ function Products() {
       category: row.category || "",
       sku: row.sku || "",
       vatRate: row.vatRate ?? "",
+      reorderLevel: row.reorderLevel ?? "",
       defaultDiscountType: row.defaultDiscountType || "",
       defaultDiscountValue: row.defaultDiscountValue ?? "",
     });
@@ -91,6 +98,7 @@ function Products() {
       category: "",
       sku: "",
       vatRate: "",
+      reorderLevel: "",
       defaultDiscountType: "",
       defaultDiscountValue: "",
     });
@@ -145,6 +153,13 @@ function Products() {
           value={form.vatRate}
           onChange={(e) => setForm({ ...form, vatRate: e.target.value })}
         />
+        <input
+          placeholder="Reorder level"
+          type="number"
+          min={0}
+          value={form.reorderLevel}
+          onChange={(e) => setForm({ ...form, reorderLevel: e.target.value })}
+        />
         <select
           value={form.defaultDiscountType}
           onChange={(e) => setForm({ ...form, defaultDiscountType: e.target.value })}
@@ -175,6 +190,7 @@ function Products() {
           <p><strong>Category:</strong> {selected.category || "-"}</p>
           <p><strong>Price:</strong> ৳{Number(selected.price || 0).toFixed(2)}</p>
           <p><strong>Stock:</strong> {selected.stock}</p>
+          <p><strong>Reorder Level:</strong> {Number(selected.reorderLevel || 0)}</p>
           <p><strong>VAT:</strong> {Number(selected.vatRate || 0)}%</p>
           <p>
             <strong>Default Discount:</strong>{" "}
@@ -205,6 +221,7 @@ function Products() {
           { key: "category", label: "Category", render: (v) => v || "-" },
           { key: "price", label: "Price", render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "stock", label: "Stock" },
+          { key: "reorderLevel", label: "Reorder Level", render: (v) => Number(v || 0) },
           { key: "vatRate", label: "VAT %", render: (v) => `${v}%` },
           {
             key: "defaultDiscountType",

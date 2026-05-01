@@ -18,9 +18,21 @@ import LoyaltyDashboard from "./pages/LoyaltyDashboard";
 import ApprovalQueue from "./pages/ApprovalQueue";
 import StockCount from "./pages/StockCount";
 import Quotations from "./pages/Quotations";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "./services/api";
+import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import { t } from "./i18n";
+
+const readNavPins = () => {
+  try {
+    const raw = localStorage.getItem("bd_pos_nav_pins");
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+};
 
 function App() {
   const [view, setView] = useState(localStorage.getItem("bd_pos_last_view") || "dashboard");
@@ -33,10 +45,11 @@ function App() {
   const user = userJson ? JSON.parse(userJson) : null;
   const branchId = localStorage.getItem("bd_pos_branch_id") || "1";
   const menuSearchRef = useRef(null);
-  const has = (code) => permissions.includes(code);
+  const [navPins, setNavPins] = useState(readNavPins);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
-  const sections = useMemo(() => {
-    const canSeePos = has("sale.create") || has("sale.view");
+  const sectionsByPerm = useMemo(() => {
+    const canSeePos = permissions.includes("sale.create") || permissions.includes("sale.view");
     const baseSections = [
       {
         title: "Daily Operations",
@@ -80,28 +93,58 @@ function App() {
       },
     ];
 
-    return baseSections
+    return baseSections.map((section) => ({
+      ...section,
+      items: section.items.filter(
+        (item) =>
+          item.perm === true || (typeof item.perm === "string" && permissions.includes(item.perm))
+      ),
+    }));
+  }, [lang, permissions]);
+
+  const allMenuItemsByPerm = useMemo(
+    () => sectionsByPerm.flatMap((section) => section.items),
+    [sectionsByPerm]
+  );
+
+  const sections = useMemo(() => {
+    const pinSet = new Set(navPins);
+    const q = menuQuery.trim().toLowerCase();
+    const matchesSearch = (item) => {
+      if (!q) return true;
+      return (
+        item.label.toLowerCase().includes(q) ||
+        String(item.hint || "").toLowerCase().includes(q)
+      );
+    };
+
+    const pinnedItems = navPins
+      .map((key) => allMenuItemsByPerm.find((item) => item.key === key))
+      .filter(Boolean)
+      .filter(matchesSearch);
+
+    const restSections = sectionsByPerm
       .map((section) => ({
         ...section,
-        items: section.items.filter(
-          (item) => item.perm === true || (typeof item.perm === "string" && has(item.perm))
-        ),
-      }))
-      .map((section) => ({
-        ...section,
-        items: section.items.filter((item) => {
-          if (!menuQuery.trim()) return true;
-          const q = menuQuery.toLowerCase();
-          return (
-            item.label.toLowerCase().includes(q) ||
-            String(item.hint || "").toLowerCase().includes(q)
-          );
-        }),
+        items: section.items.filter((item) => !pinSet.has(item.key)).filter(matchesSearch),
       }))
       .filter((section) => section.items.length > 0);
-  }, [lang, permissions, menuQuery]);
+
+    const pinnedBlock =
+      pinnedItems.length > 0 ? [{ title: t(lang, "pinned"), items: pinnedItems }] : [];
+
+    return [...pinnedBlock, ...restSections];
+  }, [sectionsByPerm, allMenuItemsByPerm, navPins, menuQuery, lang]);
 
   const allMenuItems = useMemo(() => sections.flatMap((s) => s.items), [sections]);
+
+  const toggleNavPin = (key) => {
+    setNavPins((prev) => {
+      const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key];
+      localStorage.setItem("bd_pos_nav_pins", JSON.stringify(next));
+      return next;
+    });
+  };
   const currentItem = allMenuItems.find((i) => i.key === view);
 
   const handleLogin = async (e) => {
@@ -127,8 +170,64 @@ function App() {
     localStorage.setItem("bd_pos_lang", nextLang);
   };
 
+  const openView = useCallback((nextView) => {
+    setView(nextView);
+    localStorage.setItem("bd_pos_last_view", nextView);
+  }, []);
+
+  useEffect(() => {
+    const onNavigate = (event) => {
+      const next = event?.detail?.view;
+      if (!next || typeof next !== "string") return;
+      setView(next);
+      localStorage.setItem("bd_pos_last_view", next);
+    };
+    window.addEventListener("bd_pos_navigate", onNavigate);
+    return () => window.removeEventListener("bd_pos_navigate", onNavigate);
+  }, []);
+
+  useEffect(() => {
+    const handleGlobalMenuShortcut = (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        menuSearchRef.current?.focus();
+      }
+      if (event.key === "Enter" && document.activeElement === menuSearchRef.current) {
+        const firstMatch = allMenuItems[0];
+        if (firstMatch) {
+          event.preventDefault();
+          openView(firstMatch.key);
+          setMenuQuery("");
+        }
+      }
+    };
+    window.addEventListener("keydown", handleGlobalMenuShortcut);
+    return () => window.removeEventListener("keydown", handleGlobalMenuShortcut);
+  }, [allMenuItems, openView]);
+
+  useEffect(() => {
+    const onShortcutsToggle = (event) => {
+      if (event.key !== "?") return;
+      const el = event.target;
+      if (
+        el &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.tagName === "SELECT" ||
+          el.isContentEditable)
+      )
+        return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      event.preventDefault();
+      setShortcutsOpen((open) => !open);
+    };
+    window.addEventListener("keydown", onShortcutsToggle);
+    return () => window.removeEventListener("keydown", onShortcutsToggle);
+  }, []);
+
   if (!token) {
     return (
+      <>
       <div className="login-shell">
         <div className="login-card">
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
@@ -173,6 +272,12 @@ function App() {
           </div>
         </div>
       </div>
+      <KeyboardShortcutsModal
+        open={shortcutsOpen}
+        onClose={() => setShortcutsOpen(false)}
+        lang={lang}
+      />
+      </>
     );
   }
 
@@ -225,41 +330,6 @@ function App() {
     }
   };
 
-  const openView = (nextView) => {
-    setView(nextView);
-    localStorage.setItem("bd_pos_last_view", nextView);
-  };
-
-  useEffect(() => {
-    const onNavigate = (event) => {
-      const next = event?.detail?.view;
-      if (!next || typeof next !== "string") return;
-      setView(next);
-      localStorage.setItem("bd_pos_last_view", next);
-    };
-    window.addEventListener("bd_pos_navigate", onNavigate);
-    return () => window.removeEventListener("bd_pos_navigate", onNavigate);
-  }, []);
-
-  useEffect(() => {
-    const handleGlobalMenuShortcut = (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        menuSearchRef.current?.focus();
-      }
-      if (event.key === "Enter" && document.activeElement === menuSearchRef.current) {
-        const firstMatch = allMenuItems[0];
-        if (firstMatch) {
-          event.preventDefault();
-          openView(firstMatch.key);
-          setMenuQuery("");
-        }
-      }
-    };
-    window.addEventListener("keydown", handleGlobalMenuShortcut);
-    return () => window.removeEventListener("keydown", handleGlobalMenuShortcut);
-  }, [allMenuItems]);
-
   const initials = (user?.name || user?.email || "U")
     .split(/\s+/)
     .map((s) => s[0])
@@ -285,25 +355,63 @@ function App() {
               style={{ background: "rgba(255,255,255,0.08)", color: "#e2e8f0", borderColor: "rgba(255,255,255,0.15)" }}
             />
             <div style={{ color: "#94a3b8", fontSize: 11, marginTop: 4 }}>
-              Ctrl/Cmd + K
+              Ctrl/Cmd + K · ?
             </div>
           </div>
           {sections.map((section) => (
             <div key={section.title}>
               <div className="nav-section">{section.title}</div>
               {section.items.map((item) => (
-                <button
-                  key={item.key}
-                  className={view === item.key ? "active" : ""}
-                  onClick={() => openView(item.key)}
-                  title={item.hint}
-                >
-                  <span className="nav-icon">{item.icon}</span>
-                  <span style={{ display: "flex", flexDirection: "column", lineHeight: 1.2 }}>
-                    <span>{item.label}</span>
-                    <span style={{ fontSize: 11, opacity: 0.7 }}>{item.hint}</span>
-                  </span>
-                </button>
+                <div key={item.key} className="app-nav-row">
+                  <button
+                    type="button"
+                    className={`nav-route-btn ${view === item.key ? "active" : ""}`}
+                    onClick={() => openView(item.key)}
+                    title={item.hint}
+                  >
+                    <span className="nav-icon">{item.icon}</span>
+                    <span
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        lineHeight: 1.2,
+                        flex: 1,
+                        minWidth: 0,
+                      }}
+                    >
+                      <span>{item.label}</span>
+                      <span style={{ fontSize: 11, opacity: 0.7 }}>{item.hint}</span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`nav-pin-btn ${navPins.includes(item.key) ? "pinned" : ""}`}
+                    title={
+                      navPins.includes(item.key)
+                        ? lang === "bn"
+                          ? "আনপিন"
+                          : "Unpin"
+                        : lang === "bn"
+                          ? "উপরে পিন করুন"
+                          : "Pin to top"
+                    }
+                    aria-label={
+                      navPins.includes(item.key)
+                        ? lang === "bn"
+                          ? "আনপিন"
+                          : "Unpin"
+                        : lang === "bn"
+                          ? "পিন"
+                          : "Pin"
+                    }
+                    onClick={(e) => {
+                      e.preventDefault();
+                      toggleNavPin(item.key);
+                    }}
+                  >
+                    {navPins.includes(item.key) ? "★" : "☆"}
+                  </button>
+                </div>
               ))}
             </div>
           ))}
@@ -344,6 +452,13 @@ function App() {
           </div>
           <div className="topbar-actions">
             <span className="branch-pill">Branch #{branchId}</span>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => setShortcutsOpen(true)}
+            >
+              {lang === "bn" ? "শর্টকাট" : "Shortcuts"}
+            </button>
             <button className="btn-secondary btn-sm" onClick={() => changeLang(lang === "en" ? "bn" : "en")}>
               {lang === "en" ? "বাংলা" : "English"}
             </button>
@@ -351,6 +466,11 @@ function App() {
         </div>
         <div className="app-content">{renderPage()}</div>
       </main>
+      <KeyboardShortcutsModal
+        open={shortcutsOpen}
+        onClose={() => setShortcutsOpen(false)}
+        lang={lang}
+      />
     </div>
   );
 }

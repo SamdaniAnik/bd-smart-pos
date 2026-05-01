@@ -3,7 +3,17 @@ const prisma = require("../utils/prisma");
 exports.createProduct = async (req, res) => {
   try {
     const branchId = req.branchId || Number(req.body.branchId || 1);
-    const { name, price, stock, category, sku, vatRate, defaultDiscountType, defaultDiscountValue } = req.body;
+    const {
+      name,
+      price,
+      stock,
+      category,
+      sku,
+      vatRate,
+      defaultDiscountType,
+      defaultDiscountValue,
+      reorderLevel,
+    } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Product name must be at least 2 characters" });
     }
@@ -12,6 +22,9 @@ exports.createProduct = async (req, res) => {
     }
     if (Number(vatRate || 0) < 0 || Number(vatRate || 0) > 100) {
       return res.status(400).json({ error: "VAT rate must be between 0 and 100" });
+    }
+    if (Number(reorderLevel || 0) < 0) {
+      return res.status(400).json({ error: "Reorder level must be non-negative" });
     }
     const normalizedDiscountType = defaultDiscountType || null;
     if (normalizedDiscountType && !["PERCENT", "AMOUNT"].includes(normalizedDiscountType)) {
@@ -33,6 +46,7 @@ exports.createProduct = async (req, res) => {
         category,
         sku: sku || null,
         vatRate: Number(vatRate || 0),
+        reorderLevel: Number(reorderLevel || 0),
         defaultDiscountType: normalizedDiscountType,
         defaultDiscountValue: Number(defaultDiscountValue || 0),
       }
@@ -123,7 +137,17 @@ exports.updateProduct = async (req, res) => {
       return res.status(404).json({ error: "Product not found" });
     }
 
-    const { name, price, stock, category, sku, vatRate, defaultDiscountType, defaultDiscountValue } = req.body;
+    const {
+      name,
+      price,
+      stock,
+      category,
+      sku,
+      vatRate,
+      defaultDiscountType,
+      defaultDiscountValue,
+      reorderLevel,
+    } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Product name must be at least 2 characters" });
     }
@@ -132,6 +156,9 @@ exports.updateProduct = async (req, res) => {
     }
     if (Number(vatRate || 0) < 0 || Number(vatRate || 0) > 100) {
       return res.status(400).json({ error: "VAT rate must be between 0 and 100" });
+    }
+    if (Number(reorderLevel || 0) < 0) {
+      return res.status(400).json({ error: "Reorder level must be non-negative" });
     }
     const normalizedDiscountType = defaultDiscountType || null;
     if (normalizedDiscountType && !["PERCENT", "AMOUNT"].includes(normalizedDiscountType)) {
@@ -153,6 +180,7 @@ exports.updateProduct = async (req, res) => {
         category: category || null,
         sku: sku || null,
         vatRate: Number(vatRate || 0),
+        reorderLevel: Number(reorderLevel || 0),
         defaultDiscountType: normalizedDiscountType,
         defaultDiscountValue: Number(defaultDiscountValue || 0),
       },

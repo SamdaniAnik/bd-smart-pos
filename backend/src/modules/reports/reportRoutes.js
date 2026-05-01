@@ -1,6 +1,11 @@
 const express = require("express");
 const {
   getDashboard,
+  getDashboardTrends,
+  getVatSummary,
+  getVatSalesRegister,
+  exportVatSalesRegisterCSV,
+  exportVatSalesRegisterPDF,
   getAging,
   getStockValuation,
   exportStockValuationCSV,
@@ -13,6 +18,11 @@ const { requireAuth, requirePermission } = require("../../middleware/auth");
 const router = express.Router();
 
 router.get("/dashboard", requireAuth, requirePermission("report.view"), getDashboard);
+router.get("/dashboard/trends", requireAuth, requirePermission("report.view"), getDashboardTrends);
+router.get("/vat/summary", requireAuth, requirePermission("report.view"), getVatSummary);
+router.get("/vat/sales-register", requireAuth, requirePermission("report.view"), getVatSalesRegister);
+router.get("/vat/sales-register/export.csv", requireAuth, requirePermission("report.view"), exportVatSalesRegisterCSV);
+router.get("/vat/sales-register/export.pdf", requireAuth, requirePermission("report.view"), exportVatSalesRegisterPDF);
 router.get("/aging", requireAuth, requirePermission("report.view"), getAging);
 router.get("/stock-valuation", requireAuth, requirePermission("report.view"), getStockValuation);
 router.get("/aging/export.csv", requireAuth, requirePermission("report.view"), exportAgingCSV);

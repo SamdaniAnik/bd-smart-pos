@@ -1,0 +1,1 @@
+# bd-smart-pos

@@ -1,4 +1,5 @@
 const prisma = require("../utils/prisma");
+const { dispatchBranchWebhooks } = require("../utils/webhooks");
 const { getSocketInstance } = require("../socket");
 const { ensureOpenFiscalPeriod } = require("../utils/fiscal");
 const { writeAuditLog } = require("../utils/audit");
@@ -87,6 +88,35 @@ function calculateManualDiscount(baseAmount, discountType, discountValue) {
   return amount;
 }
 
+function validateCouponForSubtotal(couponRow, subTotal) {
+  if (!couponRow) throw new Error("Invalid coupon");
+  const now = new Date();
+  if (!couponRow.isActive) throw new Error("Coupon inactive");
+  if (couponRow.startsAt && new Date(couponRow.startsAt) > now) {
+    throw new Error("Coupon not active yet");
+  }
+  if (couponRow.endsAt && new Date(couponRow.endsAt) < now) {
+    throw new Error("Coupon expired");
+  }
+  const minBasket = Number(couponRow.minBasketAmount || 0);
+  if (Number(subTotal || 0) + 0.0001 < minBasket) {
+    throw new Error(`Coupon requires minimum basket ${minBasket.toFixed(2)} BDT`);
+  }
+  const maxRed = Number(couponRow.maxRedemptions || 0);
+  if (maxRed > 0 && Number(couponRow.redemptionCount || 0) >= maxRed) {
+    throw new Error("Coupon redemption limit reached");
+  }
+}
+
+function computeCouponAmount(couponRow, subTotal) {
+  const dtype = String(couponRow.discountType || "PERCENT").toUpperCase();
+  let amt =
+    dtype === "PERCENT"
+      ? (Number(subTotal || 0) * Number(couponRow.discountValue || 0)) / 100
+      : Number(couponRow.discountValue || 0);
+  return Math.min(Math.max(0, amt), Number(subTotal || 0));
+}
+
 function getManagerApprovalPin() {
   return String(process.env.MANAGER_APPROVAL_PIN || "1234");
 }
@@ -111,30 +141,57 @@ function requiresManagerApproval(discountType, manualDiscountValue, manualDiscou
   return Number(manualDiscountAmount || 0) > thresholds.amount;
 }
 
-function parseCartPriceOverrides(cart, productMap) {
+function getCartLineBillingUnits(item, dbProduct) {
+  if (!dbProduct) return 0;
+  if (dbProduct.sellByWeight) return Math.max(0, Number(item.weightKg || 0));
+  return Math.max(0, Number(item.qty || 0));
+}
+
+function parseCartPriceOverrides(cart, productMap, variantMap = new Map()) {
   const rows = [];
-  for (const item of cart) {
-    const dbProduct = productMap.get(item.id);
-    if (!dbProduct) continue;
-    const baseUnitPrice = Number(dbProduct.price || 0);
-    const qty = Number(item.qty || 0);
+  cart.forEach((item, lineIndex) => {
+    const dbProduct = productMap.get(Number(item.id));
+    if (!dbProduct) {
+      throw new Error(`Unknown product ${item.id}`);
+    }
+    const vid = Number(item.variantId || 0) || null;
+    const variant = vid ? variantMap.get(vid) : null;
+    if (vid && (!variant || variant.productId !== dbProduct.id)) {
+      throw new Error(`Variant ${vid} invalid for ${dbProduct.name}`);
+    }
+    const billingUnits = getCartLineBillingUnits(item, dbProduct);
+    if (!dbProduct.sellByWeight && Number(item.weightKg ?? 0) > 1e-9) {
+      throw new Error(`Weight not allowed on ${dbProduct.name} (not marked sell-by-KG)`);
+    }
+    const qtyPieces = Math.max(dbProduct.sellByWeight ? 1 : 1, Number(item.qty || 1));
+
+    let baseUnitPrice =
+      variant && variant.priceOverride != null ? Number(variant.priceOverride) : Number(dbProduct.price || 0);
+    baseUnitPrice = Math.max(0, baseUnitPrice);
+
+    const productLabel =
+      variant && String(variant.label || "").trim()
+        ? `${dbProduct.name} (${String(variant.label).trim()})`
+        : dbProduct.name;
+
     const rawOverride = item.overridePrice;
     const hasOverride =
-      rawOverride !== undefined &&
-      rawOverride !== null &&
-      String(rawOverride).trim() !== "";
+      rawOverride !== undefined && rawOverride !== null && String(rawOverride).trim() !== "";
     if (!hasOverride) {
       rows.push({
+        lineIndex,
         productId: Number(item.id),
-        productName: dbProduct.name,
-        qty,
+        variantId: vid,
+        productName: productLabel,
+        qty: qtyPieces,
+        billingUnits,
         baseUnitPrice,
         appliedUnitPrice: baseUnitPrice,
         overrideUnitPrice: null,
         reductionPerUnit: 0,
         reductionPercent: 0,
       });
-      continue;
+      return;
     }
     const overrideUnitPrice = Number(rawOverride);
     if (!Number.isFinite(overrideUnitPrice) || overrideUnitPrice <= 0) {
@@ -144,16 +201,19 @@ function parseCartPriceOverrides(cart, productMap) {
     const reductionPerUnit = Math.max(0, baseUnitPrice - appliedUnitPrice);
     const reductionPercent = baseUnitPrice > 0 ? (reductionPerUnit / baseUnitPrice) * 100 : 0;
     rows.push({
+      lineIndex,
       productId: Number(item.id),
-      productName: dbProduct.name,
-      qty,
+      variantId: vid,
+      productName: productLabel,
+      qty: qtyPieces,
+      billingUnits,
       baseUnitPrice,
       appliedUnitPrice,
       overrideUnitPrice,
       reductionPerUnit,
       reductionPercent,
     });
-  }
+  });
   return rows;
 }
 
@@ -162,10 +222,12 @@ function requiresPriceOverrideApproval(overrideRows) {
   const rowsNeedingApproval = overrideRows.filter(
     (row) =>
       row.overrideUnitPrice != null &&
-      (Number(row.reductionPercent || 0) > thresholds.percent || Number(row.reductionPerUnit || 0) > thresholds.amount)
+      (Number(row.reductionPercent || 0) > thresholds.percent ||
+        Number(row.reductionPerUnit || 0) > thresholds.amount)
   );
   const totalReductionAmount = overrideRows.reduce(
-    (sum, row) => sum + Number(row.reductionPerUnit || 0) * Number(row.qty || 0),
+    (sum, row) =>
+      sum + Number(row.reductionPerUnit || 0) * Number(row.billingUnits ?? row.qty ?? 0),
     0
   );
   return {
@@ -173,6 +235,18 @@ function requiresPriceOverrideApproval(overrideRows) {
     rowsNeedingApproval,
     totalReductionAmount,
   };
+}
+
+function cartLineRetailSubtotal(item, lineIndex, productMap, variantMap, overrideMap) {
+  const p = productMap.get(Number(item.id));
+  if (!p) return 0;
+  const vid = Number(item.variantId || 0) || null;
+  const variant = vid ? variantMap.get(vid) : null;
+  const base =
+    variant && variant.priceOverride != null ? Number(variant.priceOverride) : Number(p.price || 0);
+  const row = overrideMap.get(lineIndex);
+  const applied = Number(row?.appliedUnitPrice ?? base);
+  return applied * getCartLineBillingUnits(item, p);
 }
 
 function getLoyaltyConfig() {
@@ -264,6 +338,409 @@ function normalizePaymentBreakdown(paymentBreakdown) {
     .filter((line) => line.method && line.amount > 0);
 }
 
+function normalizeGiftCardRedemptions(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((x) => ({
+      code: String(x?.code || "")
+        .trim()
+        .toUpperCase(),
+      amount: x?.amount != null && x?.amount !== "" ? Number(x.amount) : null,
+    }))
+    .filter((x) => x.code);
+}
+
+function getSaleNotesMaxLength() {
+  return Math.max(80, Number(process.env.SALE_NOTES_MAX_LENGTH || 240));
+}
+
+function sanitizeSaleNotesPayload(notesPayload = {}, maxLen = getSaleNotesMaxLength()) {
+  const base = {
+    freeText: String(notesPayload?.freeText || "").slice(0, 500),
+    paymentBreakdown: Array.isArray(notesPayload?.paymentBreakdown)
+      ? notesPayload.paymentBreakdown.slice(0, 8).map((line) => ({
+          method: String(line?.method || "").slice(0, 20),
+          amount: Number(line?.amount || 0),
+          channel: String(line?.channel || "").slice(0, 60),
+        }))
+      : [],
+    loyalty: notesPayload?.loyalty || {},
+    promotions: {
+      discountAmount: Number(notesPayload?.promotions?.discountAmount || 0),
+      applied: Array.isArray(notesPayload?.promotions?.applied)
+        ? notesPayload.promotions.applied.slice(0, 8).map((x) => ({
+            ruleId: Number(x?.ruleId || 0),
+            type: String(x?.type || "").slice(0, 30),
+            name: String(x?.name || "").slice(0, 60),
+            amount: Number(x?.amount || 0),
+          }))
+        : [],
+    },
+    antiFraud: {
+      managerApprovalPinUsed: Boolean(notesPayload?.antiFraud?.managerApprovalPinUsed),
+      approvalReason: notesPayload?.antiFraud?.approvalReason
+        ? String(notesPayload.antiFraud.approvalReason).slice(0, 250)
+        : null,
+    },
+    storedValue: Array.isArray(notesPayload?.storedValue?.gifts)
+      ? {
+          gifts: notesPayload.storedValue.gifts.slice(0, 6).map((g) => ({
+            code: String(g?.code || "").slice(0, 24),
+            amount: Number(g?.amount || 0),
+          })),
+          wallet: Number(notesPayload.storedValue.wallet || 0),
+        }
+      : undefined,
+    coupon:
+      notesPayload?.coupon && typeof notesPayload.coupon === "object" && notesPayload.coupon.code
+        ? {
+            couponCodeId: Number(notesPayload.coupon.couponCodeId || 0),
+            code: String(notesPayload.coupon.code || "").slice(0, 32),
+            discount: Number(notesPayload.coupon.discount || 0),
+          }
+        : undefined,
+  };
+
+  let serialized = JSON.stringify(base);
+  if (serialized.length <= maxLen) return serialized;
+
+  // Progressive fallback to keep JSON valid under strict DB limits.
+  base.promotions.applied = [];
+  serialized = JSON.stringify(base);
+  if (serialized.length <= maxLen) return serialized;
+
+  base.paymentBreakdown = [];
+  serialized = JSON.stringify(base);
+  if (serialized.length <= maxLen) return serialized;
+
+  base.freeText = base.freeText.slice(0, 40);
+  serialized = JSON.stringify(base);
+  if (serialized.length <= maxLen) return serialized;
+
+  const compact = JSON.stringify({
+    freeText: base.freeText,
+    d: Number(base.promotions.discountAmount || 0),
+    a: base.antiFraud?.approvalReason ? String(base.antiFraud.approvalReason).slice(0, 24) : null,
+  });
+  if (compact.length <= maxLen) return compact;
+
+  const tiny = JSON.stringify({ d: Number(base.promotions.discountAmount || 0) });
+  if (tiny.length <= maxLen) return tiny;
+
+  // Absolute last resort for very small varchar columns.
+  return "{}";
+}
+
+async function nextMushakDocumentNo(tx, branchId) {
+  const branch = await tx.branch.findUnique({ where: { id: branchId }, select: { code: true } });
+  const now = new Date();
+  const periodKey = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const scope = "MUSHAK_VAT";
+  const existing = await tx.branchDocumentSeq.findUnique({
+    where: { branchId_scope_periodKey: { branchId, scope, periodKey } },
+  });
+  let nextVal = 1;
+  if (existing) {
+    nextVal = Number(existing.lastValue || 0) + 1;
+    await tx.branchDocumentSeq.update({
+      where: { id: existing.id },
+      data: { lastValue: nextVal },
+    });
+  } else {
+    await tx.branchDocumentSeq.create({
+      data: { branchId, scope, periodKey, lastValue: 1 },
+    });
+  }
+  const code = String(branch?.code || branchId).replace(/\s+/g, "");
+  return `MS-${code}-${periodKey}-${String(nextVal).padStart(5, "0")}`;
+}
+
+function buildVatBreakdownSnapshot(cart, productMap, overrideMap, variantMap) {
+  const rows = [];
+  (cart || []).forEach((item, idx) => {
+    const p = productMap.get(Number(item.id));
+    if (!p) return;
+    const vid = Number(item.variantId || 0) || null;
+    const variant = vid ? variantMap.get(vid) : null;
+    const displayName =
+      variant && String(variant.label || "").trim()
+        ? `${p.name} (${String(variant.label).trim()})`
+        : p.name;
+
+    const row = overrideMap.get(idx);
+    const unit = Number(row?.appliedUnitPrice ?? p.price);
+    const perUnitDisc = Math.min(unit, getPerUnitPredefinedDiscount(p));
+    const netUnit = Math.max(0, unit - perUnitDisc);
+    const bill = getCartLineBillingUnits(item, p);
+    const lineNet = netUnit * bill;
+    const rate = Number(p.vatRate || 0);
+    const lineVat = (lineNet * rate) / 100;
+    rows.push({
+      productId: p.id,
+      name: displayName,
+      qty: bill,
+      sellByWeight: Boolean(p.sellByWeight),
+      weightKg: p.sellByWeight ? Number(item.weightKg || bill) : null,
+      variantId: vid || null,
+      netAmount: Math.round(lineNet * 100) / 100,
+      vatRate: rate,
+      vatAmount: Math.round(lineVat * 100) / 100,
+    });
+  });
+  return rows;
+}
+
+async function allocateFefoBatchesForSale(tx, branchId, saleItems, productMap, cartLines) {
+  const allocations = [];
+  const lines = Array.isArray(cartLines) ? cartLines : [];
+  for (let i = 0; i < (saleItems || []).length; i += 1) {
+    const saleItem = saleItems[i];
+    const cartHint = lines[i];
+    const prod = productMap.get(Number(saleItem.productId));
+    if (!prod || !prod.batchTracked) continue;
+    if (
+      prod.hasVariants ||
+      prod.sellByWeight ||
+      Number(cartHint?.variantId || 0) > 0 ||
+      Number(cartHint?.weightKg ?? 0) > 1e-9
+    ) {
+      continue;
+    }
+    let qtyNeeded = Number(saleItem.qty || 0);
+    if (!Number.isFinite(qtyNeeded) || qtyNeeded <= 0) continue;
+    qtyNeeded = Math.ceil(qtyNeeded - 1e-9);
+    const batches = await tx.inventoryBatch.findMany({
+      where: { branchId, productId: saleItem.productId, qtyOnHand: { gt: 0 } },
+      orderBy: [{ expiryDate: "asc" }, { id: "asc" }],
+    });
+    for (const b of batches) {
+      if (qtyNeeded <= 0) break;
+      const onHand = Number(b.qtyOnHand || 0);
+      if (onHand <= 0) continue;
+      const consumeQty = Math.min(qtyNeeded, onHand);
+      const nextQty = onHand - consumeQty;
+      await tx.inventoryBatch.update({
+        where: { id: b.id },
+        data: { qtyOnHand: nextQty },
+      });
+      allocations.push({
+        saleItemId: saleItem.id,
+        batchId: b.id,
+        productId: saleItem.productId,
+        productName: prod.name || `Product#${saleItem.productId}`,
+        batchCode: b.batchCode,
+        expiryDate: b.expiryDate,
+        consumeQty,
+        unitCost: Number(b.unitCost || prod.price || 0),
+      });
+      qtyNeeded -= consumeQty;
+    }
+    if (qtyNeeded > 0) {
+      const productName = prod.name || `Product#${saleItem.productId}`;
+      throw new Error(
+        `Batch stock mismatch for ${productName}. FEFO allocation missing ${qtyNeeded}. Add batch stock or disable batch tracking.`
+      );
+    }
+  }
+  return allocations;
+}
+
+function isDigitalMethod(method) {
+  return ["BKASH", "NAGAD", "ROCKET", "CARD"].includes(String(method || "").toUpperCase());
+}
+
+function isPromotionActiveNow(rule, now = new Date()) {
+  if (!rule?.isActive) return false;
+  if (rule.startsAt && new Date(rule.startsAt) > now) return false;
+  if (rule.endsAt && new Date(rule.endsAt) < now) return false;
+  return true;
+}
+
+function computePromotionDiscount({ activePromotions, cart, productMap, overrideMap, subTotal }) {
+  let discount = 0;
+  const applied = [];
+  const productQtyMap = new Map();
+  for (let idx = 0; idx < (cart || []).length; idx += 1) {
+    const item = cart[idx];
+    const pid = Number(item.id);
+    const dbProduct = productMap.get(pid);
+    if (!dbProduct) continue;
+    const bill = getCartLineBillingUnits(item, dbProduct);
+    productQtyMap.set(pid, (productQtyMap.get(pid) || 0) + bill);
+  }
+
+  function averageUnitAcrossLines(productId) {
+    let sum = 0;
+    let billTotal = 0;
+    cart.forEach((item, idx) => {
+      if (Number(item.id) !== productId) return;
+      const dbProduct = productMap.get(productId);
+      if (!dbProduct) return;
+      const u = Number((overrideMap.get(idx)?.appliedUnitPrice ?? dbProduct.price) || 0);
+      const b = getCartLineBillingUnits(item, dbProduct);
+      sum += u * b;
+      billTotal += b;
+    });
+    return billTotal > 0 ? sum / billTotal : Number(productMap.get(productId)?.price || 0);
+  }
+
+  for (const rule of activePromotions) {
+    if (rule.type === "CART_PERCENT") {
+      const minBasketAmount = Number(rule.minBasketAmount || 0);
+      const pct = Number(rule.discountValue || 0);
+      if (pct <= 0) continue;
+      if (subTotal < minBasketAmount) continue;
+      const amount = (subTotal * pct) / 100;
+      if (amount <= 0) continue;
+      discount += amount;
+      applied.push({ ruleId: rule.id, type: rule.type, name: rule.name, amount });
+      continue;
+    }
+
+    if (rule.type === "CATEGORY_PERCENT") {
+      const pct = Number(rule.discountValue || 0);
+      const category = String(rule.category || "").trim().toLowerCase();
+      if (pct <= 0 || !category) continue;
+      let matchedSubtotal = 0;
+      cart.forEach((item, idx) => {
+        const dbProduct = productMap.get(Number(item.id));
+        if (!dbProduct) return;
+        if (String(dbProduct.category || "").trim().toLowerCase() !== category) return;
+        const unit = Number((overrideMap.get(idx)?.appliedUnitPrice ?? dbProduct.price) || 0);
+        matchedSubtotal += unit * getCartLineBillingUnits(item, dbProduct);
+      });
+      if (matchedSubtotal <= 0) continue;
+      const amount = (matchedSubtotal * pct) / 100;
+      if (amount <= 0) continue;
+      discount += amount;
+      applied.push({ ruleId: rule.id, type: rule.type, name: rule.name, amount });
+      continue;
+    }
+
+    if (rule.type === "PRODUCT_PERCENT") {
+      const pct = Number(rule.discountValue || 0);
+      const productId = Number(rule.productId || 0);
+      if (pct <= 0 || !productId) continue;
+      const matchedItem = cart.find((item) => Number(item.id) === productId);
+      if (!matchedItem) continue;
+      const dbProduct = productMap.get(productId);
+      if (!dbProduct) continue;
+      let matchedSubtotal = 0;
+      cart.forEach((item, idx) => {
+        if (Number(item.id) !== productId) return;
+        const unit = Number((overrideMap.get(idx)?.appliedUnitPrice ?? dbProduct.price) || 0);
+        matchedSubtotal += unit * getCartLineBillingUnits(item, dbProduct);
+      });
+      if (matchedSubtotal <= 0) continue;
+      const amount = (matchedSubtotal * pct) / 100;
+      if (amount <= 0) continue;
+      discount += amount;
+      applied.push({ ruleId: rule.id, type: rule.type, name: rule.name, amount });
+      continue;
+    }
+
+    if (rule.type === "BOGO_PRODUCT") {
+      const productId = Number(rule.productId || 0);
+      const buyQty = Math.max(1, Number(rule.buyQty || 1));
+      const getQty = Math.max(1, Number(rule.getQty || 1));
+      if (!productId) continue;
+      const qty = Number(productQtyMap.get(productId) || 0);
+      if (qty < buyQty) continue;
+      const freeQty = Math.floor(qty / buyQty) * getQty;
+      if (freeQty <= 0) continue;
+      const dbProduct = productMap.get(productId);
+      if (!dbProduct) continue;
+      const unit = averageUnitAcrossLines(productId);
+      const amount = Math.max(0, Math.min(qty, freeQty) * unit);
+      if (amount <= 0) continue;
+      discount += amount;
+      applied.push({ ruleId: rule.id, type: rule.type, name: rule.name, amount, freeQty });
+    }
+
+    if (rule.type === "BUNDLE_FIXED") {
+      const bundlePrice = Number(rule.bundlePrice || rule.discountValue || 0);
+      const bundleIds = String(rule.bundleProductIds || "")
+        .split(",")
+        .map((x) => Number(x.trim()))
+        .filter((x) => !Number.isNaN(x) && x > 0);
+      if (bundleIds.length < 2 || bundlePrice <= 0) continue;
+      const bundleCount = bundleIds.reduce((minCount, pid) => {
+        const bill = Number(productQtyMap.get(pid) || 0);
+        return Math.min(minCount, Math.floor(bill + 1e-9));
+      }, Number.MAX_SAFE_INTEGER);
+      if (!Number.isFinite(bundleCount) || bundleCount <= 0) continue;
+      let regularBundlePrice = 0;
+      for (const pid of bundleIds) {
+        const dbProduct = productMap.get(pid);
+        if (!dbProduct) {
+          regularBundlePrice = 0;
+          break;
+        }
+        const unit = averageUnitAcrossLines(pid);
+        regularBundlePrice += unit;
+      }
+      if (regularBundlePrice <= 0 || regularBundlePrice <= bundlePrice) continue;
+      const amount = (regularBundlePrice - bundlePrice) * bundleCount;
+      if (amount <= 0) continue;
+      discount += amount;
+      applied.push({
+        ruleId: rule.id,
+        type: rule.type,
+        name: rule.name,
+        amount,
+        bundleCount,
+      });
+    }
+
+    if (rule.type === "CATEGORY_BUNDLE_FIXED") {
+      const bundleSize = Math.max(2, Number(rule.buyQty || 2));
+      const bundlePrice = Number(rule.bundlePrice || rule.discountValue || 0);
+      const category = String(rule.category || "").trim().toLowerCase();
+      if (!category || bundlePrice <= 0) continue;
+      const categoryItems = [];
+      for (let ci = 0; ci < (cart || []).length; ci += 1) {
+        const item = cart[ci];
+        const dbProduct = productMap.get(Number(item.id));
+        if (!dbProduct) continue;
+        if (String(dbProduct.category || "").trim().toLowerCase() !== category) continue;
+        const unit = Number((overrideMap.get(ci)?.appliedUnitPrice ?? dbProduct.price) || 0);
+        const bill = getCartLineBillingUnits(item, dbProduct);
+        const wholeSlots = Math.max(0, Math.floor(Number(bill) + 1e-9));
+        for (let i = 0; i < wholeSlots; i += 1) {
+          categoryItems.push(unit);
+        }
+      }
+      if (categoryItems.length < bundleSize) continue;
+      categoryItems.sort((a, b) => b - a);
+      const bundleCount = Math.floor(categoryItems.length / bundleSize);
+      if (bundleCount <= 0) continue;
+      let amount = 0;
+      for (let i = 0; i < bundleCount; i += 1) {
+        const start = i * bundleSize;
+        const regular = categoryItems.slice(start, start + bundleSize).reduce((sum, x) => sum + Number(x || 0), 0);
+        if (regular > bundlePrice) {
+          amount += regular - bundlePrice;
+        }
+      }
+      if (amount <= 0) continue;
+      discount += amount;
+      applied.push({
+        ruleId: rule.id,
+        type: rule.type,
+        name: rule.name,
+        amount,
+        bundleCount,
+        bundleSize,
+      });
+    }
+  }
+
+  return {
+    applied,
+    amount: Math.min(Math.max(0, discount), Math.max(0, subTotal)),
+  };
+}
+
 function parsePaymentBreakdownFromNotes(notes) {
   if (!notes) return [];
   try {
@@ -287,6 +764,9 @@ function normalizeHeldCartPayload(input = {}) {
     discountValue: Number(input.discountValue || 0),
     redeemPoints: Number(input.redeemPoints || 0),
     holdNote: String(input.holdNote || ""),
+    buyerBinOrNidNote: String(input.buyerBinOrNidNote || ""),
+    giftCardRedemptions: Array.isArray(input.giftCardRedemptions) ? input.giftCardRedemptions : [],
+    walletRedeemAmount: Number(input.walletRedeemAmount || 0),
   };
 }
 
@@ -381,9 +861,12 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
 
   const methodTotals = new Map();
   const channelTotals = new Map();
+  const digitalRefCounts = new Map();
   const dailyTotals = new Map();
   let totalPaid = 0;
   let totalDue = 0;
+  let digitalCollectionTotal = 0;
+  let digitalMissingRefCount = 0;
 
   const addAmount = (map, key, amount) => {
     const normalizedKey = key || "Unknown";
@@ -400,13 +883,27 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
       if (splitLines.length) {
         for (const line of splitLines) {
           addAmount(methodTotals, line.method, line.amount);
-          if (line.channel) addAmount(channelTotals, line.channel, line.amount);
+          if (line.channel) {
+            addAmount(channelTotals, line.channel, line.amount);
+            digitalRefCounts.set(line.channel, (digitalRefCounts.get(line.channel) || 0) + 1);
+          }
+          if (isDigitalMethod(line.method)) {
+            digitalCollectionTotal += Number(line.amount || 0);
+            if (!String(line.channel || "").trim()) digitalMissingRefCount += 1;
+          }
         }
         continue;
       }
     }
     addAmount(methodTotals, sale.paymentMethod || "Cash", salePaid);
-    if (sale.paymentChannel) addAmount(channelTotals, sale.paymentChannel, salePaid);
+    if (sale.paymentChannel) {
+      addAmount(channelTotals, sale.paymentChannel, salePaid);
+      digitalRefCounts.set(sale.paymentChannel, (digitalRefCounts.get(sale.paymentChannel) || 0) + 1);
+    }
+    if (isDigitalMethod(sale.paymentMethod)) {
+      digitalCollectionTotal += salePaid;
+      if (!String(sale.paymentChannel || "").trim()) digitalMissingRefCount += 1;
+    }
   }
 
   const methods = Array.from(methodTotals.entries())
@@ -415,6 +912,9 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
   const channels = Array.from(channelTotals.entries())
     .map(([channel, amount]) => ({ channel, amount }))
     .sort((a, b) => b.amount - a.amount);
+  const digitalRefs = Array.from(digitalRefCounts.entries())
+    .map(([channel, count]) => ({ channel, count }))
+    .sort((a, b) => b.count - a.count);
   const days = Array.from(dailyTotals.entries())
     .map(([date, paid]) => ({ date, paid }))
     .sort((a, b) => a.date.localeCompare(b.date));
@@ -425,8 +925,11 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
     billCount: todaySales.length,
     totalPaid,
     totalDue,
+    digitalCollectionTotal,
+    digitalMissingRefCount,
     methods,
     channels,
+    digitalRefs,
     days,
   };
 }
@@ -520,9 +1023,14 @@ exports.checkout = async (req, res) => {
       notes,
       paymentBreakdown,
       managerApprovalPin,
+      approvalReason,
       redeemPoints,
       holdCartAuditLogId: holdCartAuditLogIdRaw,
       quoteAuditLogId: quoteAuditLogIdRaw,
+      buyerBinOrNidNote: buyerBinOrNidNoteRaw,
+      giftCardRedemptions: giftCardRedemptionsRaw,
+      walletRedeemAmount: walletRedeemAmountRaw,
+      couponCode: couponCodeRaw,
     } = req.body;
     const holdCartAuditLogId =
       holdCartAuditLogIdRaw != null && holdCartAuditLogIdRaw !== ""
@@ -541,53 +1049,135 @@ exports.checkout = async (req, res) => {
     }
     await ensureOpenFiscalPeriod(branchId);
 
-    const productIds = cart.map((item) => item.id);
+    const productIds = [...new Set(cart.map((item) => Number(item.id)))];
     const dbProducts = await prisma.product.findMany({ where: { id: { in: productIds }, branchId } });
     const productMap = new Map(dbProducts.map((p) => [p.id, p]));
 
+    const variantIds = [
+      ...new Set(
+        cart
+          .map((item) => Number(item.variantId || 0))
+          .filter((x) => Number.isFinite(x) && x > 0)
+      ),
+    ];
+    const dbVariants =
+      variantIds.length > 0
+        ? await prisma.productVariant.findMany({
+            where: { branchId, id: { in: variantIds } },
+          })
+        : [];
+    const variantMap = new Map(dbVariants.map((v) => [v.id, v]));
+
     for (const item of cart) {
-      const dbProduct = productMap.get(item.id);
+      const dbProduct = productMap.get(Number(item.id));
       if (!dbProduct) return res.status(404).json({ error: `Product not found: ${item.id}` });
-      if (Number(item.qty) <= 0) return res.status(400).json({ error: `Invalid quantity for ${dbProduct.name}` });
-      if (dbProduct.stock < Number(item.qty)) {
-        return res.status(400).json({ error: `Insufficient stock for ${dbProduct.name}. Available: ${dbProduct.stock}` });
+      const vid = Number(item.variantId || 0) || null;
+      const weightVal = Number(item.weightKg ?? 0);
+
+      if (dbProduct.sellByWeight && vid) {
+        return res
+          .status(400)
+          .json({ error: `Cannot apply a variant to sell-by-KG product ${dbProduct.name}` });
+      }
+      if (!dbProduct.sellByWeight && weightVal > 1e-9) {
+        return res.status(400).json({ error: `Weight is not allowed on ${dbProduct.name}` });
+      }
+      if (!dbProduct.hasVariants && vid) {
+        return res.status(400).json({ error: `${dbProduct.name} does not use variants` });
+      }
+      if (dbProduct.hasVariants && !vid) {
+        return res.status(400).json({ error: `Please pick a variant for ${dbProduct.name}` });
+      }
+
+      if (vid) {
+        const vrow = variantMap.get(vid);
+        if (!vrow || Number(vrow.productId) !== Number(dbProduct.id) || Number(vrow.branchId) !== Number(branchId)) {
+          return res.status(400).json({ error: `Invalid variant for ${dbProduct.name}` });
+        }
+        const q = Number(item.qty ?? 0);
+        if (!(q > 0)) {
+          return res.status(400).json({ error: `Invalid quantity for ${dbProduct.name}` });
+        }
+        const need = Math.max(1, Math.ceil(Number(q) - 1e-9));
+        if (vrow.stock < need) {
+          return res.status(400).json({
+            error: `Insufficient stock for variant of ${dbProduct.name}. Available: ${vrow.stock}`,
+          });
+        }
+        continue;
+      }
+
+      if (dbProduct.sellByWeight) {
+        const bill = getCartLineBillingUnits(item, dbProduct);
+        if (!(bill > 0)) {
+          return res.status(400).json({ error: `Invalid weight for ${dbProduct.name}` });
+        }
+        if (Number(dbProduct.stockKg) + 1e-9 < bill) {
+          return res.status(400).json({
+            error: `Insufficient KG stock for ${dbProduct.name}. Available: ${Number(dbProduct.stockKg).toFixed(3)}`,
+          });
+        }
+        continue;
+      }
+
+      const q = Number(item.qty ?? 0);
+      if (!(q > 0)) {
+        return res.status(400).json({ error: `Invalid quantity for ${dbProduct.name}` });
+      }
+      const need = Math.max(1, Math.ceil(Number(q) - 1e-9));
+      if (dbProduct.stock < need) {
+        return res.status(400).json({
+          error: `Insufficient stock for ${dbProduct.name}. Available: ${dbProduct.stock}`,
+        });
       }
     }
 
-    const overrideRows = parseCartPriceOverrides(cart, productMap);
-    const overrideMap = new Map(overrideRows.map((row) => [row.productId, row]));
-    const grossSubTotal = cart.reduce((sum, item) => {
-      const row = overrideMap.get(Number(item.id));
-      const unit = Number(row?.appliedUnitPrice ?? productMap.get(item.id).price);
-      return sum + unit * Number(item.qty);
-    }, 0);
-    const predefinedDiscount = cart.reduce((sum, item) => {
-      const dbProduct = productMap.get(item.id);
-      const row = overrideMap.get(Number(item.id));
+    let overrideRows;
+    try {
+      overrideRows = parseCartPriceOverrides(cart, productMap, variantMap);
+    } catch (e) {
+      return res.status(400).json({ error: e.message || "Invalid cart" });
+    }
+    const overrideMap = new Map(overrideRows.map((row) => [row.lineIndex, row]));
+    const grossSubTotal = cart.reduce(
+      (sum, item, idx) => sum + cartLineRetailSubtotal(item, idx, productMap, variantMap, overrideMap),
+      0
+    );
+    const predefinedDiscount = cart.reduce((sum, item, idx) => {
+      const dbProduct = productMap.get(Number(item.id));
+      if (!dbProduct) return sum;
+      const row = overrideMap.get(idx);
       const unit = Number(row?.appliedUnitPrice ?? dbProduct.price);
+      const bill = getCartLineBillingUnits(item, dbProduct);
       const perUnit = Math.min(unit, getPerUnitPredefinedDiscount(dbProduct));
-      return sum + perUnit * Number(item.qty);
+      return sum + perUnit * bill;
     }, 0);
     const subTotal = Math.max(0, grossSubTotal - predefinedDiscount);
-    const vatAmount = cart.reduce((sum, item) => {
-      const dbProduct = productMap.get(item.id);
-      const row = overrideMap.get(Number(item.id));
+    const vatAmount = cart.reduce((sum, item, idx) => {
+      const dbProduct = productMap.get(Number(item.id));
+      if (!dbProduct) return sum;
+      const row = overrideMap.get(idx);
       const unit = Number(row?.appliedUnitPrice ?? dbProduct.price);
+      const bill = getCartLineBillingUnits(item, dbProduct);
       const perUnitDiscount = Math.min(unit, getPerUnitPredefinedDiscount(dbProduct));
       const netUnitPrice = Math.max(0, unit - perUnitDiscount);
-      return sum + (netUnitPrice * Number(item.qty) * Number(dbProduct.vatRate || 0)) / 100;
+      return sum + (netUnitPrice * bill * Number(dbProduct.vatRate || 0)) / 100;
     }, 0);
     const manualDiscountType = discountType || (discount ? "AMOUNT" : "AMOUNT");
     if (!["PERCENT", "AMOUNT"].includes(manualDiscountType)) {
       return res.status(400).json({ error: "Discount type must be PERCENT or AMOUNT" });
     }
     const manualDiscountValue = Number(discountValue ?? discount ?? 0);
+    const approvalReasonText = String(approvalReason || "").trim();
     if (manualDiscountValue < 0) return res.status(400).json({ error: "Discount cannot be negative" });
     if (manualDiscountType === "PERCENT" && manualDiscountValue > 100) {
       return res.status(400).json({ error: "Percent discount cannot exceed 100" });
     }
     const manualDiscountAmount = calculateManualDiscount(subTotal, manualDiscountType, manualDiscountValue);
     if (requiresManagerApproval(manualDiscountType, manualDiscountValue, manualDiscountAmount)) {
+      if (!approvalReasonText) {
+        return res.status(400).json({ error: "Approval reason is required for manager-approved discount" });
+      }
       if (String(managerApprovalPin || "") !== getManagerApprovalPin()) {
         await writeAuditLog({
           userId: req.user?.id || null,
@@ -598,7 +1188,7 @@ exports.checkout = async (req, res) => {
             status: "REJECTED",
             reason: "Manager PIN missing/invalid for manual discount",
             amount: manualDiscountAmount,
-            meta: { discountType: manualDiscountType, discountValue: manualDiscountValue },
+            meta: { discountType: manualDiscountType, discountValue: manualDiscountValue, approvalReason: approvalReasonText },
           },
         });
         return res.status(403).json({ error: "Manager approval PIN required for this discount" });
@@ -612,12 +1202,15 @@ exports.checkout = async (req, res) => {
           status: "APPROVED",
           reason: "Manager PIN approved manual discount",
           amount: manualDiscountAmount,
-          meta: { discountType: manualDiscountType, discountValue: manualDiscountValue },
+          meta: { discountType: manualDiscountType, discountValue: manualDiscountValue, approvalReason: approvalReasonText },
         },
       });
     }
     const overrideApproval = requiresPriceOverrideApproval(overrideRows);
     if (overrideApproval.required) {
+      if (!approvalReasonText) {
+        return res.status(400).json({ error: "Approval reason is required for manager-approved price override" });
+      }
       if (String(managerApprovalPin || "") !== getManagerApprovalPin()) {
         await writeAuditLog({
           userId: req.user?.id || null,
@@ -629,6 +1222,7 @@ exports.checkout = async (req, res) => {
             reason: "Manager PIN missing/invalid for line price override",
             amount: overrideApproval.totalReductionAmount,
             meta: {
+              approvalReason: approvalReasonText,
               rows: overrideApproval.rowsNeedingApproval.map((x) => ({
                 productId: x.productId,
                 productName: x.productName,
@@ -650,6 +1244,7 @@ exports.checkout = async (req, res) => {
           reason: "Manager PIN approved line price override",
           amount: overrideApproval.totalReductionAmount,
           meta: {
+            approvalReason: approvalReasonText,
             rows: overrideApproval.rowsNeedingApproval.map((x) => ({
               productId: x.productId,
               productName: x.productName,
@@ -711,6 +1306,9 @@ exports.checkout = async (req, res) => {
       });
     }
     if (requestedRedeemPoints > redeemConfig.managerApprovalPoints) {
+      if (!approvalReasonText) {
+        return res.status(400).json({ error: "Approval reason is required for high redemption approval" });
+      }
       if (String(managerApprovalPin || "") !== getManagerApprovalPin()) {
         await writeAuditLog({
           userId: req.user?.id || null,
@@ -721,7 +1319,7 @@ exports.checkout = async (req, res) => {
             status: "REJECTED",
             reason: "Manager PIN missing/invalid for high redemption",
             amount: redeemDiscountAmount,
-            meta: { requestedRedeemPoints },
+            meta: { requestedRedeemPoints, approvalReason: approvalReasonText },
           },
         });
         return res.status(403).json({ error: "Manager approval PIN required for high redemption" });
@@ -735,54 +1333,210 @@ exports.checkout = async (req, res) => {
           status: "APPROVED",
           reason: "Manager PIN approved high redemption",
           amount: redeemDiscountAmount,
-          meta: { requestedRedeemPoints },
+          meta: { requestedRedeemPoints, approvalReason: approvalReasonText },
         },
       });
     }
+    const activePromotions = await prisma.promotionRule.findMany({
+      where: { branchId, isActive: true },
+      orderBy: { id: "asc" },
+      take: 100,
+    });
+    const eligiblePromotions = activePromotions.filter((rule) => isPromotionActiveNow(rule));
+    const promotionSummary = computePromotionDiscount({
+      activePromotions: eligiblePromotions,
+      cart,
+      productMap,
+      overrideMap,
+      subTotal,
+    });
+
+    const couponCodeNormalized = String(couponCodeRaw || "").trim().toUpperCase().slice(0, 48);
+    let couponRowPre = null;
+    let couponDiscountAmount = 0;
+    if (couponCodeNormalized) {
+      couponRowPre = await prisma.couponCode.findFirst({
+        where: { branchId, code: couponCodeNormalized },
+      });
+      if (!couponRowPre) {
+        return res.status(400).json({ error: "Invalid coupon code" });
+      }
+      try {
+        validateCouponForSubtotal(couponRowPre, subTotal);
+        couponDiscountAmount = computeCouponAmount(couponRowPre, subTotal);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    }
+
     const discountAmount = Math.max(
       0,
-      predefinedDiscount + manualDiscountAmount + tierDiscountAmount + redeemDiscountAmount
+      predefinedDiscount +
+        manualDiscountAmount +
+        tierDiscountAmount +
+        redeemDiscountAmount +
+        promotionSummary.amount +
+        couponDiscountAmount
     );
     const total = Math.max(0, subTotal + vatAmount - discountAmount);
     const splitPayments = normalizePaymentBreakdown(paymentBreakdown);
     const splitPaidAmount = splitPayments.reduce((sum, line) => sum + line.amount, 0);
     const hasSplitPayments = splitPayments.length > 0;
-    const finalPaidAmount = hasSplitPayments ? splitPaidAmount : Number(paidAmount ?? total);
-    if (finalPaidAmount < 0) return res.status(400).json({ error: "Paid amount cannot be negative" });
-    if (hasSplitPayments && splitPaidAmount > total) {
-      return res.status(400).json({ error: "Total split payment cannot exceed bill total" });
+    const normalizedMethod = String(paymentMethod || "Cash");
+    if (!hasSplitPayments && isDigitalMethod(normalizedMethod) && !String(paymentChannel || "").trim()) {
+      return res.status(400).json({ error: `Transaction/reference ID is required for ${normalizedMethod} payment` });
     }
-    const dueAmount = Math.max(0, total - finalPaidAmount);
-    const notesPayload = {
-      freeText: notes ? String(notes) : "",
-      paymentBreakdown: splitPayments,
-      loyalty: {
-        tier: customerLoyaltyContext?.tier || "REGULAR",
-        tierDiscountPercent,
-        tierDiscountAmount,
-        redeemedPoints: requestedRedeemPoints,
-        redeemedAmount: redeemDiscountAmount,
-      },
-    };
-    if (dueAmount > 0 && hasCustomerIdentity) {
-      const existingForCredit = customerPhone
-        ? await prisma.customer.findFirst({ where: { phone: customerPhone, branchId } })
-        : await prisma.customer.findFirst({ where: { name: customerName, branchId } });
-      if (existingForCredit) {
-        const limit = Number(existingForCredit.creditLimit || 0);
-        if (limit > 0) {
-          const currentBal = Number(existingForCredit.balance || 0);
-          const projected = currentBal + dueAmount;
-          if (projected > limit + 0.005) {
-            if (String(managerApprovalPin || "") !== getManagerApprovalPin()) {
+    if (hasSplitPayments) {
+      const missingDigitalLine = splitPayments.find(
+        (line) => isDigitalMethod(line.method) && !String(line.channel || "").trim()
+      );
+      if (missingDigitalLine) {
+        return res.status(400).json({
+          error: `Transaction/reference ID required for split digital line (${missingDigitalLine.method})`,
+        });
+      }
+    }
+    const giftCardRedemptions = normalizeGiftCardRedemptions(giftCardRedemptionsRaw);
+    const walletRedeemRequest = Math.max(0, Number(walletRedeemAmountRaw || 0));
+    if (walletRedeemRequest > 0 && !hasCustomerIdentity) {
+      return res.status(400).json({ error: "Customer identity is required for wallet redemption" });
+    }
+    const buyerBinOrNidNote = String(buyerBinOrNidNoteRaw || "").trim().slice(0, 120) || null;
+    const vatRowsForSnapshot = buildVatBreakdownSnapshot(cart, productMap, overrideMap, variantMap);
+
+    let resultSale = null;
+    let loyaltySnapshot = null;
+
+    await prisma.$transaction(async (tx) => {
+      let customerId = null;
+      if (hasCustomerIdentity) {
+        let existingCustomer = customerPhone
+          ? await tx.customer.findFirst({ where: { phone: customerPhone, branchId } })
+          : await tx.customer.findFirst({ where: { name: customerName, branchId } });
+        if (!existingCustomer && customerName) {
+          existingCustomer = await tx.customer.create({
+            data: {
+              branchId,
+              name: customerName,
+              phone: customerPhone || null,
+              balance: 0,
+              storedValueBalance: 0,
+            },
+          });
+        }
+        customerId = existingCustomer?.id || null;
+      }
+      if (walletRedeemRequest > 0 && !customerId) {
+        throw new Error("Customer record required for wallet redemption");
+      }
+
+      let billRemain = total;
+      const appliedGifts = [];
+      for (const g of giftCardRedemptions) {
+        const card = await tx.giftCard.findFirst({
+          where: { branchId, code: g.code, status: "ACTIVE" },
+        });
+        if (!card) throw new Error(`Gift card not found: ${g.code}`);
+        if (card.expiresAt && new Date(card.expiresAt) < new Date()) {
+          throw new Error(`Gift card expired: ${g.code}`);
+        }
+        const bal = Number(card.balance || 0);
+        if (bal <= 0) throw new Error(`Gift card has no balance: ${g.code}`);
+        let take = Math.min(bal, billRemain);
+        if (g.amount != null && Number.isFinite(g.amount) && g.amount > 0) {
+          take = Math.min(take, g.amount);
+        }
+        if (take <= 0) continue;
+        const nextBal = bal - take;
+        await tx.giftCard.update({
+          where: { id: card.id },
+          data: {
+            balance: nextBal,
+            status: nextBal <= 0.0001 ? "DEPLETED" : card.status,
+          },
+        });
+        appliedGifts.push({ id: card.id, code: g.code, amount: take });
+        billRemain -= take;
+      }
+
+      let walletTake = 0;
+      if (walletRedeemRequest > 0 && customerId) {
+        const cRow = await tx.customer.findUnique({ where: { id: customerId } });
+        const wbal = Number(cRow?.storedValueBalance || 0);
+        walletTake = Math.min(walletRedeemRequest, wbal, billRemain);
+        if (walletTake > 0) {
+          await tx.customer.update({
+            where: { id: customerId },
+            data: { storedValueBalance: { decrement: walletTake } },
+          });
+          billRemain -= walletTake;
+        }
+      }
+
+      const internalOwed = Math.max(0, billRemain);
+      const internalCashPaid = hasSplitPayments ? splitPaidAmount : Number(paidAmount ?? internalOwed);
+      if (internalCashPaid < 0) throw new Error("Paid amount cannot be negative");
+      if (hasSplitPayments && splitPaidAmount > internalOwed + 0.01) {
+        throw new Error("Total split payment cannot exceed amount owed after gift/wallet");
+      }
+      if (!hasSplitPayments && internalCashPaid > internalOwed + 0.01) {
+        throw new Error("Paid amount exceeds amount owed after gift/wallet");
+      }
+      const dueAmount = Math.max(0, internalOwed - internalCashPaid);
+
+      if (dueAmount > 0 && !customerName) {
+        throw new Error("Customer name is required for due/baki sale");
+      }
+
+      if (dueAmount > 0 && hasCustomerIdentity) {
+        const existingForCredit = customerPhone
+          ? await tx.customer.findFirst({ where: { phone: customerPhone, branchId } })
+          : await tx.customer.findFirst({ where: { name: customerName, branchId } });
+        if (existingForCredit) {
+          const limit = Number(existingForCredit.creditLimit || 0);
+          if (limit > 0) {
+            const currentBal = Number(existingForCredit.balance || 0);
+            const projected = currentBal + dueAmount;
+            if (projected > limit + 0.005) {
+              if (!approvalReasonText) {
+                throw new Error("Approval reason required for credit limit override");
+              }
+              if (String(managerApprovalPin || "") !== getManagerApprovalPin()) {
+                await writeAuditLog({
+                  userId: req.user?.id || null,
+                  action: "APPROVAL_CREDIT_LIMIT",
+                  entity: "Customer",
+                  entityId: existingForCredit.id,
+                  payload: {
+                    status: "REJECTED",
+                    reason: "Manager PIN missing/invalid for credit limit override",
+                    amount: projected - limit,
+                    meta: {
+                      limit,
+                      projected,
+                      currentBalance: currentBal,
+                      dueAmount,
+                      customerId: existingForCredit.id,
+                      approvalReason: approvalReasonText,
+                    },
+                  },
+                });
+                throw new Error(
+                  `Credit limit (${limit.toFixed(
+                    2
+                  )} BDT) would be exceeded (projected balance ${projected.toFixed(
+                    2
+                  )}). Enter manager PIN on checkout, or reduce the due amount.`
+                );
+              }
               await writeAuditLog({
                 userId: req.user?.id || null,
                 action: "APPROVAL_CREDIT_LIMIT",
                 entity: "Customer",
                 entityId: existingForCredit.id,
                 payload: {
-                  status: "REJECTED",
-                  reason: "Manager PIN missing/invalid for credit limit override",
+                  status: "APPROVED",
+                  reason: "Manager PIN approved exceeding credit limit",
                   amount: projected - limit,
                   meta: {
                     limit,
@@ -790,61 +1544,68 @@ exports.checkout = async (req, res) => {
                     currentBalance: currentBal,
                     dueAmount,
                     customerId: existingForCredit.id,
+                    approvalReason: approvalReasonText,
                   },
                 },
               });
-              return res.status(403).json({
-                error: `Credit limit (${limit.toFixed(
-                  2
-                )} BDT) would be exceeded (projected balance ${projected.toFixed(
-                  2
-                )}). Enter manager PIN on checkout, or reduce the due amount.`,
-              });
             }
-            await writeAuditLog({
-              userId: req.user?.id || null,
-              action: "APPROVAL_CREDIT_LIMIT",
-              entity: "Customer",
-              entityId: existingForCredit.id,
-              payload: {
-                status: "APPROVED",
-                reason: "Manager PIN approved exceeding credit limit",
-                amount: projected - limit,
-                meta: {
-                  limit,
-                  projected,
-                  currentBalance: currentBal,
-                  dueAmount,
-                  customerId: existingForCredit.id,
-                },
-              },
-            });
           }
         }
       }
-    }
-    let resultSale = null;
-    let loyaltySnapshot = null;
 
-    await prisma.$transaction(async (tx) => {
-      let customerId = null;
-      if (dueAmount > 0 && !customerName) throw new Error("Customer name is required for due/baki sale");
-      if (hasCustomerIdentity) {
-        const existingCustomer = customerPhone
-          ? await tx.customer.findFirst({ where: { phone: customerPhone, branchId } })
-          : await tx.customer.findFirst({ where: { name: customerName, branchId } });
-        if (existingCustomer) {
-          if (dueAmount > 0) {
-            await tx.customer.update({ where: { id: existingCustomer.id }, data: { balance: { increment: dueAmount } } });
-          }
-          customerId = existingCustomer.id;
-        } else if (customerName) {
-          const savedCustomer = await tx.customer.create({
-            data: { branchId, name: customerName, phone: customerPhone || null, balance: dueAmount > 0 ? dueAmount : 0 },
-          });
-          customerId = savedCustomer.id;
-        }
+      if (dueAmount > 0 && customerId) {
+        await tx.customer.update({
+          where: { id: customerId },
+          data: { balance: { increment: dueAmount } },
+        });
+      } else if (dueAmount > 0 && customerName && !customerId) {
+        const savedCustomer = await tx.customer.create({
+          data: {
+            branchId,
+            name: customerName,
+            phone: customerPhone || null,
+            balance: dueAmount,
+            storedValueBalance: 0,
+          },
+        });
+        customerId = savedCustomer.id;
       }
+
+      const giftTotal = appliedGifts.reduce((sum, g) => sum + g.amount, 0);
+      const salePaidAmountTotal = internalCashPaid + giftTotal + walletTake;
+
+      const notesPayload = {
+        freeText: notes ? String(notes) : "",
+        paymentBreakdown: splitPayments,
+        loyalty: {
+          tier: customerLoyaltyContext?.tier || "REGULAR",
+          tierDiscountPercent,
+          tierDiscountAmount,
+          redeemedPoints: requestedRedeemPoints,
+          redeemedAmount: redeemDiscountAmount,
+        },
+        promotions: {
+          discountAmount: promotionSummary.amount,
+          applied: promotionSummary.applied,
+        },
+        antiFraud: {
+          managerApprovalPinUsed: Boolean(String(managerApprovalPin || "")),
+          approvalReason: approvalReasonText || null,
+        },
+        storedValue: {
+          gifts: appliedGifts,
+          wallet: walletTake,
+        },
+        coupon: couponRowPre
+          ? {
+              couponCodeId: couponRowPre.id,
+              code: couponCodeNormalized,
+              discount: couponDiscountAmount,
+            }
+          : undefined,
+      };
+      const serializedSaleNotes = sanitizeSaleNotesPayload(notesPayload);
+      const mushakDocumentNo = await nextMushakDocumentNo(tx, branchId);
 
       resultSale = await tx.sale.create({
         data: {
@@ -855,34 +1616,223 @@ exports.checkout = async (req, res) => {
           vatAmount,
           discount: discountAmount,
           total,
-          paidAmount: finalPaidAmount,
+          paidAmount: salePaidAmountTotal,
           dueAmount,
           paymentMethod: hasSplitPayments ? "Split" : paymentMethod || "Cash",
           paymentChannel: hasSplitPayments ? "Multi" : paymentChannel || null,
-          notes: JSON.stringify(notesPayload),
+          notes: serializedSaleNotes,
           customerId,
+          buyerBinOrNidNote,
+          mushakDocumentNo,
+          vatBreakdownSnapshot: vatRowsForSnapshot,
+          couponCodeId: couponRowPre ? couponRowPre.id : null,
+          couponDiscount: couponDiscountAmount,
           items: {
-            create: cart.map((item) => ({
-              productId: item.id,
-              qty: Number(item.qty),
-              price: Number(overrideMap.get(Number(item.id))?.appliedUnitPrice ?? productMap.get(item.id).price),
-              cost: Number(productMap.get(item.id).price),
-            })),
+            create: cart.map((item, idx) => {
+              const prod = productMap.get(Number(item.id));
+              const row = overrideMap.get(idx);
+              const vidCreate = Number(item.variantId || 0) || null;
+              const weightKgVal = prod?.sellByWeight
+                ? Math.max(0, Number(item.weightKg ?? getCartLineBillingUnits(item, prod)))
+                : null;
+              return {
+                productId: Number(item.id),
+                productVariantId: vidCreate,
+                qty: Number(item.qty ?? 1),
+                weightKg: weightKgVal,
+                price: Number(row?.appliedUnitPrice ?? prod.price),
+                cost: Number(prod.price),
+              };
+            }),
           },
         },
         include: { items: true, customer: true },
       });
 
-      for (const item of cart) {
-        await tx.product.update({ where: { id: item.id }, data: { stock: { decrement: Number(item.qty) } } });
+      if (couponRowPre) {
+        const refreshedCoupon = await tx.couponCode.findFirst({
+          where: { id: couponRowPre.id, branchId, isActive: true },
+        });
+        if (!refreshedCoupon) {
+          throw new Error("Coupon is no longer available");
+        }
+        validateCouponForSubtotal(refreshedCoupon, subTotal);
+        const recheckAmt = computeCouponAmount(refreshedCoupon, subTotal);
+        if (Math.abs(recheckAmt - couponDiscountAmount) > 0.02) {
+          throw new Error("Coupon discount changed — remove coupon and try again");
+        }
+        await tx.couponCode.update({
+          where: { id: refreshedCoupon.id },
+          data: { redemptionCount: { increment: 1 } },
+        });
+      }
+
+      const payRows = [];
+      if (hasSplitPayments) {
+        for (const line of splitPayments) {
+          payRows.push({
+            saleId: resultSale.id,
+            method: String(line.method || "Cash"),
+            channel: line.channel || null,
+            amount: line.amount,
+            meta: {},
+          });
+        }
+      } else {
+        payRows.push({
+          saleId: resultSale.id,
+          method: normalizedMethod,
+          channel: paymentChannel || null,
+          amount: internalCashPaid,
+          meta: {},
+        });
+      }
+      for (const g of appliedGifts) {
+        payRows.push({
+          saleId: resultSale.id,
+          method: "GIFTCARD",
+          channel: g.code,
+          amount: g.amount,
+          meta: { giftCardId: g.id },
+        });
+      }
+      if (walletTake > 0) {
+        payRows.push({
+          saleId: resultSale.id,
+          method: "WALLET",
+          channel: customerId ? String(customerId) : "",
+          amount: walletTake,
+          meta: {},
+        });
+      }
+      if (payRows.length) {
+        await tx.salePayment.createMany({ data: payRows });
+      }
+
+      for (const g of appliedGifts) {
+        await tx.storedValueTxn.create({
+          data: {
+            giftCardId: g.id,
+            customerId,
+            saleId: resultSale.id,
+            type: "REDEEM",
+            amount: g.amount,
+            note: `Sale ${resultSale.invoiceNo || resultSale.id}`,
+          },
+        });
+      }
+      if (walletTake > 0 && customerId) {
+        await tx.storedValueTxn.create({
+          data: {
+            customerId,
+            saleId: resultSale.id,
+            type: "WALLET_REDEEM",
+            amount: walletTake,
+            note: `Sale ${resultSale.invoiceNo || resultSale.id}`,
+          },
+        });
+      }
+
+      const fefoAllocations = await allocateFefoBatchesForSale(tx, branchId, resultSale.items, productMap, cart);
+      for (const alloc of fefoAllocations) {
+        await tx.saleItemBatch.create({
+          data: {
+            saleItemId: alloc.saleItemId,
+            batchId: alloc.batchId,
+            qty: alloc.consumeQty,
+          },
+        });
         await tx.stockLedger.create({
           data: {
             branchId,
-            productId: item.id,
+            productId: Number(alloc.productId),
+            refType: "SALE_BATCH",
+            refId: resultSale.id,
+            outQty: Number(alloc.consumeQty || 0),
+            unitCost: Number(alloc.unitCost || productMap.get(Number(alloc.productId))?.price || 0),
+          },
+        });
+      }
+
+      for (let li = 0; li < cart.length; li += 1) {
+        const item = cart[li];
+        const dbProduct = productMap.get(Number(item.id));
+        const vidLine = Number(item.variantId || 0) || null;
+        const unitCostBase = Number(dbProduct.price);
+
+        if (vidLine) {
+          const dec = Math.max(1, Math.ceil(Number(item.qty ?? 1) - 1e-9));
+          await tx.productVariant.update({
+            where: { id: vidLine },
+            data: { stock: { decrement: dec } },
+          });
+          await tx.stockLedger.create({
+            data: {
+              branchId,
+              productId: Number(item.id),
+              refType: "SALE",
+              refId: resultSale.id,
+              outQty: dec,
+              unitCost: unitCostBase,
+            },
+          });
+          continue;
+        }
+
+        if (dbProduct.sellByWeight) {
+          const w = Math.max(0, Number(item.weightKg ?? getCartLineBillingUnits(item, dbProduct)));
+          await tx.product.update({
+            where: { id: Number(item.id) },
+            data: { stockKg: { decrement: w } },
+          });
+          await tx.stockLedger.create({
+            data: {
+              branchId,
+              productId: Number(item.id),
+              refType: "SALE",
+              refId: resultSale.id,
+              outQty: 0,
+              outWeightKg: w,
+              unitCost: unitCostBase,
+            },
+          });
+          continue;
+        }
+
+        const decQty = Math.max(1, Math.ceil(Number(item.qty ?? 0) - 1e-9));
+        await tx.product.update({
+          where: { id: Number(item.id) },
+          data: { stock: { decrement: decQty } },
+        });
+        await tx.stockLedger.create({
+          data: {
+            branchId,
+            productId: Number(item.id),
             refType: "SALE",
             refId: resultSale.id,
-            outQty: Number(item.qty),
-            unitCost: Number(productMap.get(item.id).price),
+            outQty: decQty,
+            unitCost: unitCostBase,
+          },
+        });
+      }
+
+      if (fefoAllocations.length) {
+        await tx.auditLog.create({
+          data: {
+            userId: req.user?.id || null,
+            action: "SALE_BATCH_ALLOCATE",
+            entity: "Sale",
+            entityId: resultSale.id,
+            payload: {
+              branchId,
+              allocations: fefoAllocations.map((x) => ({
+                productId: x.productId,
+                productName: x.productName,
+                batchCode: x.batchCode,
+                expiryDate: x.expiryDate,
+                qty: x.consumeQty,
+              })),
+            },
           },
         });
       }
@@ -895,10 +1845,11 @@ exports.checkout = async (req, res) => {
       const cogs = map.get("5100");
       const inventory = map.get("1300");
       if (cash && receivable && revenue && cogs && inventory) {
-        const cogsAmount = cart.reduce(
-          (sum, item) => sum + Number(productMap.get(item.id).price) * Number(item.qty),
-          0
-        );
+        const cogsAmount = cart.reduce((sum, item) => {
+          const prodLine = productMap.get(Number(item.id));
+          const billLine = prodLine ? getCartLineBillingUnits(item, prodLine) : 0;
+          return sum + Number(prodLine?.price || 0) * billLine;
+        }, 0);
         await tx.journal.create({
           data: {
             branchId,
@@ -909,7 +1860,7 @@ exports.checkout = async (req, res) => {
             narration: `Sale ${resultSale.invoiceNo || resultSale.id}`,
             lines: {
               create: [
-                { accountId: cash.id, debit: finalPaidAmount, credit: 0 },
+                { accountId: cash.id, debit: salePaidAmountTotal, credit: 0 },
                 { accountId: receivable.id, debit: dueAmount, credit: 0 },
                 { accountId: revenue.id, debit: 0, credit: total },
                 { accountId: cogs.id, debit: cogsAmount, credit: 0 },
@@ -998,11 +1949,57 @@ exports.checkout = async (req, res) => {
       action: "SALE_CREATE",
       entity: "Sale",
       entityId: resultSale.id,
-      payload: { total, dueAmount },
+      payload: { total, dueAmount: resultSale.dueAmount },
     });
-    res.json({ message: "Sale completed", sale: resultSale, loyalty: loyaltySnapshot });
+    const saleOut = await prisma.sale.findFirst({
+      where: { id: resultSale.id, branchId },
+      include: { salePayments: true, items: { include: { product: true } } },
+    });
+    res.json({ message: "Sale completed", sale: saleOut, loyalty: loyaltySnapshot });
+    process.nextTick(() => {
+      dispatchBranchWebhooks({
+        prisma,
+        branchId,
+        event: "sale.created",
+        payload: {
+          saleId: saleOut.id,
+          invoiceNo: saleOut.invoiceNo,
+          branchId,
+          customerId: saleOut.customerId,
+          total: saleOut.total,
+          paidAmount: saleOut.paidAmount,
+          dueAmount: saleOut.dueAmount,
+          couponCodeId: saleOut.couponCodeId ?? null,
+          couponDiscount: saleOut.couponDiscount ?? 0,
+          createdAt: saleOut.createdAt,
+          items:
+            saleOut.items?.map((it) => ({
+              productId: it.productId,
+              qty: it.qty,
+              price: it.price,
+            })) ?? [],
+          payments:
+            saleOut.salePayments?.map((pay) => ({
+              method: pay.method,
+              channel: pay.channel,
+              amount: pay.amount,
+            })) ?? [],
+        },
+      });
+    });
   } catch (err) {
     if (err.message.includes("Customer name is required")) return res.status(400).json({ error: err.message });
+    if (
+      err.message.includes("Gift card") ||
+      err.message.includes("wallet") ||
+      err.message.includes("Wallet") ||
+      err.message.includes("Credit limit") ||
+      err.message.includes("split payment") ||
+      err.message.includes("Paid amount") ||
+      err.message.includes("Coupon")
+    ) {
+      return res.status(400).json({ error: err.message });
+    }
     const holdCheckoutMsgs = [
       "Invalid held cart reference",
       "Held cart belongs to another branch",
@@ -1980,6 +2977,81 @@ exports.getRecentSales = async (req, res) => {
   }
 };
 
+exports.getCustomerRecentSales = async (req, res) => {
+  try {
+    const branchId = getBranchId(req);
+    const take = Math.min(50, Math.max(1, Number(req.query.limit || 12)));
+    const phone = String(req.query.phone || "").trim();
+    const customerIdRaw = req.query.customerId;
+    let customerId = null;
+    if (customerIdRaw !== undefined && customerIdRaw !== null && String(customerIdRaw).trim() !== "") {
+      customerId = Number(customerIdRaw);
+      if (Number.isNaN(customerId)) {
+        return res.status(400).json({ error: "Invalid customerId" });
+      }
+    } else if (phone.length >= 6) {
+      const cust = await prisma.customer.findFirst({ where: { branchId, phone } });
+      customerId = cust?.id ?? null;
+    } else {
+      return res.status(400).json({ error: "Provide phone (≥6 chars) or customerId" });
+    }
+
+    if (!customerId) {
+      return res.json([]);
+    }
+
+    const sales = await prisma.sale.findMany({
+      where: { branchId, customerId },
+      orderBy: { createdAt: "desc" },
+      take,
+      select: {
+        id: true,
+        invoiceNo: true,
+        total: true,
+        paidAmount: true,
+        dueAmount: true,
+        createdAt: true,
+        items: {
+          select: {
+            qty: true,
+            price: true,
+            weightKg: true,
+            product: { select: { name: true } },
+            productVariant: { select: { label: true } },
+          },
+        },
+      },
+    });
+
+    const rows = sales.map((s) => ({
+      id: s.id,
+      invoiceNo: s.invoiceNo,
+      total: s.total,
+      paidAmount: s.paidAmount,
+      dueAmount: s.dueAmount,
+      createdAt: s.createdAt,
+      lines: (s.items || []).map((it) => {
+        const nm = String(it.product?.name || "").trim() || "Item";
+        const vl = String(it.productVariant?.label || "").trim();
+        const label = vl ? `${nm} (${vl})` : nm;
+        const kg = Number(it.weightKg ?? 0);
+        const billQty =
+          Number.isFinite(kg) && kg > 1e-9 ? kg : Number(it.qty || 0);
+        return {
+          label,
+          qty: billQty,
+          unitPrice: Number(it.price || 0),
+          lineTotal: billQty * Number(it.price || 0),
+        };
+      }),
+    }));
+
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
 exports.getTodaySummary = async (req, res) => {
   try {
     const branchId = getBranchId(req);
@@ -2051,11 +3123,96 @@ exports.getSaleInvoice = async (req, res) => {
     if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid sale id" });
     const sale = await prisma.sale.findFirst({
       where: { id, branchId },
-      include: { customer: true, items: { include: { product: true } } },
+      include: {
+        customer: true,
+        items: { include: { product: true, productVariant: true } },
+        salePayments: true,
+      },
     });
     if (!sale) return res.status(404).json({ error: "Sale not found" });
     res.json(sale);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+};
+
+exports.getSalePayments = async (req, res) => {
+  try {
+    const branchId = getBranchId(req);
+    const id = Number(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid sale id" });
+    const sale = await prisma.sale.findFirst({ where: { id, branchId }, select: { id: true } });
+    if (!sale) return res.status(404).json({ error: "Sale not found" });
+    const rows = await prisma.salePayment.findMany({
+      where: { saleId: id },
+      orderBy: { id: "asc" },
+      include: { settlement: true },
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.getSaleMushakPdf = async (req, res) => {
+  try {
+    const branchId = getBranchId(req);
+    const id = Number(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid sale id" });
+    const [sale, branch] = await Promise.all([
+      prisma.sale.findFirst({
+        where: { id, branchId },
+        include: { customer: true, items: { include: { product: true } } },
+      }),
+      prisma.branch.findUnique({ where: { id: branchId } }),
+    ]);
+    if (!sale) return res.status(404).json({ error: "Sale not found" });
+
+    const doc = new PDFDocument({ margin: 48, size: "A4" });
+    const filename = `mushak-${sale.mushakDocumentNo || sale.id}.pdf`;
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    doc.pipe(res);
+
+    doc.fontSize(14).text("VAT Sales Invoice (Mushak reference)", { align: "center" });
+    doc.moveDown(0.5);
+    doc.fontSize(10);
+    doc.text(`Document: ${sale.mushakDocumentNo || "—"}`);
+    doc.text(`Seller BIN: ${branch?.sellerBin || "—"}  |  Trade license: ${branch?.tradeLicenseNo || "—"}`);
+    if (branch?.vatRegistrationLabel) doc.text(String(branch.vatRegistrationLabel));
+    doc.text(`Branch: ${branch?.name || ""} (${branch?.code || ""})`);
+    doc.moveDown();
+    doc.text(`Buyer BIN / NID ref: ${sale.buyerBinOrNidNote || "—"}`);
+    doc.text(`Invoice: ${sale.invoiceNo || sale.id}  |  Date: ${new Date(sale.createdAt).toLocaleString()}`);
+    if (sale.customer) {
+      doc.text(`Customer: ${sale.customer.name}${sale.customer.phone ? ` · ${sale.customer.phone}` : ""}`);
+    }
+    doc.moveDown();
+    doc.text(`Subtotal: ${Number(sale.subTotal || 0).toFixed(2)}  VAT: ${Number(sale.vatAmount || 0).toFixed(2)}  Discount: ${Number(sale.discount || 0).toFixed(2)}`);
+    doc.text(`Total: ${Number(sale.total || 0).toFixed(2)}  Paid: ${Number(sale.paidAmount || 0).toFixed(2)}  Due: ${Number(sale.dueAmount || 0).toFixed(2)}`);
+    doc.moveDown();
+    const snap = sale.vatBreakdownSnapshot;
+    const lines = Array.isArray(snap) ? snap : snap && typeof snap === "object" ? Object.values(snap) : [];
+    if (lines.length) {
+      doc.fontSize(9).text("Line VAT breakdown");
+      lines.forEach((row, idx) => {
+        doc.text(
+          `${idx + 1}. ${row.name || row.productId} × ${row.qty} | net ${Number(row.netAmount || 0).toFixed(2)} @ ${Number(row.vatRate || 0).toFixed(2)}% VAT = ${Number(row.vatAmount || 0).toFixed(2)}`
+        );
+      });
+    } else if (sale.items?.length) {
+      sale.items.forEach((row, idx) => {
+        doc.text(
+          `${idx + 1}. ${row.product?.name || row.productId} × ${row.qty} @ ${Number(row.price || 0).toFixed(2)}`
+        );
+      });
+    }
+    doc.moveDown();
+    doc.fontSize(8).text("Generated by BD Smart POS. Use per NBR rules applicable to your business.", {
+      align: "center",
+    });
+    doc.end();
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 };

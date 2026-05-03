@@ -1,10 +1,18 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import { notifyError } from "../utils/notify";
 
 function Customers() {
   const [customers, setCustomers] = useState([]);
-  const [form, setForm] = useState({ name: "", phone: "", address: "", creditLimit: "0" });
+  const [form, setForm] = useState({
+    name: "",
+    phone: "",
+    address: "",
+    creditLimit: "0",
+    birthDate: "",
+    marketingOptIn: true,
+  });
   const [editingId, setEditingId] = useState(null);
   const [selected, setSelected] = useState(null);
 
@@ -27,7 +35,7 @@ function Customers() {
     } else {
       await api.post("/master/customers", form);
     }
-    setForm({ name: "", phone: "", address: "", creditLimit: "0" });
+    setForm({ name: "", phone: "", address: "", creditLimit: "0", birthDate: "", marketingOptIn: true });
     setEditingId(null);
     setSelected(null);
     load();
@@ -41,6 +49,8 @@ function Customers() {
       phone: row.phone || "",
       address: row.address || "",
       creditLimit: String(row.creditLimit ?? 0),
+      birthDate: row.birthDate ? String(row.birthDate).slice(0, 10) : "",
+      marketingOptIn: row.marketingOptIn == null ? true : Boolean(row.marketingOptIn),
     });
   };
 
@@ -51,7 +61,30 @@ function Customers() {
 
   const cancelEdit = () => {
     setEditingId(null);
-    setForm({ name: "", phone: "", address: "", creditLimit: "0" });
+    setForm({ name: "", phone: "", address: "", creditLimit: "0", birthDate: "", marketingOptIn: true });
+  };
+
+  const downloadAccountStatementPdf = async () => {
+    if (!selected?.id) return;
+    try {
+      const res = await api.get(`/master/customers/${selected.id}/account-statement.pdf`, {
+        responseType: "blob",
+      });
+      const blobUrl = URL.createObjectURL(new Blob([res.data]));
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `customer-${selected.id}-statement.pdf`;
+      a.click();
+      URL.revokeObjectURL(blobUrl);
+    } catch (e) {
+      const msg =
+        typeof e.response?.data === "object" &&
+        !(e.response.data instanceof Blob) &&
+        e.response.data?.error
+          ? e.response.data.error
+          : "Download failed";
+      notifyError(String(msg || "download failed"));
+    }
   };
 
   return (
@@ -69,6 +102,19 @@ function Customers() {
           value={form.creditLimit}
           onChange={(e) => setForm({ ...form, creditLimit: e.target.value })}
         />
+        <input
+          type="date"
+          value={form.birthDate}
+          onChange={(e) => setForm({ ...form, birthDate: e.target.value })}
+        />
+        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <input
+            type="checkbox"
+            checked={Boolean(form.marketingOptIn)}
+            onChange={(e) => setForm({ ...form, marketingOptIn: e.target.checked })}
+          />
+          Marketing Opt-in
+        </label>
         <button type="submit">{editingId ? "Update Customer" : "Add Customer"}</button>
         {editingId ? (
           <button type="button" className="btn-secondary" onClick={cancelEdit}>
@@ -89,6 +135,8 @@ function Customers() {
                 <p><strong>Name:</strong> {selected.name}</p>
                 <p><strong>Phone:</strong> {selected.phone || "-"}</p>
                 <p><strong>Address:</strong> {selected.address || "-"}</p>
+                <p><strong>Birth date:</strong> {selected.birthDate ? new Date(selected.birthDate).toLocaleDateString() : "-"}</p>
+                <p><strong>Marketing:</strong> {selected.marketingOptIn ? "Opted-in" : "Opted-out"}</p>
                 <p><strong>Due:</strong> ৳{due.toFixed(2)}</p>
                 <p><strong>Credit limit:</strong> ৳{creditLimit.toFixed(2)} {creditLimit <= 0 ? "(no limit)" : ""}</p>
                 {creditLimit > 0 ? (
@@ -100,6 +148,14 @@ function Customers() {
                 <p><strong>Loyalty Points:</strong> {Number(selected.loyaltyPoints || 0).toFixed(0)}</p>
                 <p><strong>Loyalty Tier:</strong> {selected.loyaltyTier || "REGULAR"}</p>
                 <p><strong>Total Spent:</strong> ৳{Number(selected.loyaltyTotalSpent || 0).toFixed(2)}</p>
+                <p><strong>Last Purchase:</strong> {selected.lastPurchaseAt ? new Date(selected.lastPurchaseAt).toLocaleString() : "-"}</p>
+                <p><strong>Days Since Purchase:</strong> {selected.daysSinceLastPurchase ?? "-"}</p>
+                <p><strong>Days Until Birthday:</strong> {selected.daysUntilBirthday ?? "-"}</p>
+                <div style={{ marginTop: 12 }}>
+                  <button type="button" className="btn-secondary btn-sm" onClick={downloadAccountStatementPdf}>
+                    Download account statement (PDF)
+                  </button>
+                </div>
               </>
             );
           })()}
@@ -113,6 +169,8 @@ function Customers() {
           { key: "name", label: "Name" },
           { key: "phone", label: "Phone", render: (v) => v || "-" },
           { key: "address", label: "Address", render: (v) => v || "-" },
+          { key: "birthDate", label: "Birth Date", render: (v) => (v ? new Date(v).toLocaleDateString() : "-") },
+          { key: "marketingOptIn", label: "Marketing", render: (v) => (v ? "Yes" : "No") },
           { key: "balance", label: "Due", render: (v) => `৳${Number(v).toFixed(2)}` },
           {
             key: "creditLimit",

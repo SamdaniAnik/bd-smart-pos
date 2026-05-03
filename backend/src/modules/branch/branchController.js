@@ -2,9 +2,19 @@ const prisma = require("../../utils/prisma");
 
 exports.createBranch = async (req, res) => {
   try {
-    const { code, name, address, phone } = req.body;
+    const { code, name, address, phone, sellerBin, tradeLicenseNo, vatRegistrationLabel } = req.body;
     const branch = await prisma.branch.create({
-      data: { code, name, address, phone },
+      data: {
+        code,
+        name,
+        address,
+        phone,
+        sellerBin: sellerBin ? String(sellerBin).trim().slice(0, 64) : null,
+        tradeLicenseNo: tradeLicenseNo ? String(tradeLicenseNo).trim().slice(0, 64) : null,
+        vatRegistrationLabel: vatRegistrationLabel
+          ? String(vatRegistrationLabel).trim().slice(0, 250)
+          : null,
+      },
     });
     res.status(201).json(branch);
   } catch (error) {
@@ -42,7 +52,7 @@ exports.updateBranch = async (req, res) => {
     const existing = await prisma.branch.findUnique({ where: { id } });
     if (!existing) return res.status(404).json({ error: "Branch not found" });
 
-    const { code, name, address, phone, isActive } = req.body;
+    const { code, name, address, phone, isActive, sellerBin, tradeLicenseNo, vatRegistrationLabel } = req.body;
     if (!code || !name) {
       return res.status(400).json({ error: "Branch code and name are required" });
     }
@@ -55,6 +65,13 @@ exports.updateBranch = async (req, res) => {
         address: address || null,
         phone: phone || null,
         isActive: typeof isActive === "boolean" ? isActive : existing.isActive,
+        sellerBin: sellerBin != null ? String(sellerBin).trim().slice(0, 64) || null : existing.sellerBin,
+        tradeLicenseNo:
+          tradeLicenseNo != null ? String(tradeLicenseNo).trim().slice(0, 64) || null : existing.tradeLicenseNo,
+        vatRegistrationLabel:
+          vatRegistrationLabel != null
+            ? String(vatRegistrationLabel).trim().slice(0, 250) || null
+            : existing.vatRegistrationLabel,
       },
     });
     res.json(branch);

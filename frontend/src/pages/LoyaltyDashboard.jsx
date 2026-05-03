@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
 
@@ -18,6 +18,16 @@ function LoyaltyDashboard() {
   });
   const [ranking, setRanking] = useState([]);
   const [redemptions, setRedemptions] = useState({ rows: [], summary: {} });
+  const [retention, setRetention] = useState({
+    summary: {},
+    atRiskCustomers: [],
+    upcomingBirthdays: [],
+  });
+  const [automation, setAutomation] = useState({
+    summary: { campaigns: 0, totalQueued: 0 },
+    campaigns: [],
+    latestQueue: [],
+  });
 
   const exportFile = async (url, filename) => {
     const res = await api.get(url, { responseType: "blob" });
@@ -34,6 +44,14 @@ function LoyaltyDashboard() {
     if (range.from) q.set("from", range.from);
     if (range.to) q.set("to", range.to);
     return q.toString() ? `?${q.toString()}` : "";
+  };
+
+  const exportRetentionCampaign = async (segment) => {
+    const qs = new URLSearchParams();
+    qs.set("segment", segment);
+    const url = `/master/customers/retention/export.csv?${qs.toString()}`;
+    const filename = segment === "birthday" ? "birthday-campaign.csv" : "at-risk-campaign.csv";
+    await exportFile(url, filename);
   };
 
   const setPresetRange = (preset) => {
@@ -57,22 +75,34 @@ function LoyaltyDashboard() {
     setRange({ from: "", to: "" });
   };
 
-  const load = async () => {
+  const load = useCallback(async () => {
     const q = new URLSearchParams();
     if (range.from) q.set("from", range.from);
     if (range.to) q.set("to", range.to);
     const redemptionUrl = q.toString() ? `/sales/loyalty/redemptions?${q.toString()}` : "/sales/loyalty/redemptions";
-    const [rankRes, redeemRes] = await Promise.all([
+    const [rankRes, redeemRes, retentionRes, automationRes] = await Promise.all([
       api.get("/master/customers/loyalty"),
       api.get(redemptionUrl),
+      api.get("/master/customers/retention"),
+      api.get("/master/customers/retention/automation"),
     ]);
     setRanking(rankRes.data || []);
     setRedemptions(redeemRes.data || { rows: [], summary: {} });
+    setRetention(retentionRes.data || { summary: {}, atRiskCustomers: [], upcomingBirthdays: [] });
+    setAutomation(automationRes.data || { summary: { campaigns: 0, totalQueued: 0 }, campaigns: [], latestQueue: [] });
+  }, [range.from, range.to]);
+
+  const runRetentionAutomation = async (segment) => {
+    await api.post("/master/customers/retention/automation", { segment, birthdayWindowDays: 7, maxCustomers: 100 });
+    await load();
   };
 
   useEffect(() => {
-    load();
-  }, [range.from, range.to]);
+    const timer = setTimeout(() => {
+      load();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [load]);
 
   const tierSummary = useMemo(() => {
     return ranking.reduce(
@@ -139,6 +169,15 @@ function LoyaltyDashboard() {
         >
           Export Redemptions XLSX
         </button>
+        <button type="button" className="btn-secondary" onClick={() => runRetentionAutomation("atRisk")}>
+          Run At-Risk Automation
+        </button>
+        <button type="button" className="btn-secondary" onClick={() => runRetentionAutomation("birthday")}>
+          Run Birthday Automation
+        </button>
+        <button type="button" className="btn-secondary" onClick={() => runRetentionAutomation("all")}>
+          Run Combined Automation
+        </button>
       </div>
 
       <div className="quick-stats" style={{ marginBottom: 12 }}>
@@ -148,6 +187,11 @@ function LoyaltyDashboard() {
         <div className="stat">Gold: {tierSummary.GOLD}</div>
         <div className="stat">Redeemed Points: {Number(redemptions.summary?.redeemedPoints || 0).toFixed(0)}</div>
         <div className="stat">Redeemed Amount: ৳{Number(redemptions.summary?.redeemedAmount || 0).toFixed(2)}</div>
+        <div className="stat">At-Risk: {Number(retention.summary?.atRiskCount || 0)}</div>
+        <div className="stat">Upcoming Birthdays: {Number(retention.summary?.upcomingBirthdayCount || 0)}</div>
+        <div className="stat">Marketing Opt-in: {Number(retention.summary?.marketingOptInCount || 0)}</div>
+        <div className="stat">Automations: {Number(automation.summary?.campaigns || 0)}</div>
+        <div className="stat">Queued Contacts: {Number(automation.summary?.totalQueued || 0)}</div>
       </div>
 
       <DataTable
@@ -183,6 +227,87 @@ function LoyaltyDashboard() {
           { key: "redeemedAmount", label: "Redeemed Amount", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           { key: "tierDiscountAmount", label: "Tier Discount", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           { key: "createdAtLabel", label: "Date" },
+        ]}
+      />
+
+      <DataTable
+        title="At-Risk Customers (Retention Follow-up)"
+        rows={(retention.atRiskCustomers || []).map((row, idx) => ({
+          rowNo: idx + 1,
+          ...row,
+          lastPurchaseAtLabel: row.lastPurchaseAt ? new Date(row.lastPurchaseAt).toLocaleString() : "-",
+        }))}
+        searchableKeys={["name", "phone", "loyaltyTier", "lastPurchaseAtLabel"]}
+        columns={[
+          { key: "rowNo", label: "ID" },
+          { key: "name", label: "Customer" },
+          { key: "phone", label: "Phone" },
+          { key: "loyaltyTier", label: "Tier" },
+          { key: "loyaltyPoints", label: "Points" },
+          { key: "daysSinceLastPurchase", label: "Days Since Last Buy", render: (v) => (v == null ? "-" : v) },
+          { key: "lastPurchaseAtLabel", label: "Last Purchase" },
+          { key: "marketingOptIn", label: "Marketing", render: (v) => (v ? "Yes" : "No") },
+        ]}
+      />
+      <div style={{ margin: "8px 0 14px" }}>
+        <button type="button" onClick={() => exportRetentionCampaign("atRisk")}>
+          Export At-Risk Campaign CSV
+        </button>
+      </div>
+
+      <DataTable
+        title="Upcoming Birthday Customers"
+        rows={(retention.upcomingBirthdays || []).map((row, idx) => ({
+          rowNo: idx + 1,
+          ...row,
+        }))}
+        searchableKeys={["name", "phone", "loyaltyTier"]}
+        columns={[
+          { key: "rowNo", label: "ID" },
+          { key: "name", label: "Customer" },
+          { key: "phone", label: "Phone" },
+          { key: "daysUntilBirthday", label: "Days To Birthday" },
+          { key: "loyaltyTier", label: "Tier" },
+          { key: "loyaltyPoints", label: "Points" },
+          { key: "marketingOptIn", label: "Marketing", render: (v) => (v ? "Yes" : "No") },
+        ]}
+      />
+      <div style={{ margin: "8px 0 14px" }}>
+        <button type="button" onClick={() => exportRetentionCampaign("birthday")}>
+          Export Birthday Campaign CSV
+        </button>
+      </div>
+
+      <DataTable
+        title="Retention Automation Campaign History"
+        rows={(automation.campaigns || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+        searchableKeys={["segment", "channel", "generatedBy"]}
+        columns={[
+          { key: "rowNo", label: "ID" },
+          { key: "segment", label: "Segment" },
+          { key: "channel", label: "Channel" },
+          { key: "totalQueued", label: "Queued" },
+          { key: "atRiskCount", label: "At-Risk" },
+          { key: "birthdayCount", label: "Birthday" },
+          { key: "generatedBy", label: "Generated By", render: (v) => v || "-" },
+          { key: "generatedAt", label: "Generated At", render: (v) => (v ? new Date(v).toLocaleString() : "-") },
+        ]}
+      />
+
+      <DataTable
+        title="Latest Retention Automation Queue"
+        rows={(automation.latestQueue || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+        searchableKeys={["customerName", "phone", "campaignType", "channel", "loyaltyTier", "status"]}
+        columns={[
+          { key: "rowNo", label: "ID" },
+          { key: "customerName", label: "Customer" },
+          { key: "phone", label: "Phone", render: (v) => v || "-" },
+          { key: "campaignType", label: "Campaign" },
+          { key: "channel", label: "Channel" },
+          { key: "loyaltyTier", label: "Tier" },
+          { key: "urgencyScore", label: "Urgency", render: (v) => Number(v || 0).toFixed(2) },
+          { key: "suggestedOffer", label: "Suggested Offer" },
+          { key: "status", label: "Status" },
         ]}
       />
     </div>

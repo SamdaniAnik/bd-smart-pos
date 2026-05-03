@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import {
+  consumeGlobalSubmitError,
+  notifyActionRequired,
+  notifyError,
+  notifySuccess,
+} from "../utils/notify";
 
 function Quotations() {
   const [rows, setRows] = useState([]);
@@ -53,8 +59,8 @@ function Quotations() {
     try {
       await api.delete(`/sales/quotes/${row.id}`);
       load();
-    } catch (e) {
-      alert(e?.response?.data?.error || "Could not cancel");
+    } catch {
+      consumeGlobalSubmitError();
     }
   };
 
@@ -67,9 +73,9 @@ function Quotations() {
         openInPos(newId);
         return;
       }
-      alert("Quote duplicated as a new OPEN quotation.");
-    } catch (e) {
-      alert(e?.response?.data?.error || "Could not duplicate quote");
+      notifySuccess("quote duplicated as a new OPEN quotation.");
+    } catch {
+      consumeGlobalSubmitError();
     }
   };
 
@@ -84,13 +90,13 @@ function Quotations() {
       const url = window.URL.createObjectURL(blob);
       const tab = window.open(url, "_blank", "noopener,noreferrer");
       if (!tab) {
-        alert("Popup blocked. Please allow popups for preview, or use PDF download.");
+        notifyActionRequired("popup blocked. Allow popups for preview, or use PDF download.");
         window.URL.revokeObjectURL(url);
         return;
       }
       setTimeout(() => window.URL.revokeObjectURL(url), 60 * 1000);
     } catch (e) {
-      alert(e?.response?.data?.error || "Could not preview quote PDF");
+      notifyError(e?.response?.data?.error || "could not preview quote PDF");
     }
   };
 
@@ -106,7 +112,7 @@ function Quotations() {
       a.remove();
       window.URL.revokeObjectURL(url);
     } catch (e) {
-      alert(e?.response?.data?.error || "Could not download quote PDF");
+      notifyError(e?.response?.data?.error || "could not download quote PDF");
     }
   };
 
@@ -152,26 +158,26 @@ function Quotations() {
 </body></html>`;
       const tab = window.open("", "_blank", "noopener,noreferrer");
       if (!tab) {
-        alert("Popup blocked. Please allow popups.");
+        notifyActionRequired("popup blocked. Please allow popups.");
         return;
       }
       tab.document.open();
       tab.document.write(html);
       tab.document.close();
     } catch (e) {
-      alert(e?.response?.data?.error || "Could not open converted sale invoice");
+      notifyError(e?.response?.data?.error || "could not open converted sale invoice");
     }
   };
 
   const shareQuoteWhatsApp = (row) => {
     const rawPhone = String(row.customerPhone || "").trim();
     if (!rawPhone) {
-      alert("Customer phone is missing for this quote.");
+      notifyActionRequired("customer phone is missing for this quote.");
       return;
     }
     const digits = rawPhone.replace(/\D/g, "");
     if (!digits) {
-      alert("Customer phone is invalid for WhatsApp sharing.");
+      notifyActionRequired("customer phone is invalid for WhatsApp sharing.");
       return;
     }
     let phone = digits;
@@ -185,7 +191,7 @@ function Quotations() {
     const url = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
     const tab = window.open(url, "_blank", "noopener,noreferrer");
     if (!tab) {
-      alert("Popup blocked. Please allow popups to open WhatsApp.");
+      notifyActionRequired("popup blocked. Please allow popups to open WhatsApp.");
     }
   };
 
@@ -205,8 +211,8 @@ function Quotations() {
       await api.post(`/sales/quotes/${row.id}/follow-up`, { followUpAt });
       load();
       loadSummary();
-    } catch (e) {
-      alert(e?.response?.data?.error || "Could not set follow-up");
+    } catch {
+      consumeGlobalSubmitError();
     }
   };
 
@@ -215,8 +221,8 @@ function Quotations() {
       await api.post(`/sales/quotes/${row.id}/follow-up-done`);
       load();
       loadSummary();
-    } catch (e) {
-      alert(e?.response?.data?.error || "Could not mark follow-up done");
+    } catch {
+      consumeGlobalSubmitError();
     }
   };
 

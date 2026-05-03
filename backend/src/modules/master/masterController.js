@@ -25,6 +25,42 @@ function parseRedeemedPoints(notes) {
   }
 }
 
+function startOfDay(date = new Date()) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function getRetentionThresholdDays() {
+  return Math.max(7, Number(process.env.LOYALTY_AT_RISK_DAYS || 45));
+}
+
+function toYmd(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function calcDaysDiffFromToday(pastDate) {
+  if (!pastDate) return null;
+  const d = new Date(pastDate);
+  if (Number.isNaN(d.getTime())) return null;
+  const today = startOfDay(new Date());
+  const target = startOfDay(d);
+  return Math.floor((today.getTime() - target.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+function calcDaysUntilBirthday(birthDate) {
+  if (!birthDate) return null;
+  const d = new Date(birthDate);
+  if (Number.isNaN(d.getTime())) return null;
+  const today = startOfDay(new Date());
+  const thisYearBirthday = new Date(today.getFullYear(), d.getMonth(), d.getDate());
+  const nextBirthday = thisYearBirthday >= today ? thisYearBirthday : new Date(today.getFullYear() + 1, d.getMonth(), d.getDate());
+  return Math.floor((nextBirthday.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+}
+
 async function buildCustomerLoyaltySnapshot(branchId, customerId) {
   const sales = await prisma.sale.findMany({
     where: { branchId, customerId },
@@ -193,7 +229,7 @@ exports.deleteSupplier = async (req, res) => {
 exports.createCustomer = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const { name, phone, address, creditLimit } = req.body;
+    const { name, phone, address, creditLimit, birthDate, marketingOptIn } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Customer name must be at least 2 characters" });
     }
@@ -207,6 +243,8 @@ exports.createCustomer = async (req, res) => {
           creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
             ? Number(creditLimit)
             : 0,
+        birthDate: birthDate ? new Date(birthDate) : null,
+        marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
       },
     });
     res.status(201).json(customer);
@@ -228,17 +266,28 @@ exports.getCustomers = async (req, res) => {
       where: { branchId: req.branchId, customerId: { in: customerIds } },
       _sum: { total: true },
       _count: { _all: true },
+      _max: { createdAt: true },
     });
     const byCustomer = new Map(
       salesAgg
         .filter((x) => x.customerId != null)
-        .map((x) => [x.customerId, { totalSpent: Number(x._sum.total || 0), orders: Number(x._count._all || 0) }])
+        .map((x) => [
+          x.customerId,
+          {
+            totalSpent: Number(x._sum.total || 0),
+            orders: Number(x._count._all || 0),
+            lastPurchaseAt: x._max.createdAt || null,
+          },
+        ])
     );
     res.json(
       customers.map((c) => {
-        const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0 };
+        const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0, lastPurchaseAt: null };
         const earnedPoints = pointsFromAmount(stats.totalSpent);
         const loyaltyPoints = Math.max(0, earnedPoints);
+        const daysSinceLastPurchase = calcDaysDiffFromToday(stats.lastPurchaseAt);
+        const atRiskDays = getRetentionThresholdDays();
+        const daysUntilBirthday = calcDaysUntilBirthday(c.birthDate);
         return {
           ...c,
           loyaltyPoints,
@@ -247,6 +296,10 @@ exports.getCustomers = async (req, res) => {
           loyaltyTier: tierFromPoints(earnedPoints),
           loyaltyTotalSpent: stats.totalSpent,
           loyaltyOrders: stats.orders,
+          lastPurchaseAt: stats.lastPurchaseAt,
+          daysSinceLastPurchase,
+          isAtRisk: daysSinceLastPurchase != null ? daysSinceLastPurchase >= atRiskDays : false,
+          daysUntilBirthday,
         };
       })
     );
@@ -271,9 +324,20 @@ exports.getCustomerDetails = async (req, res) => {
     }
 
     const loyalty = await buildCustomerLoyaltySnapshot(req.branchId, id);
+    const salesAgg = await prisma.sale.aggregate({
+      where: { branchId: req.branchId, customerId: id },
+      _max: { createdAt: true },
+    });
+    const lastPurchaseAt = salesAgg?._max?.createdAt || null;
+    const daysSinceLastPurchase = calcDaysDiffFromToday(lastPurchaseAt);
+    const daysUntilBirthday = calcDaysUntilBirthday(customer.birthDate);
     res.json({
       ...customer,
       ...loyalty,
+      lastPurchaseAt,
+      daysSinceLastPurchase,
+      isAtRisk: daysSinceLastPurchase != null ? daysSinceLastPurchase >= getRetentionThresholdDays() : false,
+      daysUntilBirthday,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -289,7 +353,21 @@ exports.lookupCustomerByPhone = async (req, res) => {
     });
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     const loyalty = await buildCustomerLoyaltySnapshot(req.branchId, customer.id);
-    res.json({ ...customer, ...loyalty });
+    const salesAgg = await prisma.sale.aggregate({
+      where: { branchId: req.branchId, customerId: customer.id },
+      _max: { createdAt: true },
+    });
+    const lastPurchaseAt = salesAgg?._max?.createdAt || null;
+    const daysSinceLastPurchase = calcDaysDiffFromToday(lastPurchaseAt);
+    const daysUntilBirthday = calcDaysUntilBirthday(customer.birthDate);
+    res.json({
+      ...customer,
+      ...loyalty,
+      lastPurchaseAt,
+      daysSinceLastPurchase,
+      isAtRisk: daysSinceLastPurchase != null ? daysSinceLastPurchase >= getRetentionThresholdDays() : false,
+      daysUntilBirthday,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -308,16 +386,25 @@ exports.getCustomerLoyaltyRanking = async (req, res) => {
       where: { branchId: req.branchId, customerId: { in: customerIds } },
       _sum: { total: true },
       _count: { _all: true },
+      _max: { createdAt: true },
     });
     const byCustomer = new Map(
       salesAgg
         .filter((x) => x.customerId != null)
-        .map((x) => [x.customerId, { totalSpent: Number(x._sum.total || 0), orders: Number(x._count._all || 0) }])
+        .map((x) => [
+          x.customerId,
+          {
+            totalSpent: Number(x._sum.total || 0),
+            orders: Number(x._count._all || 0),
+            lastPurchaseAt: x._max.createdAt || null,
+          },
+        ])
     );
     const rows = customers
       .map((c) => {
-        const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0 };
+        const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0, lastPurchaseAt: null };
         const loyaltyPoints = pointsFromAmount(stats.totalSpent);
+        const daysSinceLastPurchase = calcDaysDiffFromToday(stats.lastPurchaseAt);
         return {
           id: c.id,
           name: c.name,
@@ -326,6 +413,10 @@ exports.getCustomerLoyaltyRanking = async (req, res) => {
           loyaltyTier: tierFromPoints(loyaltyPoints),
           loyaltyTotalSpent: stats.totalSpent,
           loyaltyOrders: stats.orders,
+          lastPurchaseAt: stats.lastPurchaseAt,
+          daysSinceLastPurchase,
+          daysUntilBirthday: calcDaysUntilBirthday(c.birthDate),
+          marketingOptIn: Boolean(c.marketingOptIn),
         };
       })
       .sort((a, b) => b.loyaltyPoints - a.loyaltyPoints);
@@ -487,7 +578,7 @@ exports.updateCustomer = async (req, res) => {
       return res.status(404).json({ error: "Customer not found" });
     }
 
-    const { name, phone, address, creditLimit } = req.body;
+    const { name, phone, address, creditLimit, birthDate, marketingOptIn } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Customer name must be at least 2 characters" });
     }
@@ -502,10 +593,451 @@ exports.updateCustomer = async (req, res) => {
           creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
             ? Number(creditLimit)
             : 0,
+        birthDate: birthDate ? new Date(birthDate) : null,
+        marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
       },
     });
     res.json(customer);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getCustomerRetentionSummary = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const atRiskDays = getRetentionThresholdDays();
+    const birthdayWindowDays = Math.max(1, Number(req.query.birthdayWindowDays || 7));
+    const customers = await prisma.customer.findMany({
+      where: { branchId },
+      orderBy: { createdAt: "desc" },
+      take: 500,
+    });
+    const customerIds = customers.map((c) => c.id);
+    const salesAgg = customerIds.length
+      ? await prisma.sale.groupBy({
+          by: ["customerId"],
+          where: { branchId, customerId: { in: customerIds } },
+          _sum: { total: true },
+          _count: { _all: true },
+          _max: { createdAt: true },
+        })
+      : [];
+    const byCustomer = new Map(
+      salesAgg
+        .filter((x) => x.customerId != null)
+        .map((x) => [
+          x.customerId,
+          {
+            totalSpent: Number(x._sum.total || 0),
+            orders: Number(x._count._all || 0),
+            lastPurchaseAt: x._max.createdAt || null,
+          },
+        ])
+    );
+    const rows = customers.map((c) => {
+      const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0, lastPurchaseAt: null };
+      const points = pointsFromAmount(stats.totalSpent);
+      const daysSinceLastPurchase = calcDaysDiffFromToday(stats.lastPurchaseAt);
+      const daysUntilBirthday = calcDaysUntilBirthday(c.birthDate);
+      return {
+        id: c.id,
+        name: c.name,
+        phone: c.phone || "",
+        marketingOptIn: Boolean(c.marketingOptIn),
+        loyaltyPoints: Math.max(0, points),
+        loyaltyTier: tierFromPoints(points),
+        totalSpent: stats.totalSpent,
+        orders: stats.orders,
+        lastPurchaseAt: stats.lastPurchaseAt,
+        daysSinceLastPurchase,
+        daysUntilBirthday,
+        isAtRisk: daysSinceLastPurchase != null ? daysSinceLastPurchase >= atRiskDays : false,
+      };
+    });
+    const upcomingBirthdays = rows
+      .filter((x) => x.daysUntilBirthday != null && x.daysUntilBirthday >= 0 && x.daysUntilBirthday <= birthdayWindowDays)
+      .sort((a, b) => a.daysUntilBirthday - b.daysUntilBirthday)
+      .slice(0, 50);
+    const atRiskCustomers = rows
+      .filter((x) => x.isAtRisk)
+      .sort((a, b) => Number(b.daysSinceLastPurchase || 0) - Number(a.daysSinceLastPurchase || 0))
+      .slice(0, 100);
+    res.json({
+      summary: {
+        totalCustomers: rows.length,
+        atRiskDays,
+        birthdayWindowDays,
+        atRiskCount: atRiskCustomers.length,
+        upcomingBirthdayCount: upcomingBirthdays.length,
+        marketingOptInCount: rows.filter((x) => x.marketingOptIn).length,
+      },
+      atRiskCustomers,
+      upcomingBirthdays,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportCustomerRetentionCampaignCSV = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const atRiskDays = getRetentionThresholdDays();
+    const birthdayWindowDays = Math.max(1, Number(req.query.birthdayWindowDays || 7));
+    const segment = String(req.query.segment || "atRisk");
+    const customers = await prisma.customer.findMany({
+      where: { branchId },
+      orderBy: { createdAt: "desc" },
+      take: 500,
+    });
+    const customerIds = customers.map((c) => c.id);
+    const salesAgg = customerIds.length
+      ? await prisma.sale.groupBy({
+          by: ["customerId"],
+          where: { branchId, customerId: { in: customerIds } },
+          _sum: { total: true },
+          _count: { _all: true },
+          _max: { createdAt: true },
+        })
+      : [];
+    const byCustomer = new Map(
+      salesAgg
+        .filter((x) => x.customerId != null)
+        .map((x) => [
+          x.customerId,
+          {
+            totalSpent: Number(x._sum.total || 0),
+            orders: Number(x._count._all || 0),
+            lastPurchaseAt: x._max.createdAt || null,
+          },
+        ])
+    );
+    const rows = customers.map((c) => {
+      const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0, lastPurchaseAt: null };
+      const points = pointsFromAmount(stats.totalSpent);
+      const daysSinceLastPurchase = calcDaysDiffFromToday(stats.lastPurchaseAt);
+      const daysUntilBirthday = calcDaysUntilBirthday(c.birthDate);
+      return {
+        id: c.id,
+        name: c.name,
+        phone: c.phone || "",
+        marketingOptIn: Boolean(c.marketingOptIn),
+        loyaltyTier: tierFromPoints(points),
+        loyaltyPoints: Math.max(0, points),
+        totalSpent: Number(stats.totalSpent || 0),
+        orders: Number(stats.orders || 0),
+        lastPurchaseAt: stats.lastPurchaseAt,
+        daysSinceLastPurchase,
+        daysUntilBirthday,
+        isAtRisk: daysSinceLastPurchase != null ? daysSinceLastPurchase >= atRiskDays : false,
+      };
+    });
+
+    const campaignRows = (segment === "birthday"
+      ? rows.filter(
+          (x) =>
+            x.marketingOptIn &&
+            x.daysUntilBirthday != null &&
+            x.daysUntilBirthday >= 0 &&
+            x.daysUntilBirthday <= birthdayWindowDays
+        )
+      : rows.filter((x) => x.marketingOptIn && x.isAtRisk)
+    ).map((x) => ({
+      customer_id: x.id,
+      customer_name: x.name,
+      phone: x.phone || "",
+      campaign_type: segment === "birthday" ? "BIRTHDAY_OFFER" : "AT_RISK_WINBACK",
+      loyalty_tier: x.loyaltyTier,
+      loyalty_points: x.loyaltyPoints,
+      total_spent: x.totalSpent.toFixed(2),
+      orders: x.orders,
+      last_purchase_at: x.lastPurchaseAt ? new Date(x.lastPurchaseAt).toISOString() : "",
+      days_since_last_purchase: x.daysSinceLastPurchase ?? "",
+      days_until_birthday: x.daysUntilBirthday ?? "",
+      suggested_offer:
+        segment === "birthday" ? "Birthday voucher + points booster" : "Comeback discount + extra points",
+    }));
+    const filename =
+      segment === "birthday" ? "retention-birthday-campaign.csv" : "retention-at-risk-campaign.csv";
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(toCSV(campaignRows));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildRetentionRows(branchId, { atRiskDaysOverride = null } = {}) {
+  const atRiskDays = atRiskDaysOverride != null ? Math.max(7, Number(atRiskDaysOverride || 0)) : getRetentionThresholdDays();
+  const customers = await prisma.customer.findMany({
+    where: { branchId },
+    orderBy: { createdAt: "desc" },
+    take: 1000,
+  });
+  const customerIds = customers.map((c) => c.id);
+  const salesAgg = customerIds.length
+    ? await prisma.sale.groupBy({
+        by: ["customerId"],
+        where: { branchId, customerId: { in: customerIds } },
+        _sum: { total: true },
+        _count: { _all: true },
+        _max: { createdAt: true },
+      })
+    : [];
+  const byCustomer = new Map(
+    salesAgg
+      .filter((x) => x.customerId != null)
+      .map((x) => [
+        x.customerId,
+        {
+          totalSpent: Number(x._sum.total || 0),
+          orders: Number(x._count._all || 0),
+          lastPurchaseAt: x._max.createdAt || null,
+        },
+      ])
+  );
+  const rows = customers.map((c) => {
+    const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0, lastPurchaseAt: null };
+    const points = pointsFromAmount(stats.totalSpent);
+    const daysSinceLastPurchase = calcDaysDiffFromToday(stats.lastPurchaseAt);
+    const daysUntilBirthday = calcDaysUntilBirthday(c.birthDate);
+    return {
+      id: c.id,
+      name: c.name,
+      phone: c.phone || "",
+      marketingOptIn: Boolean(c.marketingOptIn),
+      loyaltyTier: tierFromPoints(points),
+      loyaltyPoints: Math.max(0, points),
+      totalSpent: Number(stats.totalSpent || 0),
+      orders: Number(stats.orders || 0),
+      lastPurchaseAt: stats.lastPurchaseAt,
+      daysSinceLastPurchase,
+      daysUntilBirthday,
+      isAtRisk: daysSinceLastPurchase != null ? daysSinceLastPurchase >= atRiskDays : false,
+    };
+  });
+  return { atRiskDays, rows };
+}
+
+exports.runCustomerRetentionAutomation = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const segment = String(req.body?.segment || "atRisk");
+    const birthdayWindowDays = Math.max(1, Number(req.body?.birthdayWindowDays || 7));
+    const maxCustomers = Math.max(1, Number(req.body?.maxCustomers || 100));
+    const channel = String(req.body?.channel || "SMS").toUpperCase();
+    const dryRun = Boolean(req.body?.dryRun);
+    const { atRiskDays, rows } = await buildRetentionRows(branchId, {
+      atRiskDaysOverride: req.body?.atRiskDays,
+    });
+    const filtered = (segment === "birthday"
+      ? rows.filter(
+          (x) =>
+            x.marketingOptIn &&
+            x.daysUntilBirthday != null &&
+            x.daysUntilBirthday >= 0 &&
+            x.daysUntilBirthday <= birthdayWindowDays
+        )
+      : segment === "all"
+        ? rows.filter(
+            (x) =>
+              x.marketingOptIn &&
+              (x.isAtRisk ||
+                (x.daysUntilBirthday != null && x.daysUntilBirthday >= 0 && x.daysUntilBirthday <= birthdayWindowDays))
+          )
+        : rows.filter((x) => x.marketingOptIn && x.isAtRisk)
+    )
+      .map((x) => {
+        const isBirthday = x.daysUntilBirthday != null && x.daysUntilBirthday >= 0 && x.daysUntilBirthday <= birthdayWindowDays;
+        const campaignType = isBirthday && !x.isAtRisk ? "BIRTHDAY_OFFER" : x.isAtRisk ? "AT_RISK_WINBACK" : "GENERIC_RETENTION";
+        const urgencyScore = Number(
+          (
+            (x.isAtRisk ? Math.min(70, Number(x.daysSinceLastPurchase || 0) * 1.1) : 10) +
+            (isBirthday ? 20 : 0) +
+            (x.loyaltyTier === "GOLD" ? 10 : x.loyaltyTier === "SILVER" ? 6 : 2)
+          ).toFixed(2)
+        );
+        return {
+          customerId: x.id,
+          customerName: x.name,
+          phone: x.phone,
+          campaignType,
+          channel,
+          loyaltyTier: x.loyaltyTier,
+          loyaltyPoints: x.loyaltyPoints,
+          daysSinceLastPurchase: x.daysSinceLastPurchase,
+          daysUntilBirthday: x.daysUntilBirthday,
+          urgencyScore,
+          suggestedOffer:
+            campaignType === "BIRTHDAY_OFFER"
+              ? "Birthday voucher + points booster"
+              : x.loyaltyTier === "GOLD"
+                ? "VIP comeback offer + priority support"
+                : "Comeback discount + bonus points",
+          status: "PENDING",
+        };
+      })
+      .sort((a, b) => Number(b.urgencyScore || 0) - Number(a.urgencyScore || 0))
+      .slice(0, maxCustomers);
+
+    const payload = {
+      branchId,
+      segment,
+      channel,
+      atRiskDays,
+      birthdayWindowDays,
+      maxCustomers,
+      generatedAt: new Date().toISOString(),
+      generatedByUserId: req.user?.id || null,
+      queue: filtered,
+      summary: {
+        totalQueued: filtered.length,
+        atRiskCount: filtered.filter((x) => x.campaignType === "AT_RISK_WINBACK").length,
+        birthdayCount: filtered.filter((x) => x.campaignType === "BIRTHDAY_OFFER").length,
+      },
+    };
+
+    let automationId = null;
+    if (!dryRun) {
+      const log = await prisma.auditLog.create({
+        data: {
+          userId: req.user?.id || null,
+          action: "CUSTOMER_RETENTION_AUTOMATION",
+          entity: "RetentionCampaign",
+          entityId: null,
+          payload,
+        },
+      });
+      automationId = log.id;
+    }
+    res.status(201).json({
+      message: dryRun ? "Retention automation preview generated" : "Retention automation queue generated",
+      dryRun,
+      automationId,
+      ...payload,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getCustomerRetentionAutomationHistory = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const logs = await prisma.auditLog.findMany({
+      where: { action: "CUSTOMER_RETENTION_AUTOMATION", entity: "RetentionCampaign" },
+      include: { user: { select: { id: true, name: true, email: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    const rows = logs
+      .filter((x) => Number(x.payload?.branchId || 0) === Number(branchId))
+      .map((x) => ({
+        id: x.id,
+        segment: String(x.payload?.segment || "atRisk"),
+        channel: String(x.payload?.channel || "SMS"),
+        atRiskDays: Number(x.payload?.atRiskDays || getRetentionThresholdDays()),
+        birthdayWindowDays: Number(x.payload?.birthdayWindowDays || 7),
+        totalQueued: Number(x.payload?.summary?.totalQueued || 0),
+        atRiskCount: Number(x.payload?.summary?.atRiskCount || 0),
+        birthdayCount: Number(x.payload?.summary?.birthdayCount || 0),
+        generatedAt: x.payload?.generatedAt || x.createdAt,
+        generatedBy: x.user?.name || x.user?.email || "",
+      }));
+    const latestQueue =
+      logs
+        .filter((x) => Number(x.payload?.branchId || 0) === Number(branchId))
+        .map((x) => x.payload?.queue)
+        .find((q) => Array.isArray(q) && q.length) || [];
+    res.json({
+      summary: {
+        campaigns: rows.length,
+        totalQueued: rows.reduce((sum, x) => sum + Number(x.totalQueued || 0), 0),
+      },
+      campaigns: rows,
+      latestQueue,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getCustomerAccountStatementPdf = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid customer id" });
+
+    const customer = await prisma.customer.findFirst({
+      where: { id, branchId },
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        address: true,
+        balance: true,
+        storedValueBalance: true,
+      },
+    });
+    if (!customer) return res.status(404).json({ error: "Customer not found" });
+
+    const [branch, recentSales, receipts] = await Promise.all([
+      prisma.branch.findUnique({ where: { id: branchId } }),
+      prisma.sale.findMany({
+        where: { branchId, customerId: id },
+        orderBy: { createdAt: "desc" },
+        take: 35,
+      }),
+      prisma.receiptVoucher.findMany({
+        where: { branchId, customerId: id },
+        orderBy: { createdAt: "desc" },
+        take: 35,
+      }),
+    ]);
+
+    const doc = new PDFDocument({ margin: 48, size: "A4" });
+    const filename = `customer-statement-${id}.pdf`;
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    doc.pipe(res);
+
+    doc.fontSize(16).text("Customer account statement", { align: "center" });
+    doc.moveDown(0.6);
+    doc.fontSize(10);
+    doc.text(`Branch: ${branch?.name || ""} (${branch?.code || ""})`);
+    doc.text(`Customer: ${customer.name}`);
+    doc.text(`Phone: ${customer.phone || "—"}`);
+    doc.text(`Address: ${customer.address || "—"}`);
+    doc.moveDown();
+    doc.text(`Outstanding balance (due): ${Number(customer.balance || 0).toFixed(2)} BDT`);
+    doc.text(`Wallet balance: ${Number(customer.storedValueBalance || 0).toFixed(2)} BDT`);
+    doc.moveDown();
+    doc.fontSize(12).text("Recent invoices");
+    doc.fontSize(9);
+    if (!recentSales.length) doc.text("No sales on file.");
+    for (const s of recentSales) {
+      doc.text(
+        `• ${s.invoiceNo || s.id} ${new Date(s.createdAt).toLocaleDateString()} Total ${Number(s.total || 0).toFixed(
+          2
+        )} Paid ${Number(s.paidAmount || 0).toFixed(2)} Due ${Number(s.dueAmount || 0).toFixed(2)}`
+      );
+    }
+    doc.moveDown();
+    doc.fontSize(12).text("Receipt vouchers");
+    doc.fontSize(9);
+    if (!receipts.length) doc.text("No receipts recorded.");
+    for (const r of receipts) {
+      doc.text(
+        `• ${new Date(r.createdAt).toLocaleDateString()} ${Number(r.amount || 0).toFixed(2)} BDT ${String(
+          r.method || ""
+        ).slice(0, 24)}${r.note ? ` — ${String(r.note).slice(0, 80)}` : ""}`
+      );
+    }
+    doc.moveDown();
+    doc.fontSize(8).text("Generated by BD Smart POS — for reference only.", { align: "center" });
+    doc.end();
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 };

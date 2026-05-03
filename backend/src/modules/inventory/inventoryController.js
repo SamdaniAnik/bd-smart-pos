@@ -394,7 +394,7 @@ exports.transferStock = async (req, res) => {
 
     const transfer = await prisma.$transaction(async (tx) => {
       const created = await tx.stockTransfer.create({
-        data: { fromBranchId, toBranchId: Number(toBranchId), status: "completed" },
+        data: { fromBranchId, toBranchId: Number(toBranchId), status: "pending" },
       });
 
       for (const item of items) {
@@ -419,28 +419,6 @@ exports.transferStock = async (req, res) => {
             qty,
           },
         });
-        await tx.product.update({ where: { id: fromProduct.id }, data: { stock: { decrement: qty } } });
-        await tx.product.update({ where: { id: toProduct.id }, data: { stock: { increment: qty } } });
-        await tx.stockLedger.createMany({
-          data: [
-            {
-              branchId: fromBranchId,
-              productId: fromProduct.id,
-              refType: "STOCK_TRANSFER_OUT",
-              refId: created.id,
-              outQty: qty,
-              unitCost: fromProduct.price,
-            },
-            {
-              branchId: Number(toBranchId),
-              productId: toProduct.id,
-              refType: "STOCK_TRANSFER_IN",
-              refId: created.id,
-              inQty: qty,
-              unitCost: toProduct.price,
-            },
-          ],
-        });
       }
       return created;
     });
@@ -448,11 +426,116 @@ exports.transferStock = async (req, res) => {
     res.status(201).json(transfer);
     await writeAuditLog({
       userId: req.user?.id || null,
-      action: "STOCK_TRANSFER",
+      action: "STOCK_TRANSFER_REQUEST",
       entity: "StockTransfer",
       entityId: transfer.id,
-      payload: { fromBranchId, toBranchId: Number(toBranchId) },
+      payload: { fromBranchId, toBranchId: Number(toBranchId), itemsCount: items.length, status: "PENDING" },
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.approveStockTransfer = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const transferId = Number(req.params.id);
+    const managerApprovalPin = String(req.body?.managerApprovalPin || "");
+    if (Number.isNaN(transferId)) return res.status(400).json({ error: "Invalid transfer id" });
+    if (managerApprovalPin !== getManagerPin()) {
+      return res.status(403).json({ error: "Manager approval PIN required" });
+    }
+    const transfer = await prisma.stockTransfer.findUnique({
+      where: { id: transferId },
+      include: { items: true },
+    });
+    if (!transfer) return res.status(404).json({ error: "Transfer not found" });
+    if (String(transfer.status || "").toLowerCase() !== "pending") {
+      return res.status(400).json({ error: "Only pending transfer can be approved" });
+    }
+    if (Number(transfer.toBranchId) !== Number(branchId) && Number(transfer.fromBranchId) !== Number(branchId)) {
+      return res.status(403).json({ error: "Not allowed to approve this transfer" });
+    }
+
+    const completed = await prisma.$transaction(async (tx) => {
+      for (const item of transfer.items || []) {
+        const qty = Number(item.qty || 0);
+        if (!Number.isInteger(qty) || qty <= 0) throw new Error("Invalid transfer qty");
+        const fromProduct = await tx.product.findUnique({ where: { id: Number(item.fromProductId) } });
+        const toProduct = await tx.product.findUnique({ where: { id: Number(item.toProductId) } });
+        if (!fromProduct || !toProduct) throw new Error("Transfer product mapping invalid");
+        if (Number(fromProduct.branchId) !== Number(transfer.fromBranchId) || Number(toProduct.branchId) !== Number(transfer.toBranchId)) {
+          throw new Error("Transfer product branch mismatch");
+        }
+        if (Number(fromProduct.stock || 0) < qty) throw new Error(`Insufficient stock for ${fromProduct.name}`);
+        await tx.product.update({ where: { id: fromProduct.id }, data: { stock: { decrement: qty } } });
+        await tx.product.update({ where: { id: toProduct.id }, data: { stock: { increment: qty } } });
+        await tx.stockLedger.createMany({
+          data: [
+            {
+              branchId: Number(transfer.fromBranchId),
+              productId: fromProduct.id,
+              refType: "STOCK_TRANSFER_OUT",
+              refId: transfer.id,
+              outQty: qty,
+              unitCost: fromProduct.price,
+            },
+            {
+              branchId: Number(transfer.toBranchId),
+              productId: toProduct.id,
+              refType: "STOCK_TRANSFER_IN",
+              refId: transfer.id,
+              inQty: qty,
+              unitCost: toProduct.price,
+            },
+          ],
+        });
+      }
+      return tx.stockTransfer.update({
+        where: { id: transfer.id },
+        data: { status: "completed" },
+      });
+    });
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "STOCK_TRANSFER_APPROVE",
+      entity: "StockTransfer",
+      entityId: transfer.id,
+      payload: { status: "APPROVED" },
+    });
+    res.json(completed);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.rejectStockTransfer = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const transferId = Number(req.params.id);
+    const reason = String(req.body?.reason || "").trim();
+    if (Number.isNaN(transferId)) return res.status(400).json({ error: "Invalid transfer id" });
+    const transfer = await prisma.stockTransfer.findUnique({ where: { id: transferId } });
+    if (!transfer) return res.status(404).json({ error: "Transfer not found" });
+    if (String(transfer.status || "").toLowerCase() !== "pending") {
+      return res.status(400).json({ error: "Only pending transfer can be rejected" });
+    }
+    if (Number(transfer.toBranchId) !== Number(branchId) && Number(transfer.fromBranchId) !== Number(branchId)) {
+      return res.status(403).json({ error: "Not allowed to reject this transfer" });
+    }
+    const rejected = await prisma.stockTransfer.update({
+      where: { id: transfer.id },
+      data: { status: "rejected" },
+    });
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "STOCK_TRANSFER_REJECT",
+      entity: "StockTransfer",
+      entityId: transfer.id,
+      payload: { status: "REJECTED", reason: reason || "" },
+    });
+    res.json(rejected);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -508,35 +591,243 @@ exports.getLowStockAlerts = async (req, res) => {
     });
 
     const rows = products
+      .filter((p) => !p.hasVariants)
       .map((p) => {
-        const stock = Number(p.stock || 0);
         const reorderLevel = Number(p.reorderLevel || 0);
+        const stock = p.sellByWeight ? Number(p.stockKg || 0) : Number(p.stock || 0);
         const shortageQty = Math.max(0, reorderLevel - stock);
         const status = stock <= 0 ? "OUT" : stock <= reorderLevel ? "LOW" : "OK";
         return {
           ...p,
+          kind: p.sellByWeight ? "WEIGHT" : "SIMPLE",
+          stockDisplay: p.sellByWeight ? `${Number(stock).toFixed(3)} kg` : stock,
           status,
           shortageQty,
           severityScore: reorderLevel > 0 ? shortageQty / reorderLevel : 0,
         };
       })
-      .filter((p) => (onlyCritical ? p.status !== "OK" : true))
-      .sort((a, b) => {
-        if (a.status !== b.status) {
-          const priority = { OUT: 0, LOW: 1, OK: 2 };
-          return priority[a.status] - priority[b.status];
-        }
-        if (b.severityScore !== a.severityScore) return b.severityScore - a.severityScore;
-        return a.name.localeCompare(b.name);
-      });
+      .filter((p) => (onlyCritical ? p.status !== "OK" : true));
+
+    let variantAlertRows = [];
+    const variantsForAlert = await prisma.productVariant.findMany({
+      where: {
+        branchId,
+        product: { hasVariants: true, reorderLevel: { gt: 0 } },
+      },
+      include: {
+        product: { select: { id: true, name: true, sku: true, reorderLevel: true, price: true, category: true } },
+      },
+      orderBy: [{ stock: "asc" }, { id: "asc" }],
+      take: 500,
+    });
+    variantAlertRows = variantsForAlert
+      .map((v) => {
+        const reorderLevel = Number(v.product?.reorderLevel || 0);
+        const stock = Number(v.stock || 0);
+        const shortageQty = Math.max(0, reorderLevel - stock);
+        const status = stock <= 0 ? "OUT" : stock <= reorderLevel ? "LOW" : "OK";
+        const baseName = String(v.product?.name || "").trim() || "Product";
+        const vlabel = String(v.label || "").trim();
+        return {
+          id: `var-${v.id}`,
+          variantId: v.id,
+          productId: v.productId,
+          kind: "VARIANT",
+          name: vlabel ? `${baseName} (${vlabel})` : baseName,
+          sku: v.sku || v.product?.sku || null,
+          category: v.product?.category || "",
+          price: Number(v.product?.price || 0),
+          stock,
+          reorderLevel,
+          status,
+          shortageQty,
+          severityScore: reorderLevel > 0 ? shortageQty / reorderLevel : 0,
+        };
+      })
+      .filter((p) => (onlyCritical ? p.status !== "OK" : true));
+
+    const merged = [...rows, ...variantAlertRows].sort((a, b) => {
+      if (a.status !== b.status) {
+        const priority = { OUT: 0, LOW: 1, OK: 2 };
+        return priority[a.status] - priority[b.status];
+      }
+      if (b.severityScore !== a.severityScore) return b.severityScore - a.severityScore;
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    });
 
     res.json({
-      rows,
+      rows: merged,
       summary: {
-        totalTracked: rows.length,
-        outOfStock: rows.filter((x) => x.status === "OUT").length,
-        lowStock: rows.filter((x) => x.status === "LOW").length,
+        totalTracked: merged.length,
+        outOfStock: merged.filter((x) => x.status === "OUT").length,
+        lowStock: merged.filter((x) => x.status === "LOW").length,
       },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getInventoryIntelligence = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const days = Math.max(7, Number(req.query.days || 30));
+    const deadDays = Math.max(15, Number(req.query.deadDays || 60));
+    const leadDays = Math.max(1, Number(req.query.leadDays || 7));
+    const forecastDays = Math.max(1, Number(req.query.forecastDays || leadDays));
+    const now = new Date();
+    const from = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+    const products = await prisma.product.findMany({
+      where: { branchId },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        category: true,
+        stock: true,
+        reorderLevel: true,
+        price: true,
+      },
+      orderBy: { name: "asc" },
+      take: 2000,
+    });
+    const productIds = products.map((p) => p.id);
+    if (!productIds.length) {
+      return res.json({
+        summary: { fastMovingCount: 0, slowMovingCount: 0, deadStockCount: 0, suggestedReorderCount: 0 },
+        rows: [],
+      });
+    }
+
+    const periodSales = await prisma.saleItem.findMany({
+      where: {
+        productId: { in: productIds },
+        sale: {
+          branchId,
+          createdAt: { gte: from, lte: now },
+        },
+      },
+      select: {
+        productId: true,
+        qty: true,
+        sale: { select: { createdAt: true } },
+      },
+    });
+
+    const recentSales = await prisma.saleItem.findMany({
+      where: {
+        productId: { in: productIds },
+        sale: { branchId },
+      },
+      select: {
+        productId: true,
+        qty: true,
+        sale: { select: { createdAt: true } },
+      },
+      orderBy: { sale: { createdAt: "desc" } },
+      take: 8000,
+    });
+
+    const soldQtyMap = new Map();
+    const weekdayQtyByProduct = new Map();
+    periodSales.forEach((row) => {
+      soldQtyMap.set(row.productId, (soldQtyMap.get(row.productId) || 0) + Number(row.qty || 0));
+      const createdAt = row.sale?.createdAt ? new Date(row.sale.createdAt) : null;
+      const weekday = createdAt ? createdAt.getDay() : 0;
+      if (!weekdayQtyByProduct.has(row.productId)) {
+        weekdayQtyByProduct.set(row.productId, [0, 0, 0, 0, 0, 0, 0]);
+      }
+      const arr = weekdayQtyByProduct.get(row.productId);
+      arr[weekday] += Number(row.qty || 0);
+      weekdayQtyByProduct.set(row.productId, arr);
+    });
+
+    const lastSoldMap = new Map();
+    recentSales.forEach((row) => {
+      if (!lastSoldMap.has(row.productId)) {
+        lastSoldMap.set(row.productId, row.sale?.createdAt || null);
+      }
+    });
+
+    const rows = products.map((p) => {
+      const soldQty = Number(soldQtyMap.get(p.id) || 0);
+      const avgDailySold = soldQty / days;
+      const projectedNeed = avgDailySold * leadDays;
+      const weekdayPattern = weekdayQtyByProduct.get(p.id) || [0, 0, 0, 0, 0, 0, 0];
+      const totalPatternQty = weekdayPattern.reduce((sum, qty) => sum + Number(qty || 0), 0);
+      const expectedWeekdayAvg = totalPatternQty > 0 ? totalPatternQty / 7 : avgDailySold;
+      let upcomingDemand = 0;
+      for (let i = 0; i < forecastDays; i += 1) {
+        const day = new Date(now.getTime() + i * 24 * 60 * 60 * 1000).getDay();
+        const dayQty = Number(weekdayPattern[day] || 0);
+        const normalizedDayDemand = totalPatternQty > 0 ? dayQty : expectedWeekdayAvg;
+        upcomingDemand += normalizedDayDemand;
+      }
+      const forecastNeed = totalPatternQty > 0 ? upcomingDemand : avgDailySold * forecastDays;
+      const seasonalityMultiplier = projectedNeed > 0 ? forecastNeed / projectedNeed : 1;
+      const baseReorderSuggestionQty = Math.max(
+        0,
+        Math.ceil(Math.max(Number(p.reorderLevel || 0), projectedNeed) - Number(p.stock || 0))
+      );
+      const reorderSuggestionQty = Math.max(
+        0,
+        Math.ceil(Math.max(Number(p.reorderLevel || 0), forecastNeed) - Number(p.stock || 0))
+      );
+      const lastSoldAt = lastSoldMap.get(p.id) || null;
+      const daysSinceLastSale = lastSoldAt
+        ? Math.floor((now.getTime() - new Date(lastSoldAt).getTime()) / (24 * 60 * 60 * 1000))
+        : null;
+      const deadStock = daysSinceLastSale == null ? Number(p.stock || 0) > 0 : daysSinceLastSale >= deadDays;
+      return {
+        ...p,
+        soldQty,
+        avgDailySold,
+        projectedNeed,
+        forecastNeed,
+        seasonalityMultiplier,
+        baseReorderSuggestionQty,
+        lastSoldAt,
+        daysSinceLastSale,
+        deadStock,
+        reorderSuggestionQty,
+      };
+    });
+
+    const sortedByMovement = [...rows].sort((a, b) => b.soldQty - a.soldQty);
+    const fastThreshold = sortedByMovement.length
+      ? sortedByMovement[Math.max(0, Math.floor(sortedByMovement.length * 0.2) - 1)]?.soldQty || 0
+      : 0;
+    const slowThreshold = sortedByMovement.length
+      ? sortedByMovement[Math.max(0, Math.floor(sortedByMovement.length * 0.8) - 1)]?.soldQty || 0
+      : 0;
+
+    const classified = rows.map((row) => {
+      let movementClass = "MEDIUM";
+      if (row.soldQty >= fastThreshold && row.soldQty > 0) movementClass = "FAST";
+      else if (row.soldQty <= slowThreshold) movementClass = "SLOW";
+      if (row.deadStock) movementClass = "DEAD";
+      return { ...row, movementClass };
+    });
+
+    res.json({
+      summary: {
+        fastMovingCount: classified.filter((x) => x.movementClass === "FAST").length,
+        slowMovingCount: classified.filter((x) => x.movementClass === "SLOW").length,
+        deadStockCount: classified.filter((x) => x.movementClass === "DEAD").length,
+        suggestedReorderCount: classified.filter((x) => Number(x.reorderSuggestionQty || 0) > 0).length,
+        seasonalityAdjustedCount: classified.filter(
+          (x) => Number(x.reorderSuggestionQty || 0) !== Number(x.baseReorderSuggestionQty || 0)
+        ).length,
+      },
+      rows: classified.sort((a, b) => {
+        const priority = { DEAD: 0, SLOW: 1, MEDIUM: 2, FAST: 3 };
+        if (priority[a.movementClass] !== priority[b.movementClass]) {
+          return priority[a.movementClass] - priority[b.movementClass];
+        }
+        return Number(b.soldQty || 0) - Number(a.soldQty || 0);
+      }),
+      params: { days, deadDays, leadDays, forecastDays },
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1175,6 +1466,537 @@ exports.exportStockCountSessionsXLSX = async (req, res) => {
       FinalizedAt: r.finalizedAt || "",
     }));
     sendXlsx(res, data, "stock-count-sessions.xlsx", "StockCount");
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+function normalizeBatchLog(log, productMap = new Map()) {
+  const payload = log.payload || {};
+  const qtyOnHand = Math.max(0, Number(payload.qtyOnHand || 0));
+  const expiryDate = payload.expiryDate ? new Date(payload.expiryDate) : null;
+  const now = new Date();
+  const daysToExpiry =
+    expiryDate != null ? Math.ceil((expiryDate.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)) : null;
+  const status = qtyOnHand <= 0 ? "DEPLETED" : daysToExpiry != null && daysToExpiry < 0 ? "EXPIRED" : "ACTIVE";
+  return {
+    id: log.id,
+    branchId: Number(payload.branchId || 0),
+    productId: Number(payload.productId || 0),
+    productName: productMap.get(Number(payload.productId || 0)) || `#${payload.productId || "-"}`,
+    batchCode: String(payload.batchCode || ""),
+    expiryDate: payload.expiryDate || null,
+    receivedAt: payload.receivedAt || log.createdAt,
+    qtyOnHand,
+    unitCost: Number(payload.unitCost || 0),
+    note: String(payload.note || ""),
+    status,
+    daysToExpiry,
+    createdAt: log.createdAt,
+    updatedAt: payload.updatedAt || log.createdAt,
+    source: "LEGACY_AUDIT",
+  };
+}
+
+function normalizeBatchFromDb(b, productMap = new Map()) {
+  const expiryDate = b.expiryDate ? new Date(b.expiryDate) : null;
+  const now = new Date();
+  const daysToExpiry =
+    expiryDate != null ? Math.ceil((expiryDate.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)) : null;
+  const qtyOnHand = Math.max(0, Number(b.qtyOnHand || 0));
+  const status = qtyOnHand <= 0 ? "DEPLETED" : daysToExpiry != null && daysToExpiry < 0 ? "EXPIRED" : "ACTIVE";
+  return {
+    id: b.id,
+    branchId: b.branchId,
+    productId: b.productId,
+    productName: productMap.get(b.productId) || `#${b.productId}`,
+    batchCode: b.batchCode,
+    expiryDate: b.expiryDate ? b.expiryDate.toISOString() : null,
+    receivedAt: b.createdAt.toISOString(),
+    qtyOnHand,
+    unitCost: Number(b.unitCost || 0),
+    note: String(b.note || ""),
+    status,
+    daysToExpiry,
+    createdAt: b.createdAt,
+    updatedAt: b.updatedAt,
+    source: "TABLE",
+  };
+}
+
+async function getInventoryBatchesInternal(branchId, query = {}) {
+  const productId = query.productId ? Number(query.productId) : null;
+  const includeDepleted = String(query.includeDepleted || "").toLowerCase() === "true";
+  const whereDb = {
+    branchId,
+    ...(productId ? { productId } : {}),
+    ...(!includeDepleted ? { qtyOnHand: { gt: 0 } } : {}),
+  };
+  const dbRows = await prisma.inventoryBatch.findMany({
+    where: whereDb,
+    orderBy: [{ expiryDate: "asc" }, { id: "asc" }],
+    take: 2000,
+  });
+  const productIds = [...new Set(dbRows.map((x) => x.productId))];
+  const products = productIds.length
+    ? await prisma.product.findMany({
+        where: { branchId, id: { in: productIds } },
+        select: { id: true, name: true },
+      })
+    : [];
+  const productMap = new Map(products.map((p) => [p.id, p.name]));
+  const fromDb = dbRows.map((row) => normalizeBatchFromDb(row, productMap));
+
+  const legacyWhere = {
+    action: "INVENTORY_BATCH",
+    entity: "InventoryBatch",
+  };
+  const logs = await prisma.auditLog.findMany({
+    where: legacyWhere,
+    orderBy: { createdAt: "desc" },
+    take: 500,
+  });
+  const legacyFiltered = logs.filter((log) => {
+    const payload = log.payload || {};
+    if (Number(payload.branchId || 0) !== Number(branchId)) return false;
+    if (productId && Number(payload.productId || 0) !== productId) return false;
+    if (!includeDepleted && Number(payload.qtyOnHand || 0) <= 0) return false;
+    return true;
+  });
+  const fromLegacy = legacyFiltered
+    .filter((log) => {
+      const p = log.payload || {};
+      return !fromDb.some(
+        (d) =>
+          d.branchId === Number(p.branchId) &&
+          d.productId === Number(p.productId) &&
+          d.batchCode === String(p.batchCode || "")
+      );
+    })
+    .map((log) => normalizeBatchLog(log, productMap));
+
+  return [...fromDb, ...fromLegacy];
+}
+
+exports.getInventoryBatches = async (req, res) => {
+  try {
+    const rows = await getInventoryBatchesInternal(req.branchId, req.query || {});
+    res.json(rows.sort((a, b) => {
+      const ea = a.expiryDate ? new Date(a.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
+      const eb = b.expiryDate ? new Date(b.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
+      return ea - eb;
+    }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.createInventoryBatch = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const productId = Number(req.body?.productId);
+    const batchCode = String(req.body?.batchCode || "").trim();
+    const qtyOnHand = Math.max(0, Math.floor(Number(req.body?.qtyOnHand || 0)));
+    const unitCost = Number(req.body?.unitCost || 0);
+    const expiryDate = req.body?.expiryDate ? new Date(`${req.body.expiryDate}T00:00:00.000Z`) : null;
+    const note = String(req.body?.note || "").trim();
+    if (Number.isNaN(productId) || !productId) return res.status(400).json({ error: "Invalid productId" });
+    if (!batchCode) return res.status(400).json({ error: "Batch code is required" });
+    if (!Number.isFinite(unitCost) || unitCost < 0) return res.status(400).json({ error: "Invalid unit cost" });
+    const product = await prisma.product.findFirst({ where: { id: productId, branchId }, select: { id: true, price: true } });
+    if (!product) return res.status(404).json({ error: "Product not found in branch" });
+
+    const created = await prisma.$transaction(async (tx) => {
+      const batch = await tx.inventoryBatch.create({
+        data: {
+          branchId,
+          productId,
+          batchCode,
+          expiryDate,
+          qtyOnHand,
+          unitCost,
+          note: note || null,
+        },
+      });
+      await writeAuditLog({
+        userId: req.user?.id || null,
+        action: "INVENTORY_BATCH_DB_CREATE",
+        entity: "InventoryBatch",
+        entityId: batch.id,
+        payload: { branchId, productId, batchCode, qtyOnHand },
+      });
+      if (qtyOnHand > 0) {
+        await tx.product.update({ where: { id: product.id }, data: { stock: { increment: qtyOnHand } } });
+        await tx.stockLedger.create({
+          data: {
+            branchId,
+            productId: product.id,
+            refType: "BATCH_RECEIPT",
+            refId: batch.id,
+            inQty: qtyOnHand,
+            outQty: 0,
+            unitCost: unitCost || product.price,
+          },
+        });
+      }
+      return batch;
+    });
+
+    res.status(201).json({ id: created.id, message: "Batch created" });
+  } catch (error) {
+    if (error.code === "P2002") return res.status(400).json({ error: "Batch code already exists for this product" });
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.updateInventoryBatchQty = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    const qtyChange = Math.floor(Number(req.body?.qtyChange || 0));
+    const reason = String(req.body?.reason || "batch_adjustment").trim();
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid batch id" });
+    if (!Number.isInteger(qtyChange) || qtyChange === 0) {
+      return res.status(400).json({ error: "qtyChange must be non-zero integer" });
+    }
+
+    const tableRow = await prisma.inventoryBatch.findFirst({ where: { id, branchId } });
+    if (tableRow) {
+      const nextQty = Number(tableRow.qtyOnHand || 0) + qtyChange;
+      if (nextQty < 0) return res.status(400).json({ error: "Batch quantity cannot be negative" });
+      const product = await prisma.product.findFirst({
+        where: { id: tableRow.productId, branchId },
+        select: { id: true, price: true },
+      });
+      if (!product) return res.status(404).json({ error: "Product not found" });
+      if (Number(product.stock || 0) + qtyChange < 0) return res.status(400).json({ error: "Stock cannot become negative" });
+
+      await prisma.$transaction(async (tx) => {
+        await tx.inventoryBatch.update({
+          where: { id: tableRow.id },
+          data: { qtyOnHand: nextQty },
+        });
+        await tx.product.update({
+          where: { id: product.id },
+          data: { stock: { increment: qtyChange } },
+        });
+        await tx.stockLedger.create({
+          data: {
+            branchId,
+            productId: product.id,
+            refType: qtyChange > 0 ? "BATCH_ADJUST_IN" : "BATCH_CONSUME",
+            refId: tableRow.id,
+            inQty: qtyChange > 0 ? qtyChange : 0,
+            outQty: qtyChange < 0 ? Math.abs(qtyChange) : 0,
+            unitCost: Number(tableRow.unitCost || product.price || 0),
+          },
+        });
+      });
+
+      await writeAuditLog({
+        userId: req.user?.id || null,
+        action: "INVENTORY_BATCH_QTY_UPDATE",
+        entity: "InventoryBatch",
+        entityId: id,
+        payload: { qtyChange, reason, source: "TABLE" },
+      });
+      return res.json({ message: "Batch quantity updated" });
+    }
+
+    const log = await prisma.auditLog.findUnique({ where: { id } });
+    if (!log || log.action !== "INVENTORY_BATCH" || log.entity !== "InventoryBatch") {
+      return res.status(404).json({ error: "Batch not found" });
+    }
+    const payload = log.payload || {};
+    if (Number(payload.branchId || 0) !== Number(branchId)) return res.status(404).json({ error: "Batch not found" });
+    const nextQty = Number(payload.qtyOnHand || 0) + qtyChange;
+    if (nextQty < 0) return res.status(400).json({ error: "Batch quantity cannot be negative" });
+    const product = await prisma.product.findFirst({
+      where: { id: Number(payload.productId || 0), branchId },
+      select: { id: true, price: true },
+    });
+    if (!product) return res.status(404).json({ error: "Product not found" });
+    if (Number(product.stock || 0) + qtyChange < 0) return res.status(400).json({ error: "Stock cannot become negative" });
+
+    await prisma.$transaction(async (tx) => {
+      await tx.auditLog.update({
+        where: { id },
+        data: {
+          payload: {
+            ...payload,
+            qtyOnHand: nextQty,
+            note: payload.note || "",
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      });
+      await tx.product.update({
+        where: { id: product.id },
+        data: { stock: { increment: qtyChange } },
+      });
+      await tx.stockLedger.create({
+        data: {
+          branchId,
+          productId: product.id,
+          refType: qtyChange > 0 ? "BATCH_ADJUST_IN" : "BATCH_CONSUME",
+          refId: id,
+          inQty: qtyChange > 0 ? qtyChange : 0,
+          outQty: qtyChange < 0 ? Math.abs(qtyChange) : 0,
+          unitCost: Number(payload.unitCost || product.price || 0),
+        },
+      });
+    });
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "INVENTORY_BATCH_QTY_UPDATE",
+      entity: "InventoryBatch",
+      entityId: id,
+      payload: { qtyChange, reason, source: "LEGACY_AUDIT" },
+    });
+    res.json({ message: "Batch quantity updated" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getInventoryBatchAlerts = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const days = Math.max(1, Number(req.query.days || 30));
+    const rows = await getInventoryBatchesInternal(branchId, { includeDepleted: false });
+    const now = new Date();
+    const nearRows = rows
+      .filter((row) => row.expiryDate)
+      .map((row) => {
+        const daysToExpiry = Math.ceil((new Date(row.expiryDate).getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+        const isExpired = daysToExpiry < 0;
+        const isNear = !isExpired && daysToExpiry <= days;
+        const suggestedMarkdownPct = isExpired ? 50 : daysToExpiry <= 3 ? 30 : daysToExpiry <= 7 ? 20 : 10;
+        return { ...row, daysToExpiry, isExpired, isNear, suggestedMarkdownPct };
+      })
+      .filter((row) => row.isNear || row.isExpired)
+      .sort((a, b) => Number(a.daysToExpiry || 0) - Number(b.daysToExpiry || 0));
+    res.json({
+      summary: {
+        tracked: rows.length,
+        nearExpiryCount: nearRows.filter((x) => x.isNear).length,
+        expiredCount: nearRows.filter((x) => x.isExpired).length,
+      },
+      rows: nearRows,
+      params: { days },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.createExpiryMarkdownCampaign = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const days = Math.max(1, Number(req.body?.days || req.query?.days || 30));
+    const validDays = Math.max(1, Number(req.body?.validDays || req.query?.validDays || 7));
+    const maxProducts = Math.max(1, Number(req.body?.maxProducts || req.query?.maxProducts || 100));
+    const now = new Date();
+    const endsAt = new Date(now.getTime() + validDays * 24 * 60 * 60 * 1000);
+
+    const rows = await getInventoryBatchesInternal(branchId, { includeDepleted: false });
+    const nearRows = rows
+      .filter((row) => row.expiryDate)
+      .map((row) => {
+        const daysToExpiry = Math.ceil((new Date(row.expiryDate).getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+        const isExpired = daysToExpiry < 0;
+        const isNear = !isExpired && daysToExpiry <= days;
+        const suggestedMarkdownPct = isExpired ? 50 : daysToExpiry <= 3 ? 30 : daysToExpiry <= 7 ? 20 : 10;
+        return { ...row, daysToExpiry, isExpired, isNear, suggestedMarkdownPct };
+      })
+      .filter((row) => row.isNear || row.isExpired)
+      .sort((a, b) => Number(a.daysToExpiry || 0) - Number(b.daysToExpiry || 0));
+
+    if (!nearRows.length) {
+      return res.json({ message: "No near-expiry/expired batch found for markdown campaign", created: 0, rows: [] });
+    }
+
+    const byProduct = new Map();
+    for (const row of nearRows) {
+      const key = Number(row.productId || 0);
+      if (!key) continue;
+      const prev = byProduct.get(key);
+      if (!prev || Number(row.suggestedMarkdownPct || 0) > Number(prev.suggestedMarkdownPct || 0)) {
+        byProduct.set(key, row);
+      }
+    }
+    const targets = [...byProduct.values()].slice(0, maxProducts);
+    const createdRules = [];
+
+    for (const row of targets) {
+      const created = await prisma.promotionRule.create({
+        data: {
+          branchId,
+          name: `[AUTO] Expiry markdown ${row.productName || `Product #${row.productId}`} (${row.batchCode || "-"})`,
+          type: "PRODUCT_PERCENT",
+          productId: Number(row.productId),
+          discountValue: Math.max(1, Number(row.suggestedMarkdownPct || 0)),
+          minBasketAmount: 0,
+          isActive: true,
+          startsAt: now,
+          endsAt,
+        },
+      });
+      createdRules.push(created);
+    }
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "EXPIRY_MARKDOWN_CAMPAIGN_CREATE",
+      entity: "PromotionRule",
+      entityId: null,
+      payload: {
+        branchId,
+        days,
+        validDays,
+        created: createdRules.length,
+        ruleIds: createdRules.map((x) => x.id),
+      },
+    });
+
+    res.status(201).json({
+      message: `Created ${createdRules.length} markdown promotion rule(s)`,
+      created: createdRules.length,
+      validUntil: endsAt.toISOString(),
+      rows: createdRules,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getTransferSuggestions = async (req, res) => {
+  try {
+    const fromBranchId = req.branchId;
+    const minQty = Math.max(1, Number(req.query.minQty || 1));
+    const products = await prisma.product.findMany({
+      where: { branchId: fromBranchId },
+      select: { id: true, name: true, sku: true, stock: true, reorderLevel: true },
+      take: 2000,
+      orderBy: { stock: "desc" },
+    });
+    const bySku = products.filter((p) => String(p.sku || "").trim()).map((p) => String(p.sku).trim());
+    if (!bySku.length) return res.json({ rows: [], summary: { suggestions: 0 } });
+    const targetProducts = await prisma.product.findMany({
+      where: {
+        sku: { in: bySku },
+        branchId: { not: fromBranchId },
+      },
+      include: { branch: { select: { id: true, name: true, isActive: true } } },
+      take: 8000,
+    });
+    const sourceBySku = new Map(products.map((p) => [String(p.sku || "").trim(), p]));
+    const rows = targetProducts
+      .filter((tp) => tp.branch?.isActive)
+      .map((tp) => {
+        const sku = String(tp.sku || "").trim();
+        const source = sourceBySku.get(sku);
+        if (!source) return null;
+        const excessQty = Math.max(0, Number(source.stock || 0) - Number(source.reorderLevel || 0));
+        const shortageQty = Math.max(0, Number(tp.reorderLevel || 0) - Number(tp.stock || 0));
+        const suggestedQty = Math.min(excessQty, shortageQty);
+        return {
+          fromBranchId,
+          fromProductId: source.id,
+          fromProductName: source.name,
+          fromSku: source.sku || "",
+          fromStock: Number(source.stock || 0),
+          fromReorderLevel: Number(source.reorderLevel || 0),
+          toBranchId: tp.branch.id,
+          toBranchName: tp.branch.name,
+          toProductId: tp.id,
+          toProductName: tp.name,
+          toStock: Number(tp.stock || 0),
+          toReorderLevel: Number(tp.reorderLevel || 0),
+          excessQty,
+          shortageQty,
+          suggestedQty,
+        };
+      })
+      .filter((x) => x && Number(x.suggestedQty || 0) >= minQty)
+      .sort((a, b) => Number(b.suggestedQty || 0) - Number(a.suggestedQty || 0))
+      .slice(0, 300);
+
+    res.json({
+      summary: {
+        suggestions: rows.length,
+        totalSuggestedQty: rows.reduce((sum, row) => sum + Number(row.suggestedQty || 0), 0),
+      },
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getReorderSuggestions = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const fmt = String(req.query.format || "json").toLowerCase();
+
+    const products = await prisma.product.findMany({
+      where: { branchId },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        category: true,
+        stock: true,
+        reorderLevel: true,
+        price: true,
+      },
+      orderBy: { name: "asc" },
+      take: 3500,
+    });
+
+    const rows = products
+      .map((p) => {
+        const stock = Number(p.stock || 0);
+        const reorderLevel = Math.max(0, Number(p.reorderLevel || 0));
+        if (reorderLevel <= 0 || stock > reorderLevel) return null;
+        const shortage = Math.max(0, reorderLevel - stock);
+        const targetStock = reorderLevel + reorderLevel;
+        const suggestedReorderQty = Math.ceil(Math.max(targetStock - stock, reorderLevel));
+        return {
+          ...p,
+          shortage,
+          suggestedReorderQty,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => Number(a.stock) - Number(b.stock));
+
+    if (fmt === "csv") {
+      const header =
+        ["id", "sku", "name", "category", "stock", "reorderLevel", "shortage", "suggestedReorderQty", "price"].join(
+          ","
+        ) + "\n";
+      const esc = (v) =>
+        `"${String(v ?? "")
+          .replace(/"/g, '""')
+          .replace(/\n/g, " ")}"`;
+      const cs = rows.map((r) =>
+        [r.id, r.sku, r.name, r.category, r.stock, r.reorderLevel, r.shortage, r.suggestedReorderQty, r.price]
+          .map(esc)
+          .join(",")
+      );
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="reorder-suggestions-branch-${branchId}.csv"`);
+      return res.send(header + cs.join("\n"));
+    }
+
+    res.json({
+      summary: {
+        skuCountNeedingReorder: rows.length,
+      },
+      rows,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

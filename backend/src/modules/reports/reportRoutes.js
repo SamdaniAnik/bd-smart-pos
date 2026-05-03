@@ -12,6 +12,11 @@ const {
   exportAgingCSV,
   exportStockValuationPDF,
   exportAgingPDF,
+  getShrinkageControlReport,
+  exportShrinkageControlCSV,
+  exportShrinkageControlPDF,
+  getStaffPerformanceScorecard,
+  getAuditActivityTrail,
 } = require("./reportController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -29,5 +34,10 @@ router.get("/aging/export.csv", requireAuth, requirePermission("report.view"), e
 router.get("/stock-valuation/export.csv", requireAuth, requirePermission("report.view"), exportStockValuationCSV);
 router.get("/aging/export.pdf", requireAuth, requirePermission("report.view"), exportAgingPDF);
 router.get("/stock-valuation/export.pdf", requireAuth, requirePermission("report.view"), exportStockValuationPDF);
+router.get("/shrinkage-control", requireAuth, requirePermission("report.view"), getShrinkageControlReport);
+router.get("/shrinkage-control/export.csv", requireAuth, requirePermission("report.view"), exportShrinkageControlCSV);
+router.get("/shrinkage-control/export.pdf", requireAuth, requirePermission("report.view"), exportShrinkageControlPDF);
+router.get("/staff-kpi", requireAuth, requirePermission("report.view"), getStaffPerformanceScorecard);
+router.get("/audit-activity", requireAuth, requirePermission("report.view"), getAuditActivityTrail);
 
 module.exports = router;

@@ -16,6 +16,8 @@ const {
   exportLoyaltyRedemptionHistoryPDF,
   exportLoyaltyRedemptionHistoryXLSX,
   getSaleInvoice,
+  getSalePayments,
+  getSaleMushakPdf,
   createHeldCart,
   getHeldCarts,
   discardHeldCart,
@@ -29,12 +31,14 @@ const {
   setSalesQuoteFollowUp,
   getSalesQuoteReminderSummary,
   markSalesQuoteFollowUpDone,
+  getCustomerRecentSales,
 } = require("../controllers/saleController");
 const { requireAuth, requirePermission } = require("../middleware/auth");
 
 router.post("/checkout", requireAuth, requirePermission("sale.create"), checkout);
 router.post("/:id/return", requireAuth, requirePermission("sale.return"), saleReturn);
 router.get("/recent", requireAuth, requirePermission("sale.view"), getRecentSales);
+router.get("/customer/recent-sales", requireAuth, requirePermission("sale.view"), getCustomerRecentSales);
 router.get("/summary/today", requireAuth, requirePermission("sale.view"), getTodaySummary);
 router.get("/summary/settlement-today", requireAuth, requirePermission("sale.view"), getTodaySettlement);
 router.get("/summary/settlement-today/export-method.csv", requireAuth, requirePermission("sale.view"), exportTodaySettlementMethodCSV);
@@ -58,6 +62,8 @@ router.post("/quotes/:id/follow-up-done", requireAuth, requirePermission("sale.c
 router.post("/quotes/:id/duplicate", requireAuth, requirePermission("sale.create"), duplicateSalesQuote);
 router.delete("/quotes/:id", requireAuth, requirePermission("sale.create"), cancelSalesQuote);
 router.get("/quotes/:id/pdf", requireAuth, requirePermission("sale.view"), getSalesQuotePdf);
+router.get("/:id/payments", requireAuth, requirePermission("sale.view"), getSalePayments);
+router.get("/:id/mushak-pdf", requireAuth, requirePermission("sale.view"), getSaleMushakPdf);
 router.get("/:id/invoice", requireAuth, requirePermission("sale.view"), getSaleInvoice);
 
 module.exports = router;

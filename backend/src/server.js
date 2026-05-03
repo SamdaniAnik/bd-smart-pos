@@ -18,6 +18,7 @@ const expenseRoutes = require("./modules/expense/expenseRoutes");
 const duesRoutes = require("./modules/dues/duesRoutes");
 const shiftRoutes = require("./modules/shift/shiftRoutes");
 const approvalRoutes = require("./modules/approvals/approvalRoutes");
+const promotionRoutes = require("./modules/promotions/promotionRoutes");
 const { setSocketInstance } = require("./socket");
 
 
@@ -51,6 +52,10 @@ app.use("/api/expenses", expenseRoutes);
 app.use("/api/dues", duesRoutes);
 app.use("/api/shifts", shiftRoutes);
 app.use("/api/approvals", approvalRoutes);
+app.use("/api/promotions", promotionRoutes);
+app.use("/api/gift-cards", require("./modules/giftcard/giftCardRoutes"));
+app.use("/api/finance", require("./modules/finance/financeRoutes"));
+app.use("/api/integration/webhooks", require("./modules/integration/webhookRoutes"));
 
 app.get("/", function (req, res) {
   res.send("BD Smart POS API is running");

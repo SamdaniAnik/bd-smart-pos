@@ -18,10 +18,17 @@ import LoyaltyDashboard from "./pages/LoyaltyDashboard";
 import ApprovalQueue from "./pages/ApprovalQueue";
 import StockCount from "./pages/StockCount";
 import Quotations from "./pages/Quotations";
+import Promotions from "./pages/Promotions";
+import GiftCards from "./pages/GiftCards";
+import FinanceSettlements from "./pages/FinanceSettlements";
+import FinanceBankImports from "./pages/FinanceBankImports";
+import IntegrationWebhooks from "./pages/IntegrationWebhooks";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "./services/api";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
+import ToastHost from "./components/ToastHost";
 import { t } from "./i18n";
+import { getStoredPermissions, hasPermission } from "./utils/permissions";
 
 const readNavPins = () => {
   try {
@@ -40,7 +47,7 @@ function App() {
   const [lang, setLang] = useState(localStorage.getItem("bd_pos_lang") || "en");
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const token = localStorage.getItem("bd_pos_token");
-  const permissions = JSON.parse(localStorage.getItem("bd_pos_permissions") || "[]");
+  const permissions = getStoredPermissions();
   const userJson = localStorage.getItem("bd_pos_user");
   const user = userJson ? JSON.parse(userJson) : null;
   const branchId = localStorage.getItem("bd_pos_branch_id") || "1";
@@ -49,7 +56,7 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   const sectionsByPerm = useMemo(() => {
-    const canSeePos = permissions.includes("sale.create") || permissions.includes("sale.view");
+    const canSeePos = hasPermission("sale.create", permissions) || hasPermission("sale.view", permissions);
     const baseSections = [
       {
         title: "Daily Operations",
@@ -69,8 +76,10 @@ function App() {
           { key: "stockCount", label: t(lang, "stockCount"), hint: "Physical inventory count", icon: "🧾", perm: "inventory.adjust" },
           { key: "warehouses", label: t(lang, "warehouses"), hint: "Warehouse master", icon: "🏬", perm: "inventory.view" },
           { key: "purchases", label: t(lang, "purchases"), hint: "Purchase bills", icon: "🧾", perm: "purchase.view" },
+          { key: "promotions", label: "Promotions", hint: "BOGO/category/cart offers", icon: "🏷️", perm: "product.create" },
           { key: "suppliers", label: t(lang, "suppliers"), hint: "Supplier master", icon: "🚚", perm: "supplier.view" },
           { key: "customers", label: t(lang, "customers"), hint: "Customer master", icon: "👥", perm: "customer.view" },
+          { key: "giftCards", label: "Gift cards", hint: "Issuing & wallet load", icon: "🎫", perm: "customer.view" },
         ],
       },
       {
@@ -81,6 +90,8 @@ function App() {
           { key: "loyalty", label: t(lang, "loyalty"), hint: "Points, tiers, redemption", icon: "🎁", perm: "customer.view" },
           { key: "approvals", label: t(lang, "approvals"), hint: "Approval queue & exceptions", icon: "✅", perm: "report.view" },
           { key: "accounting", label: t(lang, "accounting"), hint: "COA & trial balance", icon: "💰", perm: "accounting.view" },
+          { key: "financeSettlements", label: "Settlements", hint: "MFS reconciliation", icon: "🏦", perm: "accounting.report" },
+          { key: "financeBankCsv", label: "Bank import", hint: "Statement lines & matching", icon: "📥", perm: "accounting.report" },
           { key: "reports", label: t(lang, "reports"), hint: "Aging & valuation", icon: "📈", perm: "report.view" },
         ],
       },
@@ -88,7 +99,8 @@ function App() {
         title: "Administration",
         items: [
           { key: "roles", label: t(lang, "roleManagement"), hint: "Roles & users", icon: "🛡️", perm: "rbac.manage" },
-          { key: "settings", label: t(lang, "settings"), hint: "Branch settings", icon: "⚙️", perm: true },
+          { key: "integrationWebhooks", label: "Webhooks", hint: "sale.created integrations", icon: "🔗", perm: "rbac.manage" },
+          { key: "settings", label: t(lang, "settings"), hint: "Branch settings", icon: "⚙️", perm: "branch.manage" },
         ],
       },
     ];
@@ -97,7 +109,7 @@ function App() {
       ...section,
       items: section.items.filter(
         (item) =>
-          item.perm === true || (typeof item.perm === "string" && permissions.includes(item.perm))
+          item.perm === true || (typeof item.perm === "string" && hasPermission(item.perm, permissions))
       ),
     }));
   }, [lang, permissions]);
@@ -277,6 +289,7 @@ function App() {
         onClose={() => setShortcutsOpen(false)}
         lang={lang}
       />
+      <ToastHost />
       </>
     );
   }
@@ -299,8 +312,14 @@ function App() {
         return <Warehouses />;
       case "purchases":
         return <Purchases />;
+      case "promotions":
+        return <Promotions />;
       case "accounting":
         return <Accounting />;
+      case "financeSettlements":
+        return <FinanceSettlements />;
+      case "financeBankCsv":
+        return <FinanceBankImports />;
       case "expenses":
         return <Expenses />;
       case "dueCollection":
@@ -315,6 +334,8 @@ function App() {
         return <Suppliers />;
       case "customers":
         return <Customers />;
+      case "giftCards":
+        return <GiftCards />;
       case "returns":
         return <SalesReturns />;
       case "quotations":
@@ -325,6 +346,8 @@ function App() {
         return <Shifts />;
       case "roles":
         return <RoleManagement />;
+      case "integrationWebhooks":
+        return <IntegrationWebhooks />;
       default:
         return <Dashboard />;
     }
@@ -471,6 +494,7 @@ function App() {
         onClose={() => setShortcutsOpen(false)}
         lang={lang}
       />
+      <ToastHost />
     </div>
   );
 }

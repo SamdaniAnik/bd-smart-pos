@@ -126,13 +126,20 @@ function Dashboard() {
           (Number(settlement.totalPaid || 0) + Number(settlement.totalDue || 0))) *
         100
       : 0;
+  const quoteTotalFollowUps =
+    Number(quoteReminders.overdue || 0) +
+    Number(quoteReminders.today || 0) +
+    Number(quoteReminders.tomorrow || 0) +
+    Number(quoteReminders.upcoming || 0);
+  const customerReceivable = (aging.customers || []).reduce((s, x) => s + Number(x.balance || 0), 0);
+  const supplierPayable = (aging.suppliers || []).reduce((s, x) => s + Number(x.payableBalance || 0), 0);
 
   return (
     <div>
       <div className="page-header">
         <div>
           <div className="page-title">Branch Dashboard</div>
-          <div className="page-subtitle">Live branch business snapshot</div>
+          <div className="page-subtitle">Step-by-step business overview</div>
         </div>
       </div>
 
@@ -157,99 +164,110 @@ function Dashboard() {
         </div>
         <div className="metric warning">
           <div className="metric-icon">⚠️</div>
-          <div className="metric-label">Low Stock</div>
+          <div className="metric-label">Low Stock Items</div>
           <div className="metric-value">{lowStock.summary?.lowStock || data.stockAlerts || 0}</div>
           {renderTrend(trends.lowStock, { invert: true, isCurrency: false })}
         </div>
-        <div className="metric warning">
-          <div className="metric-icon">📌</div>
-          <div className="metric-label">Quote Follow-up Overdue</div>
-          <div className="metric-value">{Number(quoteReminders.overdue || 0)}</div>
-          <button type="button" className="btn-secondary btn-sm" onClick={() => openQuoteReminders("OVERDUE")}>
-            Open Quotes
-          </button>
-        </div>
-        <div className="metric">
-          <div className="metric-icon">📅</div>
-          <div className="metric-label">Quote Follow-up Today</div>
-          <div className="metric-value">{Number(quoteReminders.today || 0)}</div>
-          <button type="button" className="btn-secondary btn-sm" onClick={() => openQuoteReminders("TODAY")}>
-            Open Quotes
-          </button>
-        </div>
-        <div className="metric">
-          <div className="metric-icon">🗓️</div>
-          <div className="metric-label">Quote Follow-up Tomorrow</div>
-          <div className="metric-value">{Number(quoteReminders.tomorrow || 0)}</div>
-          <button type="button" className="btn-secondary btn-sm" onClick={() => openQuoteReminders("TOMORROW")}>
-            Open Quotes
-          </button>
-        </div>
       </div>
+
       <div className="quick-stats" style={{ marginBottom: 12 }}>
         <div className="stat">Bills Today: {Number(settlement.billCount || 0)}</div>
         <div className="stat">Avg Bill: {fmt(avgBill)}</div>
         <div className="stat">Collection Rate: {collectionRate.toFixed(1)}%</div>
-        <div className="stat">Stock Value: {fmt(stockValuation.totalValue || 0)}</div>
-        <div className="stat">Gross Margin (approx): {fmt(grossMarginApprox)}</div>
       </div>
+
       <div className="form-grid">
+        <div className="page-card">
+          <h4 style={{ marginBottom: 8 }}>Today’s Follow-ups</h4>
+          <p><strong>Total follow-ups:</strong> {quoteTotalFollowUps}</p>
+          <p><strong>Overdue:</strong> {Number(quoteReminders.overdue || 0)}</p>
+          <p><strong>Today:</strong> {Number(quoteReminders.today || 0)}</p>
+          <p><strong>Tomorrow:</strong> {Number(quoteReminders.tomorrow || 0)}</p>
+          <div className="pos-action-row" style={{ marginTop: 8 }}>
+            <button type="button" className="btn-secondary btn-sm" onClick={() => openQuoteReminders("OVERDUE")}>
+              Open Overdue
+            </button>
+            <button type="button" className="btn-secondary btn-sm" onClick={() => openQuoteReminders("TODAY")}>
+              Open Today
+            </button>
+            <button type="button" className="btn-secondary btn-sm" onClick={() => openQuoteReminders("TOMORROW")}>
+              Open Tomorrow
+            </button>
+          </div>
+        </div>
+
         <div className="page-card">
           <h4 style={{ marginBottom: 8 }}>Cashflow Snapshot</h4>
           <p><strong>Today Paid:</strong> {fmt(settlement.totalPaid || 0)}</p>
           <p><strong>Today Due:</strong> {fmt(settlement.totalDue || 0)}</p>
-          <p><strong>Customer Receivable:</strong> {fmt((aging.customers || []).reduce((s, x) => s + Number(x.balance || 0), 0))}</p>
-          <p><strong>Supplier Payable:</strong> {fmt((aging.suppliers || []).reduce((s, x) => s + Number(x.payableBalance || 0), 0))}</p>
-          <p><strong>Outstanding Gap:</strong> {fmt(
-            (aging.customers || []).reduce((s, x) => s + Number(x.balance || 0), 0) -
-              (aging.suppliers || []).reduce((s, x) => s + Number(x.payableBalance || 0), 0)
-          )}</p>
+          <p><strong>Customer Receivable:</strong> {fmt(customerReceivable)}</p>
+          <p><strong>Supplier Payable:</strong> {fmt(supplierPayable)}</p>
+          <p><strong>Outstanding Gap:</strong> {fmt(customerReceivable - supplierPayable)}</p>
         </div>
+
         <div className="page-card">
-          <h4 style={{ marginBottom: 8 }}>Top Payment Methods</h4>
-          {topMethods.length ? (
-            topMethods.map((m) => (
-              <p key={m.method}>
-                <strong>{m.method}:</strong> {fmt(m.amount || 0)}
-              </p>
-            ))
-          ) : (
-            <p className="text-muted">No method data yet.</p>
-          )}
-        </div>
-        <div className="page-card">
-          <h4 style={{ marginBottom: 8 }}>Top Products (Recent)</h4>
-          {topSellingProducts.length ? (
-            topSellingProducts.map((x) => (
-              <p key={x.productId}>
-                <strong>{x.name}</strong> · Qty {Number(x.qty || 0)} · {fmt(x.amount || 0)}
-              </p>
-            ))
-          ) : (
-            <p className="text-muted">No recent product activity.</p>
-          )}
+          <h4 style={{ marginBottom: 8 }}>Business Health</h4>
+          <p><strong>Stock Value:</strong> {fmt(stockValuation.totalValue || 0)}</p>
+          <p><strong>Gross Margin (approx):</strong> {fmt(grossMarginApprox)}</p>
+          <p><strong>Recent Sales Loaded:</strong> {recentSales.length}</p>
         </div>
       </div>
-      <div className="form-grid" style={{ marginTop: 10 }}>
-        <div className="page-card">
-          <h4 style={{ marginBottom: 8 }}>Low Stock Priorities</h4>
-          {(lowStock.rows || []).slice(0, 6).map((x) => (
-            <p key={x.id}>
-              <strong>{x.name}</strong> · Stock {x.stock} / Reorder {x.reorderLevel} · Short {x.shortageQty}
-            </p>
-          ))}
-          {!lowStock.rows?.length ? <p className="text-muted">No critical stock alerts.</p> : null}
+
+      <details className="page-card" style={{ padding: 0 }}>
+        <summary style={{ padding: 14, cursor: "pointer", fontWeight: 600 }}>
+          Operational Details (expand)
+        </summary>
+        <div className="form-grid" style={{ margin: 0, border: "none", boxShadow: "none", background: "transparent" }}>
+          <div className="page-card">
+            <h4 style={{ marginBottom: 8 }}>Top Payment Methods</h4>
+            {topMethods.length ? (
+              topMethods.map((m) => (
+                <p key={m.method}>
+                  <strong>{m.method}:</strong> {fmt(m.amount || 0)}
+                </p>
+              ))
+            ) : (
+              <p className="text-muted">No method data yet.</p>
+            )}
+          </div>
+          <div className="page-card">
+            <h4 style={{ marginBottom: 8 }}>Top Products (Recent)</h4>
+            {topSellingProducts.length ? (
+              topSellingProducts.map((x) => (
+                <p key={x.productId}>
+                  <strong>{x.name}</strong> · Qty {Number(x.qty || 0)} · {fmt(x.amount || 0)}
+                </p>
+              ))
+            ) : (
+              <p className="text-muted">No recent product activity.</p>
+            )}
+          </div>
+          <div className="page-card">
+            <h4 style={{ marginBottom: 8 }}>Low Stock Priorities</h4>
+            {(lowStock.rows || []).slice(0, 8).map((x) => (
+              <p key={String(x.id)}>
+                <strong>{x.name}</strong>
+                {x.kind === "VARIANT" ? <span style={{ marginLeft: 6, fontSize: 11, color: "#64748b" }}>[variant]</span> : null}
+                {x.kind === "WEIGHT" ? <span style={{ marginLeft: 6, fontSize: 11, color: "#64748b" }}>[kg]</span> : null}
+                {" "}
+                · Stock {x.stockDisplay != null ? x.stockDisplay : x.stock} / Reorder {x.reorderLevel} · Short{" "}
+                {Number(x.shortageQty || 0).toFixed(x.kind === "WEIGHT" ? 3 : 0)}
+              </p>
+            ))}
+            {!lowStock.rows?.length ? <p className="text-muted">No critical stock alerts.</p> : null}
+          </div>
+          <div className="page-card">
+            <h4 style={{ marginBottom: 8 }}>Recent Sales</h4>
+            {recentSales.slice(0, 6).map((sale) => (
+              <p key={sale.id}>
+                <strong>{sale.invoiceNo || `Sale-${sale.id}`}</strong> · {fmt(sale.total)} · Due {fmt(sale.dueAmount)}
+              </p>
+            ))}
+            {!recentSales.length ? <p className="text-muted">No recent sales yet.</p> : null}
+          </div>
         </div>
-        <div className="page-card">
-          <h4 style={{ marginBottom: 8 }}>Recent Sales</h4>
-          {recentSales.slice(0, 6).map((sale) => (
-            <p key={sale.id}>
-              <strong>{sale.invoiceNo || `Sale-${sale.id}`}</strong> · {fmt(sale.total)} · Due {fmt(sale.dueAmount)}
-            </p>
-          ))}
-          {!recentSales.length ? <p className="text-muted">No recent sales yet.</p> : null}
-        </div>
-      </div>
+      </details>
+
       {loading ? <p className="text-muted" style={{ marginTop: 10 }}>Refreshing dashboard...</p> : null}
     </div>
   );

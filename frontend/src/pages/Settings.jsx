@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import { notifyActionRequired, notifySuccess } from "../utils/notify";
 
 function Settings() {
   const [branchId, setBranchId] = useState(localStorage.getItem("bd_pos_branch_id") || "1");
@@ -21,8 +22,12 @@ function Settings() {
     address: "",
     phone: "",
     isActive: true,
+    sellerBin: "",
+    tradeLicenseNo: "",
+    vatRegistrationLabel: "",
   });
   const [editingBranchId, setEditingBranchId] = useState(null);
+  const [settingsTab, setSettingsTab] = useState("general");
 
   const loadBranches = async () => {
     const res = await api.get("/branches");
@@ -35,28 +40,28 @@ function Settings() {
 
   const save = () => {
     localStorage.setItem("bd_pos_branch_id", branchId);
-    alert("Branch updated");
+    notifySuccess("branch updated.");
   };
 
   const saveManagerPin = (e) => {
     e.preventDefault();
     const expectedCurrentPin = String(localStorage.getItem("bd_pos_manager_pin") || "1234");
     if (String(managerPinForm.currentPin).trim() !== expectedCurrentPin) {
-      alert("Current manager PIN is incorrect.");
+      notifyActionRequired("current manager PIN is incorrect.");
       return;
     }
     const nextPin = String(managerPinForm.newPin || "").trim();
     if (nextPin.length < 4) {
-      alert("New manager PIN must be at least 4 digits.");
+      notifyActionRequired("new manager PIN must be at least 4 digits.");
       return;
     }
     if (nextPin !== String(managerPinForm.confirmPin || "").trim()) {
-      alert("Confirm PIN does not match.");
+      notifyActionRequired("confirm PIN does not match.");
       return;
     }
     localStorage.setItem("bd_pos_manager_pin", nextPin);
     setManagerPinForm({ currentPin: "", newPin: "", confirmPin: "" });
-    alert("Manager PIN updated.");
+    notifySuccess("manager PIN updated.");
   };
 
   const pinStrengthLabel = (() => {
@@ -76,13 +81,16 @@ function Settings() {
       address: branchForm.address || null,
       phone: branchForm.phone || null,
       isActive: branchForm.isActive,
+      sellerBin: branchForm.sellerBin?.trim() || null,
+      tradeLicenseNo: branchForm.tradeLicenseNo?.trim() || null,
+      vatRegistrationLabel: branchForm.vatRegistrationLabel?.trim() || null,
     };
     if (editingBranchId) {
       await api.put(`/branches/${editingBranchId}`, payload);
     } else {
       await api.post("/branches", payload);
     }
-    setBranchForm({ code: "", name: "", address: "", phone: "", isActive: true });
+    setBranchForm({ code: "", name: "", address: "", phone: "", isActive: true, sellerBin: "", tradeLicenseNo: "", vatRegistrationLabel: "" });
     setEditingBranchId(null);
     loadBranches();
   };
@@ -97,6 +105,9 @@ function Settings() {
       address: b.address || "",
       phone: b.phone || "",
       isActive: Boolean(b.isActive),
+      sellerBin: b.sellerBin || "",
+      tradeLicenseNo: b.tradeLicenseNo || "",
+      vatRegistrationLabel: b.vatRegistrationLabel || "",
     });
   };
 
@@ -109,14 +120,52 @@ function Settings() {
     }
     if (editingBranchId === row.id) {
       setEditingBranchId(null);
-      setBranchForm({ code: "", name: "", address: "", phone: "", isActive: true });
+      setBranchForm({ code: "", name: "", address: "", phone: "", isActive: true, sellerBin: "", tradeLicenseNo: "", vatRegistrationLabel: "" });
     }
     loadBranches();
   };
 
   return (
-    <div style={{ padding: "20px" }}>
-      <h2>System Settings</h2>
+    <div>
+      <div className="page-header">
+        <div>
+          <div className="page-title">System Settings</div>
+          <div className="page-subtitle">Step-by-step settings workflow</div>
+        </div>
+      </div>
+      <div className="pos-tabs">
+        <div className="pos-tablist" role="tablist" aria-label="Settings tabs">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={settingsTab === "general"}
+            className={`pos-tab ${settingsTab === "general" ? "pos-tab-active" : ""}`}
+            onClick={() => setSettingsTab("general")}
+          >
+            1. General
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={settingsTab === "security"}
+            className={`pos-tab ${settingsTab === "security" ? "pos-tab-active" : ""}`}
+            onClick={() => setSettingsTab("security")}
+          >
+            2. Security
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={settingsTab === "branches"}
+            className={`pos-tab ${settingsTab === "branches" ? "pos-tab-active" : ""}`}
+            onClick={() => setSettingsTab("branches")}
+          >
+            3. Branches
+            <span className="pos-tab-badge">{branches.length}</span>
+          </button>
+        </div>
+      </div>
+      {settingsTab === "general" ? (
       <div className="form-grid">
         <label>
           Active Branch ID
@@ -124,6 +173,9 @@ function Settings() {
         </label>
         <button onClick={save}>Save Active Branch</button>
       </div>
+      ) : null}
+      {settingsTab === "security" ? (
+      <>
       <h3 style={{ marginTop: 20 }}>Manager PIN Settings</h3>
       <form onSubmit={saveManagerPin} className="form-grid">
         <div style={{ display: "flex", gap: 8 }}>
@@ -177,7 +229,10 @@ function Settings() {
         <p className="pos-inline-note">{pinStrengthLabel}</p>
         <button type="submit">Update Manager PIN</button>
       </form>
-
+      </>
+      ) : null}
+      {settingsTab === "branches" ? (
+      <>
       <h3 style={{ marginTop: 20 }}>Branch Master (Add/Edit/Delete)</h3>
       <form onSubmit={submitBranch} className="form-grid">
         <input
@@ -202,6 +257,21 @@ function Settings() {
           value={branchForm.phone}
           onChange={(e) => setBranchForm({ ...branchForm, phone: e.target.value })}
         />
+        <input
+          placeholder="Seller BIN (VAT)"
+          value={branchForm.sellerBin}
+          onChange={(e) => setBranchForm({ ...branchForm, sellerBin: e.target.value })}
+        />
+        <input
+          placeholder="Trade License Number"
+          value={branchForm.tradeLicenseNo}
+          onChange={(e) => setBranchForm({ ...branchForm, tradeLicenseNo: e.target.value })}
+        />
+        <input
+          placeholder="VAT Registration Label / Note"
+          value={branchForm.vatRegistrationLabel}
+          onChange={(e) => setBranchForm({ ...branchForm, vatRegistrationLabel: e.target.value })}
+        />
         <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input
             type="checkbox"
@@ -218,7 +288,7 @@ function Settings() {
             className="btn-secondary"
             onClick={() => {
               setEditingBranchId(null);
-              setBranchForm({ code: "", name: "", address: "", phone: "", isActive: true });
+              setBranchForm({ code: "", name: "", address: "", phone: "", isActive: true, sellerBin: "", tradeLicenseNo: "", vatRegistrationLabel: "" });
             }}
           >
             Cancel
@@ -261,6 +331,8 @@ function Settings() {
           },
         ]}
       />
+      </>
+      ) : null}
     </div>
   );
 }

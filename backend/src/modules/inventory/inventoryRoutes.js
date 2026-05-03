@@ -5,6 +5,7 @@ const {
   transferStock,
   getStockTransfers,
   getLowStockAlerts,
+  getInventoryIntelligence,
   getTransferBranchProducts,
   getStockAdjustments,
   updateStockAdjustment,
@@ -25,6 +26,15 @@ const {
   exportStockCountSessionsCSV,
   exportStockCountSessionsPDF,
   exportStockCountSessionsXLSX,
+  getInventoryBatches,
+  createInventoryBatch,
+  updateInventoryBatchQty,
+  getInventoryBatchAlerts,
+  getTransferSuggestions,
+  getReorderSuggestions,
+  createExpiryMarkdownCampaign,
+  approveStockTransfer,
+  rejectStockTransfer,
 } = require("./inventoryController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -52,8 +62,18 @@ router.put("/stock-count/sessions/:id/items", requireAuth, requirePermission("in
 router.post("/stock-count/sessions/:id/recount", requireAuth, requirePermission("inventory.adjust"), recountStockCountSession);
 router.post("/stock-count/sessions/:id/finalize", requireAuth, requirePermission("inventory.adjust"), finalizeStockCountSession);
 router.post("/transfers", requireAuth, requirePermission("inventory.transfer"), transferStock);
+router.post("/transfers/:id/approve", requireAuth, requirePermission("inventory.transfer"), approveStockTransfer);
+router.post("/transfers/:id/reject", requireAuth, requirePermission("inventory.transfer"), rejectStockTransfer);
 router.get("/transfers", requireAuth, requirePermission("inventory.view"), getStockTransfers);
 router.get("/transfers/branch-products/:branchId", requireAuth, requirePermission("inventory.transfer"), getTransferBranchProducts);
 router.get("/alerts/low-stock", requireAuth, requirePermission("inventory.view"), getLowStockAlerts);
+router.get("/intelligence", requireAuth, requirePermission("inventory.view"), getInventoryIntelligence);
+router.get("/batches", requireAuth, requirePermission("inventory.view"), getInventoryBatches);
+router.post("/batches", requireAuth, requirePermission("inventory.adjust"), createInventoryBatch);
+router.post("/batches/:id/qty", requireAuth, requirePermission("inventory.adjust"), updateInventoryBatchQty);
+router.get("/batches/alerts", requireAuth, requirePermission("inventory.view"), getInventoryBatchAlerts);
+router.post("/batches/markdown-campaign", requireAuth, requirePermission("product.create"), createExpiryMarkdownCampaign);
+router.get("/transfers/suggestions", requireAuth, requirePermission("inventory.view"), getTransferSuggestions);
+router.get("/reorder-suggestions", requireAuth, requirePermission("inventory.view"), getReorderSuggestions);
 
 module.exports = router;

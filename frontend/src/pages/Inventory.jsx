@@ -1,10 +1,25 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Select from "react-select";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import { getStoredPermissions, hasPermission } from "../utils/permissions";
+import { createSearchSelectStyles } from "../utils/selectStyles";
+import {
+  notifyActionRequired,
+  notifyError,
+  notifyPermissionRequired,
+  notifySuccess,
+} from "../utils/notify";
 
 const PURCHASE_DRAFT_KEY = "bd_pos_purchase_draft_v1";
+const SEARCH_SELECT_STYLES = createSearchSelectStyles(32);
 
 function Inventory() {
+  const permissions = getStoredPermissions();
+  const canAdjustInventory = hasPermission("inventory.adjust", permissions);
+  const canTransferInventory = hasPermission("inventory.transfer", permissions);
+  const canExportReports = hasPermission("accounting.report", permissions);
+
   const [ledger, setLedger] = useState([]);
   const [adjustments, setAdjustments] = useState([]);
   const [transfers, setTransfers] = useState([]);
@@ -15,15 +30,56 @@ function Inventory() {
   const [branches, setBranches] = useState([]);
   const [targetBranchProducts, setTargetBranchProducts] = useState([]);
   const [showOnlyCriticalLowStock, setShowOnlyCriticalLowStock] = useState(true);
+  const [batchExpiryWindowDays, setBatchExpiryWindowDays] = useState(30);
+  const [batchRows, setBatchRows] = useState([]);
+  const [batchAlertRows, setBatchAlertRows] = useState([]);
+  const [batchAlertSummary, setBatchAlertSummary] = useState({ tracked: 0, nearExpiryCount: 0, expiredCount: 0 });
+  const [transferSuggestionRows, setTransferSuggestionRows] = useState([]);
+  const [transferSuggestionSummary, setTransferSuggestionSummary] = useState({ suggestions: 0, totalSuggestedQty: 0 });
+  const [intelligenceRangeDays, setIntelligenceRangeDays] = useState(30);
+  const [deadStockDays, setDeadStockDays] = useState(60);
+  const [leadDays, setLeadDays] = useState(7);
+  const [forecastDays, setForecastDays] = useState(14);
+  const [intelligenceRows, setIntelligenceRows] = useState([]);
+  const [intelligenceSummary, setIntelligenceSummary] = useState({
+    fastMovingCount: 0,
+    slowMovingCount: 0,
+    deadStockCount: 0,
+    suggestedReorderCount: 0,
+    seasonalityAdjustedCount: 0,
+  });
   const [adjustment, setAdjustment] = useState({ productId: "", warehouseId: "", qtyChange: "", reason: "" });
   const [editingAdjustmentId, setEditingAdjustmentId] = useState(null);
   const [transferForm, setTransferForm] = useState({
     toBranchId: "",
     items: [{ fromProductId: "", toProductId: "", qty: "" }],
   });
+  const [batchForm, setBatchForm] = useState({
+    productId: "",
+    batchCode: "",
+    expiryDate: "",
+    receivedAt: "",
+    qtyOnHand: "",
+    unitCost: "",
+    note: "",
+  });
+  const [batchAdjustForm, setBatchAdjustForm] = useState({ batchId: "", qtyChange: "", reason: "" });
+  const [inventoryTab, setInventoryTab] = useState("overview");
 
   const load = useCallback(async () => {
-    const [ledgerRes, adjustmentRes, productRes, warehouseRes, transferRes, lowStockRes, branchRes] = await Promise.all([
+    const [
+      ledgerRes,
+      adjustmentRes,
+      productRes,
+      warehouseRes,
+      transferRes,
+      lowStockRes,
+      branchRes,
+      intelRes,
+      batchRes,
+      batchAlertRes,
+      transferSuggestRes,
+    ] = await Promise.all([
       api.get("/inventory/ledger"),
       api.get("/inventory/adjustments"),
       api.get("/products"),
@@ -31,6 +87,14 @@ function Inventory() {
       api.get("/inventory/transfers"),
       api.get(`/inventory/alerts/low-stock?onlyCritical=${showOnlyCriticalLowStock}`),
       api.get("/branches"),
+      api.get(
+        `/inventory/intelligence?days=${encodeURIComponent(intelligenceRangeDays)}&deadDays=${encodeURIComponent(
+          deadStockDays
+        )}&leadDays=${encodeURIComponent(leadDays)}&forecastDays=${encodeURIComponent(forecastDays)}`
+      ),
+      api.get("/inventory/batches"),
+      api.get(`/inventory/batches/alerts?days=${encodeURIComponent(batchExpiryWindowDays)}`),
+      api.get("/inventory/transfers/suggestions"),
     ]);
     setLedger(ledgerRes.data);
     setAdjustments(adjustmentRes.data);
@@ -42,7 +106,22 @@ function Inventory() {
       lowStockRes.data?.summary || { totalTracked: 0, outOfStock: 0, lowStock: 0 }
     );
     setBranches(branchRes.data || []);
-  }, [showOnlyCriticalLowStock]);
+    setIntelligenceRows(intelRes.data?.rows || []);
+    setIntelligenceSummary(
+      intelRes.data?.summary || {
+        fastMovingCount: 0,
+        slowMovingCount: 0,
+        deadStockCount: 0,
+        suggestedReorderCount: 0,
+        seasonalityAdjustedCount: 0,
+      }
+    );
+    setBatchRows(batchRes.data || []);
+    setBatchAlertRows(batchAlertRes.data?.rows || []);
+    setBatchAlertSummary(batchAlertRes.data?.summary || { tracked: 0, nearExpiryCount: 0, expiredCount: 0 });
+    setTransferSuggestionRows(transferSuggestRes.data?.rows || []);
+    setTransferSuggestionSummary(transferSuggestRes.data?.summary || { suggestions: 0, totalSuggestedQty: 0 });
+  }, [showOnlyCriticalLowStock, intelligenceRangeDays, deadStockDays, leadDays, forecastDays, batchExpiryWindowDays]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -68,6 +147,10 @@ function Inventory() {
 
   const submitAdjustment = async (e) => {
     e.preventDefault();
+    if (!canAdjustInventory) {
+      notifyPermissionRequired("inventory.adjust.");
+      return;
+    }
     const payload = {
       productId: Number(adjustment.productId),
       warehouseId: adjustment.warehouseId ? Number(adjustment.warehouseId) : null,
@@ -95,6 +178,10 @@ function Inventory() {
   };
 
   const deleteAdjustment = async (row) => {
+    if (!canAdjustInventory) {
+      notifyPermissionRequired("inventory.adjust.");
+      return;
+    }
     if (!window.confirm("Delete this ledger adjustment?")) return;
     await api.delete(`/inventory/adjustments/${row.id}`);
     if (editingAdjustmentId === row.id) {
@@ -132,12 +219,58 @@ function Inventory() {
     () => new Map(products.map((p) => [p.id, p])),
     [products]
   );
+  const productOptions = useMemo(
+    () =>
+      products.map((p) => ({
+        value: String(p.id),
+        label: `${p.name}${p.sku ? ` (${p.sku})` : ""}`,
+      })),
+    [products]
+  );
+  const warehouseOptions = useMemo(
+    () =>
+      warehouses.map((w) => ({
+        value: String(w.id),
+        label: w.name,
+      })),
+    [warehouses]
+  );
+  const batchOptions = useMemo(
+    () =>
+      batchRows.map((b) => ({
+        value: String(b.id),
+        label: `${b.productName} - ${b.batchCode} (Qty ${b.qtyOnHand})`,
+      })),
+    [batchRows]
+  );
+  const destinationBranchOptions = useMemo(
+    () =>
+      branches
+        .filter((b) => Number(b.id) !== Number(localStorage.getItem("bd_pos_branch_id") || "1"))
+        .map((b) => ({
+          value: String(b.id),
+          label: `#${b.id} ${b.name}`,
+        })),
+    [branches]
+  );
+  const targetBranchProductOptions = useMemo(
+    () =>
+      targetBranchProducts.map((p) => ({
+        value: String(p.id),
+        label: `${p.name}${p.sku ? ` (${p.sku})` : ""}`,
+      })),
+    [targetBranchProducts]
+  );
 
   const submitTransfer = async (e) => {
     e.preventDefault();
+    if (!canTransferInventory) {
+      notifyPermissionRequired("inventory.transfer.");
+      return;
+    }
     const toBranchId = Number(transferForm.toBranchId);
     if (!toBranchId) {
-      alert("Select destination branch");
+      notifyActionRequired("select a destination branch.");
       return;
     }
     const items = transferForm.items
@@ -148,7 +281,7 @@ function Inventory() {
       }))
       .filter((x) => x.fromProductId && x.toProductId && Number.isInteger(x.qty) && x.qty > 0);
     if (!items.length) {
-      alert("Add at least one valid transfer line");
+      notifyActionRequired("add at least one valid transfer line.");
       return;
     }
     await api.post("/inventory/transfers", { toBranchId, items });
@@ -158,6 +291,62 @@ function Inventory() {
     });
     setTargetBranchProducts([]);
     load();
+  };
+
+  const submitBatch = async (e) => {
+    e.preventDefault();
+    if (!canAdjustInventory) {
+      notifyPermissionRequired("inventory.adjust.");
+      return;
+    }
+    await api.post("/inventory/batches", {
+      productId: Number(batchForm.productId),
+      batchCode: batchForm.batchCode,
+      expiryDate: batchForm.expiryDate || null,
+      receivedAt: batchForm.receivedAt || null,
+      qtyOnHand: Number(batchForm.qtyOnHand || 0),
+      unitCost: Number(batchForm.unitCost || 0),
+      note: batchForm.note,
+    });
+    setBatchForm({
+      productId: "",
+      batchCode: "",
+      expiryDate: "",
+      receivedAt: "",
+      qtyOnHand: "",
+      unitCost: "",
+      note: "",
+    });
+    load();
+  };
+
+  const submitBatchAdjustment = async (e) => {
+    e.preventDefault();
+    if (!canAdjustInventory) {
+      notifyPermissionRequired("inventory.adjust.");
+      return;
+    }
+    await api.post(`/inventory/batches/${Number(batchAdjustForm.batchId)}/qty`, {
+      qtyChange: Number(batchAdjustForm.qtyChange || 0),
+      reason: batchAdjustForm.reason,
+    });
+    setBatchAdjustForm({ batchId: "", qtyChange: "", reason: "" });
+    load();
+  };
+
+  const createExpiryMarkdownCampaign = async () => {
+    if (!canAdjustInventory) {
+      notifyPermissionRequired("inventory.adjust.");
+      return;
+    }
+    const ok = window.confirm("Create auto markdown promotions from near-expiry batches?");
+    if (!ok) return;
+    const res = await api.post("/inventory/batches/markdown-campaign", {
+      days: Number(batchExpiryWindowDays || 30),
+      validDays: 7,
+      maxProducts: 100,
+    });
+    notifySuccess(res.data?.message || "markdown campaign created.");
   };
 
   const appendLowStockToPurchaseDraft = (items) => {
@@ -217,13 +406,167 @@ function Inventory() {
     [transfers]
   );
 
+  const approveTransfer = async (row) => {
+    if (!canTransferInventory) {
+      notifyPermissionRequired("inventory.transfer.");
+      return;
+    }
+    const pin = window.prompt("Enter manager PIN to approve transfer:");
+    if (!pin) return;
+    await api.post(`/inventory/transfers/${Number(row.id)}/approve`, { managerApprovalPin: pin });
+    notifySuccess("transfer approved and posted to stock.");
+    await load();
+  };
+
+  const rejectTransfer = async (row) => {
+    if (!canTransferInventory) {
+      notifyPermissionRequired("inventory.transfer.");
+      return;
+    }
+    const reason = (window.prompt("Rejection reason (optional):") || "").trim();
+    await api.post(`/inventory/transfers/${Number(row.id)}/reject`, { reason });
+    notifySuccess("transfer rejected.");
+    await load();
+  };
+
+  const downloadReorderCsv = async () => {
+    if (!canExportReports) {
+      notifyPermissionRequired("accounting.report to export reorder CSV.");
+      return;
+    }
+    try {
+      const res = await api.get("/inventory/reorder-suggestions?format=csv", { responseType: "blob" });
+      const blobUrl = URL.createObjectURL(new Blob([res.data]));
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = "reorder-suggestions.csv";
+      a.click();
+      URL.revokeObjectURL(blobUrl);
+    } catch {
+      notifyError("could not export reorder CSV.");
+    }
+  };
+
   return (
     <div>
-      <h2>Inventory Ledger</h2>
+      <div className="page-header">
+        <div>
+          <div className="page-title">Inventory</div>
+          <div className="page-subtitle">Step-by-step inventory workflow</div>
+        </div>
+      </div>
       <div className="quick-stats">
         <div className="stat-chip">Tracked reorder products: {lowStockSummary.totalTracked}</div>
-        <div className="stat-chip">Out of stock: {lowStockSummary.outOfStock}</div>
-        <div className="stat-chip">Low stock: {lowStockSummary.lowStock}</div>
+        <div className="stat-chip">Out of Stock: {lowStockSummary.outOfStock}</div>
+        <div className="stat-chip">Low Stock: {lowStockSummary.lowStock}</div>
+        <div className="stat-chip">Fast Moving: {intelligenceSummary.fastMovingCount}</div>
+        <div className="stat-chip">Slow Moving: {intelligenceSummary.slowMovingCount}</div>
+        <div className="stat-chip">Dead Stock: {intelligenceSummary.deadStockCount}</div>
+        <div className="stat-chip">Reorder Suggestions: {intelligenceSummary.suggestedReorderCount}</div>
+        <div className="stat-chip">Seasonality Adjusted: {intelligenceSummary.seasonalityAdjustedCount}</div>
+        <div className="stat-chip">Batch Tracked: {batchAlertSummary.tracked}</div>
+        <div className="stat-chip">Near Expiry: {batchAlertSummary.nearExpiryCount}</div>
+        <div className="stat-chip">Expired: {batchAlertSummary.expiredCount}</div>
+        <div className="stat-chip">Transfer Suggestions: {transferSuggestionSummary.suggestions}</div>
+      </div>
+      <div className="pos-tabs">
+        <div className="pos-tablist" role="tablist" aria-label="Inventory workflow">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inventoryTab === "overview"}
+            className={`pos-tab ${inventoryTab === "overview" ? "pos-tab-active" : ""}`}
+            onClick={() => setInventoryTab("overview")}
+          >
+            1. Overview
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inventoryTab === "batches"}
+            className={`pos-tab ${inventoryTab === "batches" ? "pos-tab-active" : ""}`}
+            onClick={() => setInventoryTab("batches")}
+          >
+            2. Batches & Expiry
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inventoryTab === "ops"}
+            className={`pos-tab ${inventoryTab === "ops" ? "pos-tab-active" : ""}`}
+            onClick={() => setInventoryTab("ops")}
+          >
+            3. Stock Ops
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inventoryTab === "transfers"}
+            className={`pos-tab ${inventoryTab === "transfers" ? "pos-tab-active" : ""}`}
+            onClick={() => setInventoryTab("transfers")}
+          >
+            4. Transfers
+          </button>
+        </div>
+      </div>
+      {!canAdjustInventory && (inventoryTab === "batches" || inventoryTab === "ops") ? (
+        <div className="page-card" style={{ marginBottom: 10 }}>
+          <strong>Permission required:</strong> <code>inventory.adjust</code> to add batches, adjust batch quantities, and edit/delete stock adjustments.
+        </div>
+      ) : null}
+      {!canTransferInventory && inventoryTab === "transfers" ? (
+        <div className="page-card" style={{ marginBottom: 10 }}>
+          <strong>Permission required:</strong> <code>inventory.transfer</code> to submit, approve, or reject stock transfers.
+        </div>
+      ) : null}
+      {!canExportReports && inventoryTab === "overview" ? (
+        <div className="page-card" style={{ marginBottom: 10 }}>
+          <strong>Permission required:</strong> <code>accounting.report</code> to export reorder CSV files.
+        </div>
+      ) : null}
+      {inventoryTab === "overview" ? (
+        <div className="pos-tab-panel">
+      <div style={{ margin: "10px 0", display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <button type="button" className="btn-secondary btn-sm" onClick={downloadReorderCsv} disabled={!canExportReports}>
+          Download reorder CSV (at/below reorder level)
+        </button>
+      </div>
+      <div className="form-grid" style={{ margin: "8px 0" }}>
+        <input
+          type="number"
+          min={7}
+          value={intelligenceRangeDays}
+          onChange={(e) => setIntelligenceRangeDays(e.target.value)}
+          placeholder="Sales Lookback Days"
+        />
+        <input
+          type="number"
+          min={15}
+          value={deadStockDays}
+          onChange={(e) => setDeadStockDays(e.target.value)}
+          placeholder="Dead Stock Days"
+        />
+        <input
+          type="number"
+          min={1}
+          value={leadDays}
+          onChange={(e) => setLeadDays(e.target.value)}
+          placeholder="Lead Days"
+        />
+        <input
+          type="number"
+          min={1}
+          value={forecastDays}
+          onChange={(e) => setForecastDays(e.target.value)}
+          placeholder="Forecast Days"
+        />
+        <input
+          type="number"
+          min={1}
+          value={batchExpiryWindowDays}
+          onChange={(e) => setBatchExpiryWindowDays(e.target.value)}
+          placeholder="Near-Expiry Window Days"
+        />
       </div>
       <label style={{ display: "inline-flex", alignItems: "center", gap: 6, margin: "8px 0 4px" }}>
         <input
@@ -233,6 +576,64 @@ function Inventory() {
         />
         Show only low/out of stock
       </label>
+      <DataTable
+        title="Inventory Intelligence (Fast/Slow/Dead + Reorder)"
+        rows={intelligenceRows.map((row) => ({
+          ...row,
+          lastSoldAtLabel: row.lastSoldAt ? new Date(row.lastSoldAt).toLocaleDateString() : "-",
+        }))}
+        searchableKeys={["name", "sku", "category", "movementClass"]}
+        columns={[
+          { key: "name", label: "Product" },
+          { key: "sku", label: "SKU", render: (v) => v || "-" },
+          { key: "category", label: "Category", render: (v) => v || "-" },
+          { key: "stock", label: "Stock" },
+          { key: "soldQty", label: "Sold Qty" },
+          { key: "avgDailySold", label: "Avg/Day", render: (v) => Number(v || 0).toFixed(2) },
+          { key: "forecastNeed", label: "Forecast Need", render: (v) => Number(v || 0).toFixed(2) },
+          { key: "seasonalityMultiplier", label: "Seasonality", render: (v) => `${Number(v || 1).toFixed(2)}x` },
+          { key: "lastSoldAtLabel", label: "Last Sold" },
+          { key: "daysSinceLastSale", label: "Days Since Last Sale", render: (v) => (v == null ? "-" : v) },
+          {
+            key: "movementClass",
+            label: "Movement",
+            render: (v) =>
+              v === "DEAD" ? (
+                <span className="badge badge-danger">DEAD</span>
+              ) : v === "SLOW" ? (
+                <span className="badge badge-warning">SLOW</span>
+              ) : v === "FAST" ? (
+                <span className="badge badge-success">FAST</span>
+              ) : (
+                <span className="badge">MEDIUM</span>
+              ),
+          },
+          { key: "reorderSuggestionQty", label: "Suggested Reorder Qty" },
+          {
+            key: "actions",
+            label: "Actions",
+            render: (_, row) => (
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={() =>
+                  appendLowStockToPurchaseDraft([
+                    {
+                      productId: row.id,
+                      productName: row.name,
+                      qty: Math.max(1, Number(row.reorderSuggestionQty || 1)),
+                      cost: Number(row.price || 0),
+                    },
+                  ])
+                }
+                disabled={Number(row.reorderSuggestionQty || 0) <= 0}
+              >
+                Add Suggestion to Draft
+              </button>
+            ),
+          },
+        ]}
+      />
       <DataTable
         title="Low Stock Alerts"
         rows={lowStockRows}
@@ -266,7 +667,8 @@ function Inventory() {
                 onClick={() =>
                   appendLowStockToPurchaseDraft([
                     {
-                      productId: row.id,
+                      productId:
+                        row.kind === "VARIANT" ? Number(row.productId) : Number(row.id),
                       productName: row.name,
                       qty: Math.max(1, Number(row.shortageQty || 1)),
                       cost: Number(row.price || 0),
@@ -290,7 +692,7 @@ function Inventory() {
                 lowStockRows
                   .filter((x) => x.status === "LOW" || x.status === "OUT")
                   .map((x) => ({
-                    productId: x.id,
+                    productId: x.kind === "VARIANT" ? Number(x.productId) : Number(x.id),
                     productName: x.name,
                     qty: Math.max(1, Number(x.shortageQty || 1)),
                     cost: Number(x.price || 0),
@@ -302,34 +704,175 @@ function Inventory() {
           </button>
         </div>
       ) : null}
+        </div>
+      ) : null}
+      {inventoryTab === "batches" ? (
+        <div className="pos-tab-panel">
+      <div className="page-card" style={{ marginBottom: 12 }}>
+        <h3>Batch & Expiry Tracking (FEFO Ready)</h3>
+        <form onSubmit={submitBatch} className="form-grid" style={{ marginBottom: 8 }}>
+          <Select
+            className="form-select-sm"
+            value={productOptions.find((opt) => opt.value === String(batchForm.productId)) || null}
+            options={productOptions}
+            onChange={(opt) => setBatchForm((p) => ({ ...p, productId: opt?.value || "" }))}
+            placeholder="Select Product"
+            isClearable
+            isSearchable
+            styles={SEARCH_SELECT_STYLES}
+          />
+          <input
+            placeholder="Batch Code"
+            value={batchForm.batchCode}
+            onChange={(e) => setBatchForm((p) => ({ ...p, batchCode: e.target.value }))}
+          />
+          <input type="date" value={batchForm.expiryDate} onChange={(e) => setBatchForm((p) => ({ ...p, expiryDate: e.target.value }))} />
+          <input type="date" value={batchForm.receivedAt} onChange={(e) => setBatchForm((p) => ({ ...p, receivedAt: e.target.value }))} />
+          <input
+            type="number"
+            min={0}
+            step={1}
+            placeholder="Quantity"
+            value={batchForm.qtyOnHand}
+            onChange={(e) => setBatchForm((p) => ({ ...p, qtyOnHand: e.target.value }))}
+          />
+          <input
+            type="number"
+            min={0}
+            step="0.01"
+            placeholder="Unit Cost"
+            value={batchForm.unitCost}
+            onChange={(e) => setBatchForm((p) => ({ ...p, unitCost: e.target.value }))}
+          />
+          <input placeholder="Note (Optional)" value={batchForm.note} onChange={(e) => setBatchForm((p) => ({ ...p, note: e.target.value }))} />
+          <button type="submit" disabled={!canAdjustInventory}>Add Batch</button>
+        </form>
+        <form onSubmit={submitBatchAdjustment} className="form-grid">
+          <Select
+            className="form-select-sm"
+            value={batchOptions.find((opt) => opt.value === String(batchAdjustForm.batchId)) || null}
+            options={batchOptions}
+            onChange={(opt) => setBatchAdjustForm((p) => ({ ...p, batchId: opt?.value || "" }))}
+            placeholder="Select Batch"
+            isClearable
+            isSearchable
+            styles={SEARCH_SELECT_STYLES}
+          />
+          <input
+            type="number"
+            step={1}
+            placeholder="Quantity Change (+/-)"
+            value={batchAdjustForm.qtyChange}
+            onChange={(e) => setBatchAdjustForm((p) => ({ ...p, qtyChange: e.target.value }))}
+          />
+          <input
+            placeholder="Reason (Required)"
+            value={batchAdjustForm.reason}
+            onChange={(e) => setBatchAdjustForm((p) => ({ ...p, reason: e.target.value }))}
+          />
+          <button type="submit" disabled={!canAdjustInventory}>Update Batch Quantity</button>
+        </form>
+      </div>
+      <DataTable
+        title="Near Expiry / Expired Batch Alerts"
+        rows={batchAlertRows.map((row) => ({
+          ...row,
+          expiryDateLabel: row.expiryDate ? new Date(row.expiryDate).toLocaleDateString() : "-",
+          markdownLabel: `${Number(row.suggestedMarkdownPct || 0).toFixed(0)}%`,
+        }))}
+        searchableKeys={["productName", "batchCode", "note"]}
+        columns={[
+          { key: "productName", label: "Product" },
+          { key: "batchCode", label: "Batch" },
+          { key: "qtyOnHand", label: "Qty" },
+          { key: "expiryDateLabel", label: "Expiry Date" },
+          { key: "daysToExpiry", label: "Days Left" },
+          { key: "markdownLabel", label: "Suggested Markdown" },
+          {
+            key: "isExpired",
+            label: "Status",
+            render: (v, row) =>
+              v ? (
+                <span className="badge badge-danger">EXPIRED</span>
+              ) : row.isNear ? (
+                <span className="badge badge-warning">NEAR EXPIRY</span>
+              ) : (
+                <span className="badge badge-success">OK</span>
+              ),
+          },
+        ]}
+      />
+      <div style={{ marginBottom: 10 }}>
+        <button type="button" className="btn-secondary btn-sm" onClick={createExpiryMarkdownCampaign} disabled={!canAdjustInventory}>
+          Create Auto Markdown Campaign
+        </button>
+      </div>
+      <DataTable
+        title="Batch Register"
+        rows={batchRows.map((row) => ({
+          ...row,
+          expiryDateLabel: row.expiryDate ? new Date(row.expiryDate).toLocaleDateString() : "-",
+          receivedAtLabel: row.receivedAt ? new Date(row.receivedAt).toLocaleDateString() : "-",
+        }))}
+        searchableKeys={["productName", "batchCode", "status", "note"]}
+        columns={[
+          { key: "id", label: "ID" },
+          { key: "productName", label: "Product" },
+          { key: "batchCode", label: "Batch" },
+          { key: "qtyOnHand", label: "Qty On Hand" },
+          { key: "unitCost", label: "Unit Cost", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "receivedAtLabel", label: "Received" },
+          { key: "expiryDateLabel", label: "Expiry" },
+          { key: "daysToExpiry", label: "Days Left", render: (v) => (v == null ? "-" : v) },
+          {
+            key: "status",
+            label: "Status",
+            render: (v) => {
+              const status = String(v || "").toLowerCase();
+              if (status === "completed") return <span className="badge badge-success">COMPLETED</span>;
+              if (status === "rejected") return <span className="badge badge-danger">REJECTED</span>;
+              if (status === "pending") return <span className="badge badge-warning">PENDING</span>;
+              return <span className="badge">{String(v || "-").toUpperCase()}</span>;
+            },
+          },
+        ]}
+      />
+        </div>
+      ) : null}
+      {inventoryTab === "ops" ? (
+        <div className="pos-tab-panel">
       <form onSubmit={submitAdjustment} className="form-grid">
-        <select value={adjustment.productId} onChange={(e) => setAdjustment({ ...adjustment, productId: e.target.value })}>
-          <option value="">Select Product</option>
-          {products.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-        <select value={adjustment.warehouseId} onChange={(e) => setAdjustment({ ...adjustment, warehouseId: e.target.value })}>
-          <option value="">Select Warehouse (Optional)</option>
-          {warehouses.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.name}
-            </option>
-          ))}
-        </select>
+        <Select
+          className="form-select-sm"
+          value={productOptions.find((opt) => opt.value === String(adjustment.productId)) || null}
+          options={productOptions}
+          onChange={(opt) => setAdjustment({ ...adjustment, productId: opt?.value || "" })}
+          placeholder="Select Product"
+          isClearable
+          isSearchable
+          styles={SEARCH_SELECT_STYLES}
+        />
+        <Select
+          className="form-select-sm"
+          value={warehouseOptions.find((opt) => opt.value === String(adjustment.warehouseId)) || null}
+          options={warehouseOptions}
+          onChange={(opt) => setAdjustment({ ...adjustment, warehouseId: opt?.value || "" })}
+          placeholder="Select Warehouse (Optional)"
+          isClearable
+          isSearchable
+          styles={SEARCH_SELECT_STYLES}
+        />
         <input
-          placeholder="Qty Change (+/-)"
+          placeholder="Quantity Change (+/-)"
           value={adjustment.qtyChange}
           onChange={(e) => setAdjustment({ ...adjustment, qtyChange: e.target.value })}
         />
         <input
-          placeholder="Reason"
+          placeholder="Reason (Required)"
           value={adjustment.reason}
           onChange={(e) => setAdjustment({ ...adjustment, reason: e.target.value })}
         />
-        <button type="submit">{editingAdjustmentId ? "Update Adjustment" : "Add Adjustment"}</button>
+        <button type="submit" disabled={!canAdjustInventory}>{editingAdjustmentId ? "Update Adjustment" : "Add Adjustment"}</button>
         {editingAdjustmentId ? (
           <button
             type="button"
@@ -362,8 +905,8 @@ function Inventory() {
             label: "Actions",
             render: (_, row) => (
               <div style={{ display: "flex", gap: 6 }}>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => editAdjustment(row)}>Edit</button>
-                <button type="button" className="btn-danger btn-sm" onClick={() => deleteAdjustment(row)}>Delete</button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => editAdjustment(row)} disabled={!canAdjustInventory}>Edit</button>
+                <button type="button" className="btn-danger btn-sm" onClick={() => deleteAdjustment(row)} disabled={!canAdjustInventory}>Delete</button>
               </div>
             ),
           },
@@ -395,35 +938,44 @@ function Inventory() {
           { key: "outQty", label: "Out" },
         ]}
       />
+        </div>
+      ) : null}
+      {inventoryTab === "transfers" ? (
+        <div className="pos-tab-panel">
       <div className="page-card" style={{ marginTop: 14 }}>
         <h3>Branch Stock Transfer</h3>
         <form onSubmit={submitTransfer}>
           <div className="form-grid">
-            <select
-              value={transferForm.toBranchId}
-              onChange={(e) =>
+            <Select
+              className="form-select-sm"
+              value={destinationBranchOptions.find((opt) => opt.value === String(transferForm.toBranchId)) || null}
+              options={destinationBranchOptions}
+              onChange={(opt) =>
                 setTransferForm({
-                  toBranchId: e.target.value,
+                  toBranchId: opt?.value || "",
                   items: [{ fromProductId: "", toProductId: "", qty: "" }],
                 })
               }
-            >
-              <option value="">Destination Branch</option>
-              {branches
-                .filter((b) => Number(b.id) !== Number(localStorage.getItem("bd_pos_branch_id") || "1"))
-                .map((b) => (
-                  <option key={b.id} value={b.id}>
-                    #{b.id} {b.name}
-                  </option>
-                ))}
-            </select>
+              placeholder="Destination Branch"
+              isClearable
+              isSearchable
+              styles={SEARCH_SELECT_STYLES}
+            />
           </div>
           {transferForm.items.map((line, idx) => (
             <div key={`transfer-line-${idx}`} className="form-grid" style={{ marginTop: 8 }}>
-              <select
-                value={line.fromProductId}
-                onChange={(e) => {
-                  const fromProductId = e.target.value;
+              <Select
+                className="form-select-sm"
+                value={productOptions.find((opt) => opt.value === String(line.fromProductId)) || null}
+                options={productOptions.map((opt) => {
+                  const p = fromProductMap.get(Number(opt.value));
+                  return {
+                    value: opt.value,
+                    label: `${opt.label} - Stock ${p?.stock ?? 0}`,
+                  };
+                })}
+                onChange={(opt) => {
+                  const fromProductId = opt?.value || "";
                   const fromProduct = fromProductMap.get(Number(fromProductId));
                   const autoMatch = targetBranchProducts.find(
                     (p) =>
@@ -436,35 +988,31 @@ function Inventory() {
                     toProductId: autoMatch ? String(autoMatch.id) : line.toProductId,
                   });
                 }}
-              >
-                <option value="">From Product (Current Branch)</option>
-                {products.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} {p.sku ? `(${p.sku})` : ""} - Stock {p.stock}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={line.toProductId}
-                onChange={(e) => upsertTransferItem(idx, { toProductId: e.target.value })}
-              >
-                <option value="">To Product (Destination Branch)</option>
-                {targetBranchProducts.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} {p.sku ? `(${p.sku})` : ""}
-                  </option>
-                ))}
-              </select>
+                placeholder="From Product (Current Branch)"
+                isClearable
+                isSearchable
+                styles={SEARCH_SELECT_STYLES}
+              />
+              <Select
+                className="form-select-sm"
+                value={targetBranchProductOptions.find((opt) => opt.value === String(line.toProductId)) || null}
+                options={targetBranchProductOptions}
+                onChange={(opt) => upsertTransferItem(idx, { toProductId: opt?.value || "" })}
+                placeholder="To Product (Destination Branch)"
+                isClearable
+                isSearchable
+                styles={SEARCH_SELECT_STYLES}
+              />
               <input
                 type="number"
                 min={1}
                 step={1}
-                placeholder="Qty"
+                placeholder="Quantity"
                 value={line.qty}
                 onChange={(e) => upsertTransferItem(idx, { qty: e.target.value })}
               />
               <div style={{ display: "flex", gap: 6 }}>
-                <button type="button" className="btn-secondary btn-sm" onClick={addTransferLine}>
+                <button type="button" className="btn-secondary btn-sm" onClick={addTransferLine} disabled={!canTransferInventory}>
                   + Line
                 </button>
                 {transferForm.items.length > 1 ? (
@@ -472,6 +1020,7 @@ function Inventory() {
                     type="button"
                     className="btn-danger btn-sm"
                     onClick={() => removeTransferLine(idx)}
+                    disabled={!canTransferInventory}
                   >
                     Remove
                   </button>
@@ -479,8 +1028,8 @@ function Inventory() {
               </div>
             </div>
           ))}
-          <button type="submit" style={{ marginTop: 8 }}>
-            Create Transfer
+          <button type="submit" style={{ marginTop: 8 }} disabled={!canTransferInventory}>
+            Submit Transfer For Approval
           </button>
         </form>
       </div>
@@ -498,6 +1047,23 @@ function Inventory() {
           { key: "itemCount", label: "Lines" },
           { key: "qtyTotal", label: "Total Qty" },
           {
+            key: "action",
+            label: "Approval",
+            render: (_, row) =>
+              String(row.status || "").toLowerCase() === "pending" ? (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => approveTransfer(row)} disabled={!canTransferInventory}>
+                    Approve
+                  </button>
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => rejectTransfer(row)} disabled={!canTransferInventory}>
+                    Reject
+                  </button>
+                </div>
+              ) : (
+                "-"
+              ),
+          },
+          {
             key: "items",
             label: "Items",
             render: (_, row) =>
@@ -507,6 +1073,47 @@ function Inventory() {
           },
         ]}
       />
+      <DataTable
+        title="Auto Transfer Suggestions (Cross-Branch Balancing)"
+        rows={transferSuggestionRows}
+        searchableKeys={["fromProductName", "fromSku", "toBranchName", "toProductName"]}
+        columns={[
+          { key: "fromProductName", label: "From Product" },
+          { key: "fromSku", label: "SKU", render: (v) => v || "-" },
+          { key: "fromStock", label: "From Stock" },
+          { key: "toBranchName", label: "To Branch" },
+          { key: "toProductName", label: "To Product" },
+          { key: "toStock", label: "To Stock" },
+          { key: "shortageQty", label: "Shortage" },
+          { key: "suggestedQty", label: "Suggested Transfer" },
+          {
+            key: "actions",
+            label: "Actions",
+            render: (_, row) => (
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={() =>
+                  setTransferForm({
+                    toBranchId: String(row.toBranchId),
+                    items: [
+                      {
+                        fromProductId: String(row.fromProductId),
+                        toProductId: String(row.toProductId),
+                        qty: String(Math.max(1, Number(row.suggestedQty || 1))),
+                      },
+                    ],
+                  })
+                }
+              >
+                Use Suggestion
+              </button>
+            ),
+          },
+        ]}
+      />
+        </div>
+      ) : null}
     </div>
   );
 }

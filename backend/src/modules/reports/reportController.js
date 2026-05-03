@@ -539,3 +539,435 @@ exports.exportAgingPDF = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+function parseNumberOrDefault(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+async function buildShrinkageControlPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query);
+  const discountAlertMin = parseNumberOrDefault(query.discountAlertMin, 200);
+  const returnAlertMin = parseNumberOrDefault(query.returnAlertMin, 200);
+  const criticalAmount = parseNumberOrDefault(query.criticalAmount, 1000);
+  const whereSales = buildSaleWhere(branchId, from, to);
+
+  const sales = await prisma.sale.findMany({
+    where: whereSales,
+    include: {
+      cashier: { select: { id: true, name: true, email: true } },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 5000,
+  });
+  const saleIds = sales.map((s) => Number(s.id));
+
+  const returns = saleIds.length
+    ? await prisma.saleReturn.findMany({
+        where: {
+          saleId: { in: saleIds },
+          ...(from || to
+            ? {
+                createdAt: {
+                  ...(from ? { gte: from } : {}),
+                  ...(to ? { lte: to } : {}),
+                },
+              }
+            : {}),
+        },
+        include: {
+          sale: {
+            select: {
+              cashier: { select: { id: true, name: true, email: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: "desc" },
+        take: 5000,
+      })
+    : [];
+
+  const approvalLogs = await prisma.auditLog.findMany({
+    where: {
+      action: { in: ["APPROVAL_DISCOUNT", "APPROVAL_PRICE_OVERRIDE", "APPROVAL_RETURN"] },
+      ...(from || to
+        ? {
+            createdAt: {
+              ...(from ? { gte: from } : {}),
+              ...(to ? { lte: to } : {}),
+            },
+          }
+        : {}),
+    },
+    include: {
+      user: { select: { id: true, name: true, email: true } },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 5000,
+  });
+
+  const userMap = new Map();
+  const ensureAgg = (user) => {
+    const key = user?.id ? String(user.id) : "unknown";
+    if (!userMap.has(key)) {
+      userMap.set(key, {
+        userId: user?.id || null,
+        userName: user?.name || user?.email || "Unknown",
+        saleCount: 0,
+        grossSales: 0,
+        discountCount: 0,
+        discountAmount: 0,
+        priceOverrideCount: 0,
+        priceOverrideAmount: 0,
+        returnCount: 0,
+        returnAmount: 0,
+      });
+    }
+    return userMap.get(key);
+  };
+
+  const events = [];
+  for (const sale of sales) {
+    const agg = ensureAgg(sale.cashier);
+    agg.saleCount += 1;
+    agg.grossSales += Number(sale.total || 0);
+    if (Number(sale.discount || 0) > 0) {
+      agg.discountCount += 1;
+      agg.discountAmount += Number(sale.discount || 0);
+    }
+    if (Number(sale.discount || 0) >= discountAlertMin) {
+      events.push({
+        type: "HIGH_DISCOUNT_SALE",
+        createdAt: sale.createdAt,
+        userId: sale.cashier?.id || null,
+        userName: sale.cashier?.name || sale.cashier?.email || "Unknown",
+        amount: Number(sale.discount || 0),
+        ref: sale.invoiceNo || `INV-${sale.id}`,
+        note: `High discount on sale invoice ${sale.invoiceNo || `INV-${sale.id}`}`,
+      });
+    }
+  }
+
+  for (const row of returns) {
+    const agg = ensureAgg(row.sale?.cashier);
+    const amount = Number(row.amount || 0);
+    agg.returnCount += 1;
+    agg.returnAmount += amount;
+    if (amount >= returnAlertMin) {
+      events.push({
+        type: "HIGH_RETURN",
+        createdAt: row.createdAt,
+        userId: row.sale?.cashier?.id || null,
+        userName: row.sale?.cashier?.name || row.sale?.cashier?.email || "Unknown",
+        amount,
+        ref: row.saleId ? `SALE-${row.saleId}` : "-",
+        note: "High value sale return",
+      });
+    }
+  }
+
+  for (const log of approvalLogs) {
+    const agg = ensureAgg(log.user);
+    const amount = Number(log.payload?.amount || 0);
+    if (log.action === "APPROVAL_PRICE_OVERRIDE") {
+      agg.priceOverrideCount += 1;
+      agg.priceOverrideAmount += amount;
+    } else if (log.action === "APPROVAL_DISCOUNT") {
+      agg.discountCount += 1;
+      agg.discountAmount += amount;
+    } else if (log.action === "APPROVAL_RETURN") {
+      agg.returnCount += 1;
+      agg.returnAmount += amount;
+    }
+    events.push({
+      type: log.action,
+      createdAt: log.createdAt,
+      userId: log.user?.id || null,
+      userName: log.user?.name || log.user?.email || "Unknown",
+      amount,
+      ref: `${log.entity || ""}-${log.entityId || ""}` || "-",
+      note: log.payload?.reason || "",
+    });
+  }
+
+  const summaryRows = Array.from(userMap.values())
+    .map((row) => {
+      const gross = Number(row.grossSales || 0);
+      const discountRate = gross > 0 ? (Number(row.discountAmount || 0) / gross) * 100 : 0;
+      const returnRate = gross > 0 ? (Number(row.returnAmount || 0) / gross) * 100 : 0;
+      const riskScore =
+        Number(row.discountCount || 0) * 1.2 +
+        Number(row.priceOverrideCount || 0) * 1.8 +
+        Number(row.returnCount || 0) * 1.6 +
+        discountRate * 0.4 +
+        returnRate * 0.6;
+      return {
+        ...row,
+        discountRate: Number(discountRate.toFixed(2)),
+        returnRate: Number(returnRate.toFixed(2)),
+        riskScore: Number(riskScore.toFixed(2)),
+      };
+    })
+    .sort((a, b) => b.riskScore - a.riskScore);
+
+  const eventRows = events
+    .map((event) => ({ ...event, riskScore: Number(event.amount || 0) >= criticalAmount ? 10 : 5 }))
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .slice(0, 300);
+
+  const totals = summaryRows.reduce(
+    (acc, row) => {
+      acc.totalCashiers += 1;
+      acc.totalSales += Number(row.grossSales || 0);
+      acc.totalDiscount += Number(row.discountAmount || 0);
+      acc.totalReturns += Number(row.returnAmount || 0);
+      acc.totalOverrides += Number(row.priceOverrideCount || 0);
+      return acc;
+    },
+    { totalCashiers: 0, totalSales: 0, totalDiscount: 0, totalReturns: 0, totalOverrides: 0 }
+  );
+
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    thresholds: { discountAlertMin, returnAlertMin, criticalAmount },
+    totals: {
+      ...totals,
+      totalSales: Number(totals.totalSales.toFixed(2)),
+      totalDiscount: Number(totals.totalDiscount.toFixed(2)),
+      totalReturns: Number(totals.totalReturns.toFixed(2)),
+    },
+    summaryRows,
+    eventRows,
+  };
+}
+
+exports.getShrinkageControlReport = async (req, res) => {
+  try {
+    const payload = await buildShrinkageControlPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportShrinkageControlCSV = async (req, res) => {
+  try {
+    const payload = await buildShrinkageControlPayload(req.branchId, req.query || {});
+    const rows = (payload.summaryRows || []).map((row) => ({
+      user_name: row.userName,
+      sale_count: row.saleCount,
+      gross_sales: Number(row.grossSales || 0).toFixed(2),
+      discount_count: row.discountCount,
+      discount_amount: Number(row.discountAmount || 0).toFixed(2),
+      price_override_count: row.priceOverrideCount,
+      return_count: row.returnCount,
+      return_amount: Number(row.returnAmount || 0).toFixed(2),
+      discount_rate_pct: Number(row.discountRate || 0).toFixed(2),
+      return_rate_pct: Number(row.returnRate || 0).toFixed(2),
+      risk_score: Number(row.riskScore || 0).toFixed(2),
+    }));
+    const csv = toCSV(rows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="shrinkage-risk-summary.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportShrinkageControlPDF = async (req, res) => {
+  try {
+    const payload = await buildShrinkageControlPayload(req.branchId, req.query || {});
+    writePdfTableReport(
+      res,
+      "Shrinkage Risk Summary",
+      [
+        { key: "userName", label: "Cashier/User" },
+        { key: "saleCount", label: "Sales" },
+        { key: "discountAmount", label: "Discount" },
+        { key: "returnAmount", label: "Returns" },
+        { key: "riskScore", label: "Risk Score" },
+      ],
+      (payload.summaryRows || []).map((row) => ({
+        userName: row.userName,
+        saleCount: row.saleCount,
+        discountAmount: Number(row.discountAmount || 0).toFixed(2),
+        returnAmount: Number(row.returnAmount || 0).toFixed(2),
+        riskScore: Number(row.riskScore || 0).toFixed(2),
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getStaffPerformanceScorecard = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const { from, to } = parseDateRange(req.query || {});
+    const saleWhere = buildSaleWhere(branchId, from, to);
+    const sales = await prisma.sale.findMany({
+      where: saleWhere,
+      include: {
+        cashier: { select: { id: true, name: true, email: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 5000,
+    });
+    const saleIds = sales.map((s) => Number(s.id));
+    const returns = saleIds.length
+      ? await prisma.saleReturn.findMany({
+          where: { saleId: { in: saleIds } },
+          include: { sale: { select: { cashier: { select: { id: true, name: true, email: true } } } } },
+          take: 5000,
+        })
+      : [];
+    const approvals = await prisma.auditLog.findMany({
+      where: {
+        action: { in: ["APPROVAL_DISCOUNT", "APPROVAL_PRICE_OVERRIDE", "APPROVAL_RETURN"] },
+        ...(from || to
+          ? {
+              createdAt: {
+                ...(from ? { gte: from } : {}),
+                ...(to ? { lte: to } : {}),
+              },
+            }
+          : {}),
+      },
+      include: { user: { select: { id: true, name: true, email: true } } },
+      take: 5000,
+    });
+
+    const byUser = new Map();
+    const ensure = (user) => {
+      const key = user?.id ? String(user.id) : "unknown";
+      if (!byUser.has(key)) {
+        byUser.set(key, {
+          userId: user?.id || null,
+          userName: user?.name || user?.email || "Unknown",
+          invoiceCount: 0,
+          grossSales: 0,
+          totalDiscount: 0,
+          returnCount: 0,
+          returnAmount: 0,
+          overrideCount: 0,
+          avgBill: 0,
+          riskScore: 0,
+        });
+      }
+      return byUser.get(key);
+    };
+
+    for (const sale of sales) {
+      const row = ensure(sale.cashier);
+      row.invoiceCount += 1;
+      row.grossSales += Number(sale.total || 0);
+      row.totalDiscount += Number(sale.discount || 0);
+    }
+    for (const ret of returns) {
+      const row = ensure(ret.sale?.cashier);
+      row.returnCount += 1;
+      row.returnAmount += Number(ret.amount || 0);
+    }
+    for (const approval of approvals) {
+      const row = ensure(approval.user);
+      if (approval.action === "APPROVAL_PRICE_OVERRIDE") row.overrideCount += 1;
+      if (approval.action === "APPROVAL_RETURN") row.returnCount += 1;
+      if (approval.action === "APPROVAL_DISCOUNT") row.totalDiscount += Number(approval.payload?.amount || 0);
+    }
+
+    const rows = Array.from(byUser.values())
+      .map((row) => {
+        const invoiceCount = Number(row.invoiceCount || 0);
+        const gross = Number(row.grossSales || 0);
+        const avgBill = invoiceCount > 0 ? gross / invoiceCount : 0;
+        const discountRate = gross > 0 ? (Number(row.totalDiscount || 0) / gross) * 100 : 0;
+        const returnRate = gross > 0 ? (Number(row.returnAmount || 0) / gross) * 100 : 0;
+        const riskScore = Number(
+          (Number(row.returnCount || 0) * 1.8 + Number(row.overrideCount || 0) * 1.5 + discountRate * 0.4 + returnRate * 0.7).toFixed(2)
+        );
+        return {
+          ...row,
+          avgBill: Number(avgBill.toFixed(2)),
+          discountRate: Number(discountRate.toFixed(2)),
+          returnRate: Number(returnRate.toFixed(2)),
+          riskScore,
+        };
+      })
+      .sort((a, b) => Number(b.grossSales || 0) - Number(a.grossSales || 0));
+
+    res.json({
+      from: from ? from.toISOString().slice(0, 10) : null,
+      to: to ? to.toISOString().slice(0, 10) : null,
+      summary: {
+        staffCount: rows.length,
+        totalSales: Number(rows.reduce((sum, r) => sum + Number(r.grossSales || 0), 0).toFixed(2)),
+        totalInvoices: rows.reduce((sum, r) => sum + Number(r.invoiceCount || 0), 0),
+      },
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getAuditActivityTrail = async (req, res) => {
+  try {
+    const { from, to } = parseDateRange(req.query || {});
+    const action = String(req.query?.action || "").trim();
+    const entity = String(req.query?.entity || "").trim();
+    const limitRaw = Number(req.query?.limit || 300);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 300;
+
+    const where = {
+      ...(from || to
+        ? {
+            createdAt: {
+              ...(from ? { gte: from } : {}),
+              ...(to ? { lte: to } : {}),
+            },
+          }
+        : {}),
+      ...(action ? { action: { contains: action } } : {}),
+      ...(entity ? { entity: { contains: entity } } : {}),
+    };
+
+    const logs = await prisma.auditLog.findMany({
+      where,
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+
+    const rows = logs.map((log) => ({
+      id: log.id,
+      createdAt: log.createdAt,
+      action: log.action || "",
+      entity: log.entity || "",
+      entityId: log.entityId,
+      userId: log.userId,
+      userName: log.user?.name || log.user?.email || "System",
+      userRole: log.user?.role?.name || "-",
+      payload: log.payload || null,
+    }));
+
+    res.json({
+      from: from ? from.toISOString().slice(0, 10) : null,
+      to: to ? to.toISOString().slice(0, 10) : null,
+      count: rows.length,
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};

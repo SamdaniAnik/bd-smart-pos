@@ -1,8 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import { getStoredPermissions, hasPermission } from "../utils/permissions";
+import { notifyPermissionRequired } from "../utils/notify";
 
 function RoleManagement() {
+  const permissionsForUser = getStoredPermissions();
+  const canManageRbac = hasPermission("rbac.manage", permissionsForUser);
+
   const [roles, setRoles] = useState([]);
   const [permissions, setPermissions] = useState([]);
   const [users, setUsers] = useState([]);
@@ -12,6 +17,8 @@ function RoleManagement() {
   const [newRole, setNewRole] = useState("");
   const [selectedRoleId, setSelectedRoleId] = useState("");
   const [selectedPermissionIds, setSelectedPermissionIds] = useState([]);
+  const [matrixFilter, setMatrixFilter] = useState("");
+  const [matrixGroup, setMatrixGroup] = useState("all");
   const [userForm, setUserForm] = useState({
     name: "",
     email: "",
@@ -21,12 +28,7 @@ function RoleManagement() {
     language: "en",
   });
 
-  const selectedRole = useMemo(
-    () => roles.find((r) => String(r.id) === String(selectedRoleId)),
-    [roles, selectedRoleId]
-  );
-
-  const load = async () => {
+  const load = useCallback(async () => {
     const [rolesRes, permissionsRes, usersRes, branchesRes, templateRes] = await Promise.all([
       api.get("/rbac/roles"),
       api.get("/rbac/permissions"),
@@ -39,28 +41,31 @@ function RoleManagement() {
     setUsers(usersRes.data);
     setBranches(branchesRes.data);
     setTemplates(templateRes.data || {});
-  };
-
-  useEffect(() => {
-    load();
   }, []);
 
   useEffect(() => {
-    if (!selectedRole) {
-      setSelectedPermissionIds([]);
-      return;
-    }
-    setSelectedPermissionIds(selectedRole.rolePermissions.map((rp) => rp.permissionId));
-  }, [selectedRole]);
+    const timer = setTimeout(() => {
+      load();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [load]);
 
   const createRole = async (e) => {
     e.preventDefault();
+    if (!canManageRbac) {
+      notifyPermissionRequired("rbac.manage.");
+      return;
+    }
     await api.post("/rbac/roles", { name: newRole });
     setNewRole("");
     load();
   };
 
   const savePermissions = async () => {
+    if (!canManageRbac) {
+      notifyPermissionRequired("rbac.manage.");
+      return;
+    }
     if (!selectedRoleId) return;
     await api.post(`/rbac/roles/${selectedRoleId}/permissions`, {
       permissionIds: selectedPermissionIds,
@@ -69,6 +74,10 @@ function RoleManagement() {
   };
 
   const applyTemplate = async () => {
+    if (!canManageRbac) {
+      notifyPermissionRequired("rbac.manage.");
+      return;
+    }
     if (!selectedRoleId || !selectedTemplateName) return;
     await api.post(`/rbac/roles/${selectedRoleId}/apply-template`, {
       templateName: selectedTemplateName,
@@ -78,6 +87,10 @@ function RoleManagement() {
 
   const createUser = async (e) => {
     e.preventDefault();
+    if (!canManageRbac) {
+      notifyPermissionRequired("rbac.manage.");
+      return;
+    }
     await api.post("/rbac/users", {
       ...userForm,
       roleId: Number(userForm.roleId),
@@ -88,6 +101,10 @@ function RoleManagement() {
   };
 
   const updateUserRole = async (userId, roleId) => {
+    if (!canManageRbac) {
+      notifyPermissionRequired("rbac.manage.");
+      return;
+    }
     await api.patch(`/rbac/users/${userId}/role`, { roleId: Number(roleId) });
     load();
   };
@@ -98,18 +115,63 @@ function RoleManagement() {
     );
   };
 
+  const permissionGroups = useMemo(() => {
+    const groups = new Set(["all"]);
+    for (const permission of permissions) {
+      const code = String(permission.code || "");
+      const [prefix] = code.split(".");
+      groups.add(prefix || "other");
+    }
+    return [...groups];
+  }, [permissions]);
+
+  const matrixPermissions = useMemo(() => {
+    const term = String(matrixFilter || "").trim().toLowerCase();
+    return (permissions || []).filter((permission) => {
+      const code = String(permission.code || "");
+      const [prefix] = code.split(".");
+      const byGroup = matrixGroup === "all" ? true : (prefix || "other") === matrixGroup;
+      const bySearch = term ? code.toLowerCase().includes(term) : true;
+      return byGroup && bySearch;
+    });
+  }, [permissions, matrixFilter, matrixGroup]);
+
+  const rolePermissionSetByRoleId = useMemo(() => {
+    const map = new Map();
+    for (const role of roles) {
+      map.set(
+        Number(role.id),
+        new Set((role.rolePermissions || []).map((rp) => Number(rp.permissionId)))
+      );
+    }
+    return map;
+  }, [roles]);
+
   return (
     <div>
       <h2>Role Management</h2>
+      {!canManageRbac ? (
+        <div className="page-card" style={{ marginBottom: 12 }}>
+          <strong>Permission required:</strong> <code>rbac.manage</code> to create roles/users and change permission assignments.
+        </div>
+      ) : null}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
         <div>
           <h4>Create Role</h4>
           <form onSubmit={createRole}>
             <input placeholder="Role name" value={newRole} onChange={(e) => setNewRole(e.target.value)} />
-            <button type="submit">Create Role</button>
+            <button type="submit" disabled={!canManageRbac}>Create Role</button>
           </form>
           <h4 style={{ marginTop: "14px" }}>Assign Permissions</h4>
-          <select value={selectedRoleId} onChange={(e) => setSelectedRoleId(e.target.value)}>
+          <select
+            value={selectedRoleId}
+            onChange={(e) => {
+              const nextRoleId = e.target.value;
+              setSelectedRoleId(nextRoleId);
+              const role = roles.find((r) => String(r.id) === String(nextRoleId));
+              setSelectedPermissionIds((role?.rolePermissions || []).map((rp) => rp.permissionId));
+            }}
+          >
             <option value="">Select Role</option>
             {roles.map((role) => (
               <option key={role.id} value={role.id}>
@@ -130,7 +192,7 @@ function RoleManagement() {
               </label>
             ))}
           </div>
-          <button style={{ marginTop: "10px" }} onClick={savePermissions}>
+          <button style={{ marginTop: "10px" }} onClick={savePermissions} disabled={!canManageRbac}>
             Save Permissions
           </button>
           <h4 style={{ marginTop: "14px" }}>Apply Role Template</h4>
@@ -142,7 +204,7 @@ function RoleManagement() {
               </option>
             ))}
           </select>
-          <button style={{ marginTop: "8px" }} onClick={applyTemplate}>
+          <button style={{ marginTop: "8px" }} onClick={applyTemplate} disabled={!canManageRbac}>
             Apply Template
           </button>
         </div>
@@ -173,8 +235,86 @@ function RoleManagement() {
                 </option>
               ))}
             </select>
-            <button type="submit">Create User</button>
+            <button type="submit" disabled={!canManageRbac}>Create User</button>
           </form>
+        </div>
+      </div>
+      <div className="page-card" style={{ marginTop: 14, marginBottom: 12 }}>
+        <h4 style={{ marginTop: 0 }}>Role-based Action Matrix</h4>
+        <div className="form-grid" style={{ marginBottom: 8 }}>
+          <input
+            placeholder="Search permission (e.g. sale.create)"
+            value={matrixFilter}
+            onChange={(e) => setMatrixFilter(e.target.value)}
+          />
+          <select value={matrixGroup} onChange={(e) => setMatrixGroup(e.target.value)}>
+            {permissionGroups.map((group) => (
+              <option key={group} value={group}>
+                {group === "all" ? "All modules" : group}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div style={{ maxHeight: 380, overflow: "auto", border: "1px solid #ddd", borderRadius: 10 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, background: "#fff" }}>
+                  Action
+                </th>
+                {roles.map((role) => (
+                  <th
+                    key={`role-col-${role.id}`}
+                    style={{ textAlign: "center", padding: 8, borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, background: "#fff" }}
+                  >
+                    {role.name}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {matrixPermissions.map((permission) => (
+                <tr key={`perm-row-${permission.id}`}>
+                  <td style={{ padding: 8, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{permission.code}</td>
+                  {roles.map((role) => {
+                    const checked = rolePermissionSetByRoleId.get(Number(role.id))?.has(Number(permission.id));
+                    const editable = String(selectedRoleId) === String(role.id);
+                    return (
+                      <td key={`cell-${permission.id}-${role.id}`} style={{ textAlign: "center", padding: 8, borderBottom: "1px solid #f1f5f9" }}>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(checked)}
+                          disabled={!editable || !canManageRbac}
+                          onChange={() => {
+                            if (!editable) return;
+                            togglePermission(permission.id);
+                          }}
+                          style={{ width: "auto" }}
+                          title={
+                            !canManageRbac
+                              ? "Requires rbac.manage permission"
+                              : editable
+                                ? "Editable (selected role)"
+                                : "Select this role above to edit"
+                          }
+                        />
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+              {!matrixPermissions.length ? (
+                <tr>
+                  <td colSpan={roles.length + 1} style={{ padding: 10, textAlign: "center", color: "var(--muted)" }}>
+                    No permissions found for current filter.
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ marginTop: 8, color: "var(--muted)" }}>
+          Tip: select a role in the "Assign Permissions" section to make its matrix column editable, then click "Save Permissions".
         </div>
       </div>
 
@@ -199,6 +339,7 @@ function RoleManagement() {
               <select
                 value={v}
                 onChange={(e) => updateUserRole(row.id, e.target.value)}
+                disabled={!canManageRbac}
                 style={{ marginBottom: 0 }}
               >
                 {roles.map((role) => (

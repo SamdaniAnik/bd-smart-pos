@@ -19,6 +19,7 @@ function RoleManagement() {
   const [selectedPermissionIds, setSelectedPermissionIds] = useState([]);
   const [matrixFilter, setMatrixFilter] = useState("");
   const [matrixGroup, setMatrixGroup] = useState("all");
+  const [matrixDraft, setMatrixDraft] = useState({});
   const [userForm, setUserForm] = useState({
     name: "",
     email: "",
@@ -41,6 +42,7 @@ function RoleManagement() {
     setUsers(usersRes.data);
     setBranches(branchesRes.data);
     setTemplates(templateRes.data || {});
+    setMatrixDraft({});
   }, []);
 
   useEffect(() => {
@@ -146,6 +148,39 @@ function RoleManagement() {
     }
     return map;
   }, [roles]);
+
+  const getMatrixCellChecked = useCallback(
+    (roleId, permissionId) => {
+      const key = `${roleId}:${permissionId}`;
+      if (Object.prototype.hasOwnProperty.call(matrixDraft, key)) {
+        return Boolean(matrixDraft[key]);
+      }
+      return Boolean(rolePermissionSetByRoleId.get(Number(roleId))?.has(Number(permissionId)));
+    },
+    [matrixDraft, rolePermissionSetByRoleId]
+  );
+
+  const matrixDraftUpdates = useMemo(() => {
+    const updates = [];
+    for (const [key, checked] of Object.entries(matrixDraft)) {
+      const [roleIdRaw, permissionIdRaw] = key.split(":");
+      const roleId = Number(roleIdRaw);
+      const permissionId = Number(permissionIdRaw);
+      if (!Number.isFinite(roleId) || !Number.isFinite(permissionId)) continue;
+      updates.push({ roleId, permissionId, checked: Boolean(checked) });
+    }
+    return updates;
+  }, [matrixDraft]);
+
+  const saveMatrixBulk = async () => {
+    if (!canManageRbac) {
+      notifyPermissionRequired("rbac.manage.");
+      return;
+    }
+    if (!matrixDraftUpdates.length) return;
+    await api.post("/rbac/permission-matrix/bulk-update", { updates: matrixDraftUpdates });
+    await load();
+  };
 
   return (
     <div>
@@ -254,6 +289,12 @@ function RoleManagement() {
               </option>
             ))}
           </select>
+          <button type="button" className="btn-secondary" onClick={() => setMatrixDraft({})} disabled={!Object.keys(matrixDraft).length}>
+            Reset Unsaved
+          </button>
+          <button type="button" onClick={saveMatrixBulk} disabled={!canManageRbac || !matrixDraftUpdates.length}>
+            Save Matrix Changes ({matrixDraftUpdates.length})
+          </button>
         </div>
         <div style={{ maxHeight: 380, overflow: "auto", border: "1px solid #ddd", borderRadius: 10 }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
@@ -277,26 +318,19 @@ function RoleManagement() {
                 <tr key={`perm-row-${permission.id}`}>
                   <td style={{ padding: 8, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{permission.code}</td>
                   {roles.map((role) => {
-                    const checked = rolePermissionSetByRoleId.get(Number(role.id))?.has(Number(permission.id));
-                    const editable = String(selectedRoleId) === String(role.id);
+                    const checked = getMatrixCellChecked(role.id, permission.id);
                     return (
                       <td key={`cell-${permission.id}-${role.id}`} style={{ textAlign: "center", padding: 8, borderBottom: "1px solid #f1f5f9" }}>
                         <input
                           type="checkbox"
                           checked={Boolean(checked)}
-                          disabled={!editable || !canManageRbac}
+                          disabled={!canManageRbac}
                           onChange={() => {
-                            if (!editable) return;
-                            togglePermission(permission.id);
+                            const key = `${role.id}:${permission.id}`;
+                            setMatrixDraft((prev) => ({ ...prev, [key]: !Boolean(checked) }));
                           }}
                           style={{ width: "auto" }}
-                          title={
-                            !canManageRbac
-                              ? "Requires rbac.manage permission"
-                              : editable
-                                ? "Editable (selected role)"
-                                : "Select this role above to edit"
-                          }
+                          title={!canManageRbac ? "Requires rbac.manage permission" : "Editable in bulk matrix mode"}
                         />
                       </td>
                     );
@@ -314,7 +348,7 @@ function RoleManagement() {
           </table>
         </div>
         <div style={{ marginTop: 8, color: "var(--muted)" }}>
-          Tip: select a role in the "Assign Permissions" section to make its matrix column editable, then click "Save Permissions".
+          Tip: toggle any cells across roles, then click "Save Matrix Changes" once.
         </div>
       </div>
 

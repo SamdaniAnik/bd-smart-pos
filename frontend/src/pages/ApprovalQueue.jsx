@@ -2,18 +2,22 @@ import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
 
+const APPROVAL_FOCUS_KEY = "bd_pos_approval_focus_id";
+
 function ApprovalQueue() {
   const [rows, setRows] = useState([]);
   const [summary, setSummary] = useState({});
-  const [filters, setFilters] = useState({ from: "", to: "", action: "", status: "" });
+  const [filters, setFilters] = useState({ id: "", from: "", to: "", action: "", status: "", overdueOnly: false });
   const [reviewRemark, setReviewRemark] = useState("");
 
   const queryString = () => {
     const q = new URLSearchParams();
+    if (filters.id) q.set("id", filters.id);
     if (filters.from) q.set("from", filters.from);
     if (filters.to) q.set("to", filters.to);
     if (filters.action) q.set("action", filters.action);
     if (filters.status) q.set("status", filters.status);
+    if (filters.overdueOnly) q.set("overdueOnly", "true");
     return q.toString() ? `?${q.toString()}` : "";
   };
 
@@ -24,8 +28,16 @@ function ApprovalQueue() {
   };
 
   useEffect(() => {
+    const focusedId = localStorage.getItem(APPROVAL_FOCUS_KEY) || "";
+    if (focusedId) {
+      setFilters((p) => ({ ...p, id: focusedId }));
+      localStorage.removeItem(APPROVAL_FOCUS_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
     load();
-  }, [filters.from, filters.to, filters.action, filters.status]);
+  }, [filters.id, filters.from, filters.to, filters.action, filters.status, filters.overdueOnly]);
 
   const exportFile = async (ext) => {
     const res = await api.get(`/approvals/export.${ext}${queryString()}`, { responseType: "blob" });
@@ -39,8 +51,27 @@ function ApprovalQueue() {
 
   const review = async (row) => {
     if (row.status === "REVIEWED") return;
-    await api.put(`/approvals/${row.id}/review`, { remark: reviewRemark || "Reviewed by manager" });
+    await api.put(`/approvals/${row.id}/review`, {
+      decision: "REVIEWED",
+      remark: reviewRemark || "Reviewed by manager",
+    });
     setReviewRemark("");
+    load();
+  };
+
+  const decide = async (row, decision) => {
+    if (["APPROVED", "REJECTED"].includes(String(row.status || "").toUpperCase())) return;
+    await api.put(`/approvals/${row.id}/review`, {
+      decision,
+      remark: reviewRemark || `${decision} by manager`,
+    });
+    setReviewRemark("");
+    load();
+  };
+
+  const escalate = async (row) => {
+    const reason = (window.prompt("Escalation reason (optional):") || "").trim();
+    await api.post(`/approvals/${row.id}/escalate`, { reason });
     load();
   };
 
@@ -48,6 +79,11 @@ function ApprovalQueue() {
     <div>
       <h2>Approval Queue & Exceptions</h2>
       <div className="form-grid" style={{ marginBottom: 12 }}>
+        <input
+          placeholder="Approval Event ID"
+          value={filters.id}
+          onChange={(e) => setFilters((p) => ({ ...p, id: e.target.value }))}
+        />
         <input type="date" value={filters.from} onChange={(e) => setFilters((p) => ({ ...p, from: e.target.value }))} />
         <input type="date" value={filters.to} onChange={(e) => setFilters((p) => ({ ...p, to: e.target.value }))} />
         <select value={filters.action} onChange={(e) => setFilters((p) => ({ ...p, action: e.target.value }))}>
@@ -56,6 +92,8 @@ function ApprovalQueue() {
           <option value="APPROVAL_REDEMPTION">Redemption Approval</option>
           <option value="APPROVAL_RETURN">Return Approval</option>
           <option value="APPROVAL_STOCK_COUNT">Stock Count Approval</option>
+          <option value="APPROVAL_STOCK_ADJUSTMENT">Stock Write-off Approval</option>
+          <option value="APPROVAL_PETTY_CASH_CLAIM">Petty Cash Claim Approval</option>
           <option value="APPROVAL_HOLD_DISCARD">Held Cart Discard (other cashier)</option>
           <option value="APPROVAL_HOLD_RESUME">Held Cart Resume (other cashier)</option>
           <option value="APPROVAL_CREDIT_LIMIT">Credit limit override</option>
@@ -67,7 +105,19 @@ function ApprovalQueue() {
           <option value="PENDING">Pending</option>
           <option value="REVIEWED">Reviewed</option>
         </select>
-        <button type="button" className="btn-secondary" onClick={() => setFilters({ from: "", to: "", action: "", status: "" })}>
+        <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <input
+            type="checkbox"
+            checked={Boolean(filters.overdueOnly)}
+            onChange={(e) => setFilters((p) => ({ ...p, overdueOnly: e.target.checked }))}
+          />
+          Pending overdue only
+        </label>
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={() => setFilters({ id: "", from: "", to: "", action: "", status: "", overdueOnly: false })}
+        >
           Clear Filter
         </button>
         <button type="button" onClick={() => exportFile("csv")}>Export CSV</button>
@@ -80,6 +130,9 @@ function ApprovalQueue() {
         <div className="stat">Approved: {Number(summary.approved || 0)}</div>
         <div className="stat">Rejected: {Number(summary.rejected || 0)}</div>
         <div className="stat">Reviewed: {Number(summary.reviewed || 0)}</div>
+        <div className="stat">Overdue 30m+: {Number(summary.overdue30m || 0)}</div>
+        <div className="stat">Overdue 2h+: {Number(summary.overdue2h || 0)}</div>
+        <div className="stat">Overdue 24h+: {Number(summary.overdue24h || 0)}</div>
         <div className="stat">Amount: ৳{Number(summary.totalAmount || 0).toFixed(2)}</div>
       </div>
       <div className="form-grid" style={{ marginBottom: 12 }}>
@@ -96,6 +149,17 @@ function ApprovalQueue() {
           { key: "id", label: "ID" },
           { key: "action", label: "Action" },
           { key: "status", label: "Status" },
+          {
+            key: "slaLevel",
+            label: "SLA",
+            render: (_, row) => {
+              const level = String(row.slaLevel || "ON_TIME").toUpperCase();
+              if (level === "OVERDUE_24H") return <span className="badge badge-danger">24H+</span>;
+              if (level === "OVERDUE_2H") return <span className="badge badge-warning">2H+</span>;
+              if (level === "OVERDUE_30M") return <span className="badge">30M+</span>;
+              return <span className="badge badge-success">ON TIME</span>;
+            },
+          },
           {
             key: "requestedByName",
             label: "Requested By",
@@ -126,14 +190,40 @@ function ApprovalQueue() {
             key: "actions",
             label: "Actions",
             render: (_, row) => (
-              <button
-                type="button"
-                className="btn-secondary btn-sm"
-                disabled={row.status === "REVIEWED"}
-                onClick={() => review(row)}
-              >
-                Mark Reviewed
-              </button>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={["REVIEWED", "APPROVED", "REJECTED"].includes(String(row.status || "").toUpperCase())}
+                  onClick={() => review(row)}
+                >
+                  Mark Reviewed
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={["APPROVED", "REJECTED"].includes(String(row.status || "").toUpperCase())}
+                  onClick={() => decide(row, "APPROVED")}
+                >
+                  Approve
+                </button>
+                <button
+                  type="button"
+                  className="btn-danger btn-sm"
+                  disabled={["APPROVED", "REJECTED"].includes(String(row.status || "").toUpperCase())}
+                  onClick={() => decide(row, "REJECTED")}
+                >
+                  Reject
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={String(row.status || "").toUpperCase() !== "PENDING"}
+                  onClick={() => escalate(row)}
+                >
+                  Escalate
+                </button>
+              </div>
             ),
           },
         ]}

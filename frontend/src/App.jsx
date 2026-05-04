@@ -22,6 +22,11 @@ import Promotions from "./pages/Promotions";
 import GiftCards from "./pages/GiftCards";
 import FinanceSettlements from "./pages/FinanceSettlements";
 import FinanceBankImports from "./pages/FinanceBankImports";
+import Cheques from "./pages/Cheques";
+import FiscalPeriods from "./pages/FiscalPeriods";
+import Assets from "./pages/Assets";
+import CostCenters from "./pages/CostCenters";
+import PettyCash from "./pages/PettyCash";
 import IntegrationWebhooks from "./pages/IntegrationWebhooks";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "./services/api";
@@ -92,6 +97,11 @@ function App() {
           { key: "accounting", label: t(lang, "accounting"), hint: "COA & trial balance", icon: "💰", perm: "accounting.view" },
           { key: "financeSettlements", label: "Settlements", hint: "MFS reconciliation", icon: "🏦", perm: "accounting.report" },
           { key: "financeBankCsv", label: "Bank import", hint: "Statement lines & matching", icon: "📥", perm: "accounting.report" },
+          { key: "fiscalPeriods", label: t(lang, "fiscalPeriods"), hint: "Close/reopen fiscal period", icon: "🗓️", perm: "accounting.report" },
+          { key: "costCenters", label: t(lang, "costCenters"), hint: "Department/project finance tags", icon: "🏷️", perm: "costcenter.view" },
+          { key: "pettyCash", label: t(lang, "pettyCash"), hint: "Imprest funds and replenishment", icon: "👛", perm: "pettycash.view" },
+          { key: "assets", label: t(lang, "assets"), hint: "Asset register & depreciation", icon: "🏢", perm: "asset.view" },
+          { key: "cheques", label: t(lang, "cheques"), hint: "Issued/received cheque tracking", icon: "🧾", perm: "cheque.view" },
           { key: "reports", label: t(lang, "reports"), hint: "Aging & valuation", icon: "📈", perm: "report.view" },
         ],
       },
@@ -320,6 +330,16 @@ function App() {
         return <FinanceSettlements />;
       case "financeBankCsv":
         return <FinanceBankImports />;
+      case "fiscalPeriods":
+        return <FiscalPeriods />;
+      case "costCenters":
+        return <CostCenters />;
+      case "assets":
+        return <Assets />;
+      case "pettyCash":
+        return <PettyCash />;
+      case "cheques":
+        return <Cheques />;
       case "expenses":
         return <Expenses />;
       case "dueCollection":

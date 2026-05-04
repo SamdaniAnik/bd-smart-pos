@@ -25,13 +25,27 @@ const permissionCodes = [
   "customer.create",
   "expense.view",
   "expense.create",
+  "cheque.view",
+  "cheque.manage",
+  "cheque.clear",
+  "asset.view",
+  "asset.manage",
+  "costcenter.view",
+  "costcenter.manage",
+  "pettycash.view",
+  "pettycash.manage",
 ];
 
 const accountDefaults = [
   { code: "1100", name: "Cash In Hand", type: "Asset", isSystem: true },
+  { code: "1110", name: "Cheques In Hand", type: "Asset", isSystem: true },
+  { code: "1120", name: "Petty Cash", type: "Asset", isSystem: true },
   { code: "1200", name: "Accounts Receivable", type: "Asset", isSystem: true },
   { code: "1300", name: "Inventory", type: "Asset", isSystem: true },
+  { code: "1400", name: "Fixed Assets", type: "Asset", isSystem: true },
+  { code: "1410", name: "Accumulated Depreciation", type: "Asset", isSystem: true },
   { code: "2100", name: "Accounts Payable", type: "Liability", isSystem: true },
+  { code: "2110", name: "Cheques Issued", type: "Liability", isSystem: true },
   { code: "3100", name: "Owner Equity", type: "Equity", isSystem: true },
   { code: "4100", name: "Sales Revenue", type: "Revenue", isSystem: true },
   { code: "5100", name: "Cost Of Goods Sold", type: "Expense", isSystem: true },
@@ -80,6 +94,21 @@ exports.seedSystem = async (req, res) => {
         where: { branchId_code: { branchId: bId, code: account.code } },
         update: {},
         create: { branchId: bId, ...account },
+      });
+    }
+
+    const defaultAdjustReasons = [
+      { code: "DAMAGE", label: "Damage / Breakage", direction: "OUT", accountingImpact: "WRITE_OFF", accountCode: "5200" },
+      { code: "EXPIRED", label: "Expired / Spoilage", direction: "OUT", accountingImpact: "WRITE_OFF", accountCode: "5200" },
+      { code: "COUNT_GAIN", label: "Stock Count Gain", direction: "IN", accountingImpact: "GAIN", accountCode: "4100" },
+      { code: "COUNT_LOSS", label: "Stock Count Loss", direction: "OUT", accountingImpact: "WRITE_OFF", accountCode: "5200" },
+      { code: "MANUAL", label: "Manual Adjustment", direction: "BOTH", accountingImpact: "NONE", accountCode: null },
+    ];
+    for (const reason of defaultAdjustReasons) {
+      await prisma.inventoryAdjustReason.upsert({
+        where: { branchId_code: { branchId: bId, code: reason.code } },
+        update: {},
+        create: { branchId: bId, ...reason, isActive: true },
       });
     }
 

@@ -1,5 +1,6 @@
 const prisma = require("../../utils/prisma");
 const { writeAuditLog } = require("../../utils/audit");
+const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
 const PDFDocument = require("pdfkit");
 const XLSX = require("xlsx");
 
@@ -58,6 +59,10 @@ function getStockCountVarianceThreshold() {
   return Number(process.env.STOCK_COUNT_APPROVAL_QTY || 20);
 }
 
+function getInventoryWriteOffApprovalThreshold() {
+  return Number(process.env.INVENTORY_WRITEOFF_APPROVAL_AMOUNT || 5000);
+}
+
 function getNextDueAt(fromDate, frequency) {
   const date = new Date(fromDate);
   const f = String(frequency || "daily").toLowerCase();
@@ -65,6 +70,77 @@ function getNextDueAt(fromDate, frequency) {
   else if (f === "monthly") date.setMonth(date.getMonth() + 1);
   else date.setDate(date.getDate() + 1);
   return date;
+}
+
+function clean(value, max = 120) {
+  return String(value || "").trim().slice(0, max);
+}
+
+async function getReasonMap(tx, branchId) {
+  const rows = await tx.inventoryAdjustReason.findMany({ where: { branchId } });
+  return new Map(rows.map((x) => [String(x.code).toUpperCase(), x]));
+}
+
+async function upsertAdjustmentJournal(tx, { adjustmentId, branchId, qty, unitPrice, productName, reason }) {
+  const impact = String(reason?.accountingImpact || "NONE").toUpperCase();
+  if (impact === "NONE") return null;
+  const amount = Number((Math.abs(Number(qty || 0)) * Number(unitPrice || 0)).toFixed(2));
+  if (!(amount > 0)) return null;
+  const accountCode = String(reason?.accountCode || (qty < 0 ? "5200" : "4100")).trim();
+  const accounts = await tx.account.findMany({ where: { branchId } });
+  const map = new Map(accounts.map((a) => [a.code, a]));
+  const inventoryAcc = map.get("1300");
+  const impactAcc = map.get(accountCode);
+  if (!inventoryAcc || !impactAcc) {
+    throw new Error(`Required accounts missing for stock adjustment journal: 1300 and ${accountCode}`);
+  }
+  const journalPayload =
+    qty < 0
+      ? {
+          narration: `Inventory write-off ${productName} (${reason?.code || "UNSPECIFIED"})`,
+          lines: [
+            { accountId: impactAcc.id, debit: amount, credit: 0 },
+            { accountId: inventoryAcc.id, debit: 0, credit: amount },
+          ],
+        }
+      : {
+          narration: `Inventory gain ${productName} (${reason?.code || "UNSPECIFIED"})`,
+          lines: [
+            { accountId: inventoryAcc.id, debit: amount, credit: 0 },
+            { accountId: impactAcc.id, debit: 0, credit: amount },
+          ],
+        };
+  const existing = await tx.stockAdjustment.findUnique({ where: { id: adjustmentId }, select: { journalId: true } });
+  if (existing?.journalId) {
+    await tx.journalLine.deleteMany({ where: { journalId: existing.journalId } });
+    await tx.journal.update({
+      where: { id: existing.journalId },
+      data: {
+        narration: journalPayload.narration,
+        lines: { create: journalPayload.lines },
+      },
+    });
+    return existing.journalId;
+  }
+  const created = await tx.journal.create({
+    data: {
+      branchId,
+      createdBy: null,
+      refType: "STOCK_ADJUSTMENT",
+      refId: adjustmentId,
+      narration: journalPayload.narration,
+      lines: { create: journalPayload.lines },
+    },
+  });
+  return created.id;
+}
+
+function requiresWriteOffApproval({ reasonRule, qty, unitPrice }) {
+  if (!reasonRule) return false;
+  if (String(reasonRule.accountingImpact || "").toUpperCase() !== "WRITE_OFF") return false;
+  if (!(Number(qty) < 0)) return false;
+  const amount = Math.abs(Number(qty || 0)) * Number(unitPrice || 0);
+  return amount >= getInventoryWriteOffApprovalThreshold();
 }
 
 async function buildStockCountSnapshotItems(branchId) {
@@ -200,8 +276,11 @@ exports.getStockLedger = async (req, res) => {
 exports.adjustStock = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const { productId, qtyChange, reason, warehouseId } = req.body;
+    const { productId, qtyChange, reason, reasonCode, warehouseId } = req.body;
+    const managerApprovalPin = String(req.body?.managerApprovalPin || "");
     const qty = Number(qtyChange);
+    const normalizedReasonCode = clean(reasonCode, 40).toUpperCase() || null;
+    const reasonText = clean(reason, 160);
     const parsedWarehouseId = warehouseId ? Number(warehouseId) : null;
     if (!Number.isInteger(qty) || qty === 0) {
       return res.status(400).json({ error: "qtyChange must be non-zero integer" });
@@ -219,11 +298,77 @@ exports.adjustStock = async (req, res) => {
       if (!warehouse) return res.status(404).json({ error: "Warehouse not found in branch" });
     }
 
+    await ensureOpenFiscalPeriod(branchId, new Date());
     await prisma.$transaction(async (tx) => {
+      const reasonMap = await getReasonMap(tx, branchId);
+      const reasonRule = normalizedReasonCode ? reasonMap.get(normalizedReasonCode) : null;
+      if (normalizedReasonCode && !reasonRule) {
+        throw new Error("Invalid reasonCode");
+      }
+      if (reasonRule?.direction === "IN" && qty < 0) throw new Error("Selected reason only supports positive adjustment");
+      if (reasonRule?.direction === "OUT" && qty > 0) throw new Error("Selected reason only supports negative adjustment");
+      if (
+        requiresWriteOffApproval({
+          reasonRule,
+          qty,
+          unitPrice: Number(product.price || 0),
+        }) &&
+        managerApprovalPin !== getManagerPin()
+      ) {
+        const requiredAmount = Number((Math.abs(qty) * Number(product.price || 0)).toFixed(2));
+        const approvalEvent = await tx.auditLog.create({
+          data: {
+            userId: req.user?.id || null,
+            action: "APPROVAL_STOCK_ADJUSTMENT",
+            entity: "StockAdjustment",
+            payload: {
+              status: "PENDING",
+              reason: "Manager PIN required for high-value write-off",
+              amount: requiredAmount,
+              threshold: getInventoryWriteOffApprovalThreshold(),
+              productId: product.id,
+              reasonCode: reasonRule?.code || null,
+              qtyChange: qty,
+              branchId,
+              request: {
+                mode: "CREATE",
+                productId: product.id,
+                qtyChange: qty,
+                reason: reasonText || reasonRule?.label || "manual_adjustment",
+                reasonCode: reasonRule?.code || null,
+                warehouseId: parsedWarehouseId || null,
+              },
+            },
+          },
+        });
+        const error = new Error("Manager approval PIN required for high-value write-off");
+        error.httpStatus = 403;
+        error.meta = { approvalEventId: approvalEvent.id, requiredAmount };
+        throw error;
+      }
       await tx.product.update({ where: { id: product.id }, data: { stock: { increment: qty } } });
       const adjustment = await tx.stockAdjustment.create({
-        data: { branchId, productId: product.id, qtyChange: qty, reason: reason || "manual_adjustment" },
+        data: {
+          branchId,
+          productId: product.id,
+          qtyChange: qty,
+          reason: reasonText || reasonRule?.label || "manual_adjustment",
+          reasonCode: reasonRule?.code || null,
+        },
       });
+      const journalId = reasonRule
+        ? await upsertAdjustmentJournal(tx, {
+            adjustmentId: adjustment.id,
+            branchId,
+            qty,
+            unitPrice: Number(product.price || 0),
+            productName: product.name,
+            reason: reasonRule,
+          })
+        : null;
+      if (journalId) {
+        await tx.stockAdjustment.update({ where: { id: adjustment.id }, data: { journalId } });
+      }
       await tx.stockLedger.create({
         data: {
           branchId,
@@ -244,10 +389,13 @@ exports.adjustStock = async (req, res) => {
       action: "STOCK_ADJUST",
       entity: "Product",
       entityId: product.id,
-      payload: { qtyChange: qty, reason: reason || "manual_adjustment" },
+      payload: { qtyChange: qty, reason: reasonText || "manual_adjustment", reasonCode: normalizedReasonCode },
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.httpStatus || 400).json({
+      error: error.message,
+      ...(error.meta || {}),
+    });
   }
 };
 
@@ -259,6 +407,11 @@ exports.getStockAdjustments = async (req, res) => {
       orderBy: { createdAt: "desc" },
       take: 200,
     });
+    const reasons = await prisma.inventoryAdjustReason.findMany({
+      where: { branchId },
+      select: { code: true, label: true },
+    });
+    const reasonMap = new Map(reasons.map((x) => [x.code, x.label]));
     const productIds = [...new Set(items.map((x) => x.productId))];
     const products = productIds.length
       ? await prisma.product.findMany({
@@ -275,13 +428,43 @@ exports.getStockAdjustments = async (req, res) => {
         })
       : [];
     const ledgerMap = new Map(ledgers.map((l) => [l.refId, l]));
+    const approvalLogs = await prisma.auditLog.findMany({
+      where: { action: "APPROVAL_STOCK_ADJUSTMENT", entity: "StockAdjustment" },
+      orderBy: { createdAt: "desc" },
+      take: 1000,
+    });
+    const approvalByAdjustmentId = new Map();
+    for (const log of approvalLogs) {
+      const payload = log.payload || {};
+      if (Number(payload.branchId || 0) !== Number(branchId)) continue;
+      const candidateIds = [
+        Number(log.entityId || 0),
+        Number(payload?.resolvedEntityId || 0),
+        Number(payload?.request?.adjustmentId || 0),
+      ].filter(Boolean);
+      const status = String(payload.status || "PENDING").toUpperCase();
+      for (const adjId of candidateIds) {
+        if (!adjustmentIds.includes(adjId)) continue;
+        if (!approvalByAdjustmentId.has(adjId)) {
+          approvalByAdjustmentId.set(adjId, {
+            approvalStatus: status,
+            approvalEventId: log.id,
+            approvalRemark: payload?.review?.remark || "",
+          });
+        }
+      }
+    }
 
     res.json(
       items.map((x) => ({
         ...x,
         productName: productMap.get(x.productId) || `#${x.productId}`,
+        reasonLabel: x.reasonCode ? reasonMap.get(x.reasonCode) || x.reason : x.reason,
         warehouseId: ledgerMap.get(x.id)?.warehouseId || null,
         warehouseName: ledgerMap.get(x.id)?.warehouse?.name || "-",
+        approvalStatus: approvalByAdjustmentId.get(x.id)?.approvalStatus || null,
+        approvalEventId: approvalByAdjustmentId.get(x.id)?.approvalEventId || null,
+        approvalRemark: approvalByAdjustmentId.get(x.id)?.approvalRemark || "",
       }))
     );
   } catch (error) {
@@ -295,6 +478,8 @@ exports.updateStockAdjustment = async (req, res) => {
     const adjustmentId = Number(req.params.id);
     const nextQty = Number(req.body.qtyChange);
     const nextReason = String(req.body.reason || "manual_adjustment");
+    const nextReasonCode = clean(req.body.reasonCode, 40).toUpperCase() || null;
+    const managerApprovalPin = String(req.body?.managerApprovalPin || "");
     const nextWarehouseId = req.body.warehouseId ? Number(req.body.warehouseId) : null;
     if (Number.isNaN(adjustmentId) || !Number.isInteger(nextQty) || nextQty === 0) {
       return res.status(400).json({ error: "Invalid adjustment update payload" });
@@ -309,7 +494,13 @@ exports.updateStockAdjustment = async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Adjustment not found" });
 
     const delta = nextQty - existing.qtyChange;
+    await ensureOpenFiscalPeriod(branchId, new Date());
     await prisma.$transaction(async (tx) => {
+      const reasonMap = await getReasonMap(tx, branchId);
+      const reasonRule = nextReasonCode ? reasonMap.get(nextReasonCode) : null;
+      if (nextReasonCode && !reasonRule) throw new Error("Invalid reasonCode");
+      if (reasonRule?.direction === "IN" && nextQty < 0) throw new Error("Selected reason only supports positive adjustment");
+      if (reasonRule?.direction === "OUT" && nextQty > 0) throw new Error("Selected reason only supports negative adjustment");
       if (nextWarehouseId) {
         const warehouse = await tx.warehouse.findFirst({
           where: { id: nextWarehouseId, branchId },
@@ -321,6 +512,46 @@ exports.updateStockAdjustment = async (req, res) => {
       });
       if (!product) throw new Error("Product not found");
       if (product.stock + delta < 0) throw new Error("Negative stock not allowed");
+      if (
+        requiresWriteOffApproval({
+          reasonRule,
+          qty: nextQty,
+          unitPrice: Number(product.price || 0),
+        }) &&
+        managerApprovalPin !== getManagerPin()
+      ) {
+        const requiredAmount = Number((Math.abs(nextQty) * Number(product.price || 0)).toFixed(2));
+        const approvalEvent = await tx.auditLog.create({
+          data: {
+            userId: req.user?.id || null,
+            action: "APPROVAL_STOCK_ADJUSTMENT",
+            entity: "StockAdjustment",
+            entityId: adjustmentId,
+            payload: {
+              status: "PENDING",
+              reason: "Manager PIN required for high-value write-off update",
+              amount: requiredAmount,
+              threshold: getInventoryWriteOffApprovalThreshold(),
+              productId: product.id,
+              reasonCode: reasonRule?.code || null,
+              qtyChange: nextQty,
+              branchId,
+              request: {
+                mode: "UPDATE",
+                adjustmentId,
+                qtyChange: nextQty,
+                reason: nextReason || reasonRule?.label || "manual_adjustment",
+                reasonCode: reasonRule?.code || null,
+                warehouseId: nextWarehouseId || null,
+              },
+            },
+          },
+        });
+        const err = new Error("Manager approval PIN required for high-value write-off");
+        err.httpStatus = 403;
+        err.meta = { approvalEventId: approvalEvent.id, requiredAmount };
+        throw err;
+      }
 
       await tx.product.update({
         where: { id: product.id },
@@ -328,7 +559,29 @@ exports.updateStockAdjustment = async (req, res) => {
       });
       await tx.stockAdjustment.update({
         where: { id: adjustmentId },
-        data: { qtyChange: nextQty, reason: nextReason },
+        data: {
+          qtyChange: nextQty,
+          reason: nextReason || reasonRule?.label || "manual_adjustment",
+          reasonCode: reasonRule?.code || null,
+        },
+      });
+      const journalId = reasonRule
+        ? await upsertAdjustmentJournal(tx, {
+            adjustmentId,
+            branchId,
+            qty: nextQty,
+            unitPrice: Number(product.price || 0),
+            productName: product.name,
+            reason: reasonRule,
+          })
+        : null;
+      if (!reasonRule && existing.journalId) {
+        await tx.journalLine.deleteMany({ where: { journalId: existing.journalId } });
+        await tx.journal.delete({ where: { id: existing.journalId } });
+      }
+      await tx.stockAdjustment.update({
+        where: { id: adjustmentId },
+        data: { journalId: journalId || null },
       });
       await tx.stockLedger.updateMany({
         where: { branchId, refType: "STOCK_ADJUSTMENT", refId: adjustmentId },
@@ -343,7 +596,10 @@ exports.updateStockAdjustment = async (req, res) => {
 
     res.json({ message: "Stock adjustment updated" });
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    res.status(error.httpStatus || 400).json({
+      error: error.message,
+      ...(error.meta || {}),
+    });
   }
 };
 
@@ -358,6 +614,7 @@ exports.deleteStockAdjustment = async (req, res) => {
     });
     if (!existing) return res.status(404).json({ error: "Adjustment not found" });
 
+    await ensureOpenFiscalPeriod(branchId, new Date());
     await prisma.$transaction(async (tx) => {
       const product = await tx.product.findFirst({
         where: { id: existing.productId, branchId },
@@ -372,12 +629,106 @@ exports.deleteStockAdjustment = async (req, res) => {
       await tx.stockLedger.deleteMany({
         where: { branchId, refType: "STOCK_ADJUSTMENT", refId: adjustmentId },
       });
+      if (existing.journalId) {
+        await tx.journalLine.deleteMany({ where: { journalId: existing.journalId } });
+        await tx.journal.delete({ where: { id: existing.journalId } });
+      }
       await tx.stockAdjustment.delete({ where: { id: adjustmentId } });
     });
 
     res.json({ message: "Stock adjustment deleted" });
   } catch (error) {
     res.status(400).json({ error: error.message });
+  }
+};
+
+exports.listInventoryAdjustReasons = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const active = String(req.query?.active || "").trim();
+    const rows = await prisma.inventoryAdjustReason.findMany({
+      where: {
+        branchId,
+        ...(active === "1" ? { isActive: true } : {}),
+      },
+      orderBy: [{ isActive: "desc" }, { code: "asc" }],
+      take: 500,
+    });
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.createInventoryAdjustReason = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const code = clean(req.body?.code, 40).toUpperCase();
+    const label = clean(req.body?.label, 120);
+    const direction = clean(req.body?.direction, 10).toUpperCase() || "BOTH";
+    const accountingImpact = clean(req.body?.accountingImpact, 20).toUpperCase() || "NONE";
+    const accountCode = clean(req.body?.accountCode, 20) || null;
+    if (!code || !label) return res.status(400).json({ error: "code and label are required" });
+    if (!["IN", "OUT", "BOTH"].includes(direction)) return res.status(400).json({ error: "direction must be IN/OUT/BOTH" });
+    if (!["NONE", "WRITE_OFF", "GAIN"].includes(accountingImpact)) {
+      return res.status(400).json({ error: "accountingImpact must be NONE/WRITE_OFF/GAIN" });
+    }
+    const row = await prisma.inventoryAdjustReason.create({
+      data: {
+        branchId,
+        code,
+        label,
+        direction,
+        accountingImpact,
+        accountCode,
+        isActive: req.body?.isActive !== false,
+      },
+    });
+    res.status(201).json(row);
+  } catch (error) {
+    if (String(error?.code) === "P2002") return res.status(409).json({ error: "Reason code already exists" });
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.updateInventoryAdjustReason = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid reason id" });
+    const existing = await prisma.inventoryAdjustReason.findFirst({ where: { id, branchId } });
+    if (!existing) return res.status(404).json({ error: "Reason not found" });
+    const nextCode = req.body?.code != null ? clean(req.body.code, 40).toUpperCase() : existing.code;
+    const nextLabel = req.body?.label != null ? clean(req.body.label, 120) : existing.label;
+    const nextDirection = req.body?.direction != null ? clean(req.body.direction, 10).toUpperCase() : existing.direction;
+    const nextImpact =
+      req.body?.accountingImpact != null
+        ? clean(req.body.accountingImpact, 20).toUpperCase()
+        : existing.accountingImpact;
+    const nextAccountCode =
+      req.body?.accountCode != null ? clean(req.body.accountCode, 20) || null : existing.accountCode;
+    const nextIsActive = req.body?.isActive != null ? Boolean(req.body.isActive) : existing.isActive;
+
+    if (!nextCode || !nextLabel) return res.status(400).json({ error: "code and label are required" });
+    if (!["IN", "OUT", "BOTH"].includes(nextDirection)) return res.status(400).json({ error: "direction must be IN/OUT/BOTH" });
+    if (!["NONE", "WRITE_OFF", "GAIN"].includes(nextImpact)) {
+      return res.status(400).json({ error: "accountingImpact must be NONE/WRITE_OFF/GAIN" });
+    }
+    const row = await prisma.inventoryAdjustReason.update({
+      where: { id },
+      data: {
+        code: nextCode,
+        label: nextLabel,
+        direction: nextDirection,
+        accountingImpact: nextImpact,
+        accountCode: nextAccountCode,
+        isActive: nextIsActive,
+      },
+    });
+    res.json(row);
+  } catch (error) {
+    if (String(error?.code) === "P2002") return res.status(409).json({ error: "Reason code already exists" });
+    res.status(500).json({ error: error.message });
   }
 };
 

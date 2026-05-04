@@ -55,6 +55,10 @@ app.use("/api/approvals", approvalRoutes);
 app.use("/api/promotions", promotionRoutes);
 app.use("/api/gift-cards", require("./modules/giftcard/giftCardRoutes"));
 app.use("/api/finance", require("./modules/finance/financeRoutes"));
+app.use("/api/cheques", require("./modules/cheque/chequeRoutes"));
+app.use("/api/assets", require("./modules/assets/assetRoutes"));
+app.use("/api/cost-centers", require("./modules/costcenter/costCenterRoutes"));
+app.use("/api/petty-cash", require("./modules/pettycash/pettyCashRoutes"));
 app.use("/api/integration/webhooks", require("./modules/integration/webhookRoutes"));
 
 app.get("/", function (req, res) {

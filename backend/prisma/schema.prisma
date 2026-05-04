@@ -8,218 +8,262 @@ datasource db {
 }
 
 model Product {
-  id            Int            @id @default(autoincrement())
-  branchId      Int
-  categoryId    Int?
-  taxProfileId  Int?
-  name          String
-  price         Float
-  stock         Int            @default(0)
-  reorderLevel  Int            @default(0)
-  category      String?
-  sku           String?
-  vatRate       Float          @default(0)
+  id                   Int                 @id @default(autoincrement())
+  branchId             Int
+  categoryId           Int?
+  taxProfileId         Int?
+  name                 String
+  price                Float
+  stock                Int                 @default(0)
+  reorderLevel         Int                 @default(0)
+  category             String?
+  sku                  String?
+  vatRate              Float               @default(0)
   defaultDiscountType  String?
-  defaultDiscountValue Float    @default(0)
-  batchTracked  Boolean        @default(false)
-  sellByWeight  Boolean        @default(false)
-  stockKg       Float          @default(0)
-  hasVariants   Boolean        @default(false)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
-  saleItems     SaleItem[]
-  variants      ProductVariant[]
-  branch        Branch         @relation(fields: [branchId], references: [id])
-  categoryRef   ProductCategory? @relation(fields: [categoryId], references: [id])
-  taxProfile    TaxProfile?    @relation(fields: [taxProfileId], references: [id])
-  purchaseItems PurchaseItem[]
-  stockLedger   StockLedger[]
-  stockTransferFrom StockTransferItem[] @relation("TransferFromProduct")
-  stockTransferTo   StockTransferItem[] @relation("TransferToProduct")
-  saleReturnItems SaleReturnItem[]
-  promotionRules PromotionRule[]
-  inventoryBatches InventoryBatch[]
+  defaultDiscountValue Float               @default(0)
+  batchTracked         Boolean             @default(false)
+  sellByWeight         Boolean             @default(false)
+  stockKg              Float               @default(0)
+  hasVariants          Boolean             @default(false)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  saleItems            SaleItem[]
+  variants             ProductVariant[]
+  branch               Branch              @relation(fields: [branchId], references: [id])
+  categoryRef          ProductCategory?    @relation(fields: [categoryId], references: [id])
+  taxProfile           TaxProfile?         @relation(fields: [taxProfileId], references: [id])
+  purchaseItems        PurchaseItem[]
+  stockLedger          StockLedger[]
+  stockTransferFrom    StockTransferItem[] @relation("TransferFromProduct")
+  stockTransferTo      StockTransferItem[] @relation("TransferToProduct")
+  saleReturnItems      SaleReturnItem[]
+  promotionRules       PromotionRule[]
+  inventoryBatches     InventoryBatch[]
 
   @@unique([branchId, sku])
 }
 
 model ProductVariant {
-  id           Int       @id @default(autoincrement())
-  branchId    Int
-  productId    Int
-  label       String    @default("")
-  sku          String?
-  barcode      String?
-  stock        Int       @default(0)
+  id            Int        @id @default(autoincrement())
+  branchId      Int
+  productId     Int
+  label         String     @default("")
+  sku           String?
+  barcode       String?
+  stock         Int        @default(0)
   priceOverride Float?
-  sortOrder    Int       @default(0)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  branch       Branch    @relation(fields: [branchId], references: [id])
-  product      Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
-  saleItems    SaleItem[]
+  sortOrder     Int        @default(0)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  branch        Branch     @relation(fields: [branchId], references: [id])
+  product       Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  saleItems     SaleItem[]
 
   @@unique([branchId, barcode])
   @@index([branchId, productId])
 }
 
 model Sale {
-  id             Int          @id @default(autoincrement())
-  branchId       Int
-  cashierId      Int?
-  invoiceNo      String?
-  subTotal       Float        @default(0)
-  vatAmount      Float        @default(0)
-  discount       Float        @default(0)
-  total          Float
-  paidAmount     Float        @default(0)
-  dueAmount      Float        @default(0)
-  paymentMethod  String       @default("Cash")
-  paymentChannel String?
-  notes          String?
-  customerId     Int?
-  status         String       @default("completed")
-  buyerBinOrNidNote   String?
-  mushakDocumentNo    String?
+  id                   Int      @id @default(autoincrement())
+  branchId             Int
+  cashierId            Int?
+  invoiceNo            String?
+  subTotal             Float    @default(0)
+  vatAmount            Float    @default(0)
+  discount             Float    @default(0)
+  total                Float
+  paidAmount           Float    @default(0)
+  dueAmount            Float    @default(0)
+  paymentMethod        String   @default("Cash")
+  paymentChannel       String?
+  notes                String?
+  customerId           Int?
+  status               String   @default("completed")
+  buyerBinOrNidNote    String?
+  mushakDocumentNo     String?
   vatBreakdownSnapshot Json?
-  couponCodeId   Int?
-  couponDiscount Float        @default(0)
-  createdAt      DateTime     @default(now())
+  couponCodeId         Int?
+  couponDiscount       Float    @default(0)
+  createdAt            DateTime @default(now())
 
-  branch         Branch       @relation(fields: [branchId], references: [id])
-  cashier        User?        @relation(fields: [cashierId], references: [id])
-  customer       Customer?    @relation(fields: [customerId], references: [id])
-  couponCode     CouponCode?  @relation(fields: [couponCodeId], references: [id])
-  items          SaleItem[]
-  journals       Journal[]
-  returns        SaleReturn[]
-  salePayments   SalePayment[]
+  branch          Branch           @relation(fields: [branchId], references: [id])
+  cashier         User?            @relation(fields: [cashierId], references: [id])
+  customer        Customer?        @relation(fields: [customerId], references: [id])
+  couponCode      CouponCode?      @relation(fields: [couponCodeId], references: [id])
+  items           SaleItem[]
+  journals        Journal[]
+  returns         SaleReturn[]
+  salePayments    SalePayment[]
   storedValueTxns StoredValueTxn[]
 
   @@unique([branchId, invoiceNo])
 }
 
 model SaleItem {
-  id                Int             @id @default(autoincrement())
-  saleId            Int
+  id               Int             @id @default(autoincrement())
+  saleId           Int
   productId        Int
-  productVariantId  Int?
-  qty               Float
-  weightKg          Float?
-  price             Float
-  cost              Float           @default(0)
-  sale              Sale            @relation(fields: [saleId], references: [id])
-  product           Product         @relation(fields: [productId], references: [id])
-  productVariant    ProductVariant? @relation(fields: [productVariantId], references: [id])
+  productVariantId Int?
+  qty              Float
+  weightKg         Float?
+  price            Float
+  cost             Float           @default(0)
+  sale             Sale            @relation(fields: [saleId], references: [id])
+  product          Product         @relation(fields: [productId], references: [id])
+  productVariant   ProductVariant? @relation(fields: [productVariantId], references: [id])
   batchAllocations SaleItemBatch[]
 }
 
 model Customer {
-  id             Int         @id @default(autoincrement())
-  branchId       Int
-  name           String
-  phone          String?
-  address        String?
-  birthDate      DateTime?
-  marketingOptIn Boolean     @default(true)
-  balance        Float       @default(0)
-  creditLimit    Float       @default(0) // 0 = unlimited; >0 = max outstanding balance
-  storedValueBalance Float   @default(0)
-  createdAt      DateTime    @default(now())
-  branch    Branch      @relation(fields: [branchId], references: [id])
-  sales     Sale[]
-  receipts  ReceiptVoucher[]
-  giftCards GiftCard[]
-  storedValueTxns StoredValueTxn[]
+  id                 Int              @id @default(autoincrement())
+  branchId           Int
+  name               String
+  phone              String?
+  address            String?
+  birthDate          DateTime?
+  marketingOptIn     Boolean          @default(true)
+  balance            Float            @default(0)
+  creditLimit        Float            @default(0) // 0 = unlimited; >0 = max outstanding balance
+  storedValueBalance Float            @default(0)
+  createdAt          DateTime         @default(now())
+  branch             Branch           @relation(fields: [branchId], references: [id])
+  sales              Sale[]
+  receipts           ReceiptVoucher[]
+  giftCards          GiftCard[]
+  storedValueTxns    StoredValueTxn[]
+  cheques            Cheque[]
 }
 
 model Branch {
-  id           Int              @id @default(autoincrement())
-  code         String           @unique
-  name         String
-  address      String?
-  phone        String?
-  isActive     Boolean          @default(true)
-  sellerBin         String?
-  tradeLicenseNo    String?
-  vatRegistrationLabel String?
-  createdAt    DateTime         @default(now())
-  users        User[]
-  products     Product[]
-  productVariants ProductVariant[]
-  sales        Sale[]
-  customers    Customer[]
-  suppliers    Supplier[]
-  purchases    Purchase[]
-  warehouses   Warehouse[]
-  registers    CashRegister[]
-  journals     Journal[]
-  expenses     Expense[]
-  accounts     Account[]
-  stockAdjustments StockAdjustment[]
-  stockTransfersFrom StockTransfer[] @relation("TransferFromBranch")
-  stockTransfersTo   StockTransfer[] @relation("TransferToBranch")
-  taxProfiles   TaxProfile[]
-  promotionRules PromotionRule[]
-  inventoryBatches   InventoryBatch[]
-  documentSequences  BranchDocumentSeq[]
-  giftCards          GiftCard[]
-  paymentSettlements PaymentSettlement[]
-  couponCodes          CouponCode[]
-  bankStatementImports BankStatementImport[]
-  webhookSubscriptions WebhookSubscription[]
+  id                     Int                     @id @default(autoincrement())
+  code                   String                  @unique
+  name                   String
+  address                String?
+  phone                  String?
+  isActive               Boolean                 @default(true)
+  sellerBin              String?
+  tradeLicenseNo         String?
+  vatRegistrationLabel   String?
+  createdAt              DateTime                @default(now())
+  users                  User[]
+  products               Product[]
+  productVariants        ProductVariant[]
+  sales                  Sale[]
+  customers              Customer[]
+  suppliers              Supplier[]
+  purchases              Purchase[]
+  warehouses             Warehouse[]
+  registers              CashRegister[]
+  journals               Journal[]
+  expenses               Expense[]
+  accounts               Account[]
+  stockAdjustments       StockAdjustment[]
+  inventoryAdjustReasons InventoryAdjustReason[]
+  stockTransfersFrom     StockTransfer[]         @relation("TransferFromBranch")
+  stockTransfersTo       StockTransfer[]         @relation("TransferToBranch")
+  taxProfiles            TaxProfile[]
+  promotionRules         PromotionRule[]
+  inventoryBatches       InventoryBatch[]
+  documentSequences      BranchDocumentSeq[]
+  giftCards              GiftCard[]
+  paymentSettlements     PaymentSettlement[]
+  couponCodes            CouponCode[]
+  bankStatementImports   BankStatementImport[]
+  webhookSubscriptions   WebhookSubscription[]
+  cheques                Cheque[]
+  assets                 Asset[]
+  costCenters            CostCenter[]
+  pettyCashFunds         PettyCashFund[]
+  pettyCashTxns          PettyCashTxn[]
+  pettyCashClaims        PettyCashClaim[]
 }
 
 model CouponCode {
-  id                Int       @id @default(autoincrement())
-  branchId          Int
-  code              String
-  discountType      String    @default("PERCENT")
-  discountValue     Float
-  minBasketAmount   Float     @default(0)
-  maxRedemptions    Int       @default(0)
-  redemptionCount   Int       @default(0)
-  isActive          Boolean   @default(true)
-  startsAt          DateTime?
-  endsAt            DateTime?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  id              Int       @id @default(autoincrement())
+  branchId        Int
+  code            String
+  discountType    String    @default("PERCENT")
+  discountValue   Float
+  minBasketAmount Float     @default(0)
+  maxRedemptions  Int       @default(0)
+  redemptionCount Int       @default(0)
+  isActive        Boolean   @default(true)
+  startsAt        DateTime?
+  endsAt          DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-  branch            Branch    @relation(fields: [branchId], references: [id])
-  sales             Sale[]
+  branch Branch @relation(fields: [branchId], references: [id])
+  sales  Sale[]
 
   @@unique([branchId, code])
   @@index([branchId])
 }
 
 model BankStatementImport {
-  id         Int                 @id @default(autoincrement())
-  branchId   Int
-  label      String?
-  rowCount   Int                 @default(0)
-  importedAt DateTime            @default(now())
-  meta       Json?
+  id          Int       @id @default(autoincrement())
+  branchId    Int
+  label       String?
+  rowCount    Int       @default(0)
+  importedAt  DateTime  @default(now())
+  meta        Json?
+  status      String    @default("OPEN")
+  closedAt    DateTime?
+  closedById  Int?
+  closingNote String?
 
-  branch     Branch              @relation(fields: [branchId], references: [id])
-  lines      BankStatementLine[]
+  branch   Branch              @relation(fields: [branchId], references: [id])
+  lines    BankStatementLine[]
+  closedBy User?               @relation("BankImportCloser", fields: [closedById], references: [id])
 
   @@index([branchId])
 }
 
 model BankStatementLine {
-  id                   Int                 @id @default(autoincrement())
-  importId             Int
-  txnDate              DateTime
-  description          String?
-  amount               Float
-  direction            String              @default("CREDIT")
-  reference            String?
-  matchedSalePaymentId Int?                @unique
-  matchedAt            DateTime?
-  matchNote            String?
+  id                    Int       @id @default(autoincrement())
+  importId              Int
+  txnDate               DateTime
+  description           String?
+  amount                Float
+  direction             String    @default("CREDIT")
+  reference             String?
+  matchedSalePaymentId  Int?      @unique
+  matchedChequeId       Int?      @unique
+  matchedAt             DateTime?
+  matchNote             String?
+  exceptionStatus       String    @default("NONE")
+  exceptionReason       String?
+  exceptionNote         String?
+  exceptionRaisedAt     DateTime?
+  exceptionResolvedAt   DateTime?
+  exceptionResolvedById Int?
 
-  import               BankStatementImport @relation(fields: [importId], references: [id], onDelete: Cascade)
-  matchedSalePayment   SalePayment?        @relation(fields: [matchedSalePaymentId], references: [id])
+  import              BankStatementImport       @relation(fields: [importId], references: [id], onDelete: Cascade)
+  matchedSalePayment  SalePayment?              @relation(fields: [matchedSalePaymentId], references: [id])
+  matchedCheque       Cheque?                   @relation(fields: [matchedChequeId], references: [id])
+  exceptionResolvedBy User?                     @relation("BankLineExceptionResolver", fields: [exceptionResolvedById], references: [id])
+  allocations         BankStatementAllocation[]
+}
+
+model BankStatementAllocation {
+  id            Int      @id @default(autoincrement())
+  branchId      Int
+  lineId        Int
+  targetType    String
+  salePaymentId Int?
+  chequeId      Int?
+  amount        Float
+  note          String?
+  createdById   Int?
+  createdAt     DateTime @default(now())
+
+  line        BankStatementLine @relation(fields: [lineId], references: [id], onDelete: Cascade)
+  salePayment SalePayment?      @relation(fields: [salePaymentId], references: [id])
+  cheque      Cheque?           @relation(fields: [chequeId], references: [id])
+  createdBy   User?             @relation(fields: [createdById], references: [id])
+
+  @@index([branchId, lineId])
+  @@index([branchId, targetType])
 }
 
 model WebhookSubscription {
@@ -232,7 +276,7 @@ model WebhookSubscription {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  branch    Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
 
   @@index([branchId])
 }
@@ -249,20 +293,20 @@ model BranchDocumentSeq {
 }
 
 model InventoryBatch {
-  id             Int       @id @default(autoincrement())
-  branchId       Int
-  productId      Int
-  batchCode      String
-  expiryDate     DateTime?
-  qtyOnHand      Int       @default(0)
-  unitCost       Float     @default(0)
+  id               Int       @id @default(autoincrement())
+  branchId         Int
+  productId        Int
+  batchCode        String
+  expiryDate       DateTime?
+  qtyOnHand        Int       @default(0)
+  unitCost         Float     @default(0)
   legacyAuditLogId Int?
-  note           String?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  note             String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
-  branch         Branch    @relation(fields: [branchId], references: [id])
-  product        Product   @relation(fields: [productId], references: [id])
+  branch          Branch          @relation(fields: [branchId], references: [id])
+  product         Product         @relation(fields: [productId], references: [id])
   saleItemBatches SaleItemBatch[]
 
   @@unique([branchId, productId, batchCode])
@@ -275,27 +319,28 @@ model SaleItemBatch {
   batchId    Int
   qty        Int
 
-  saleItem   SaleItem        @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
-  batch      InventoryBatch  @relation(fields: [batchId], references: [id])
+  saleItem SaleItem       @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
+  batch    InventoryBatch @relation(fields: [batchId], references: [id])
 
   @@index([saleItemId])
   @@index([batchId])
 }
 
 model SalePayment {
-  id             Int       @id @default(autoincrement())
-  saleId         Int
-  method         String
-  channel        String?
-  amount         Float
-  meta           Json?
-  reconciledAt   DateTime?
-  settlementId   Int?
-  createdAt      DateTime  @default(now())
+  id           Int       @id @default(autoincrement())
+  saleId       Int
+  method       String
+  channel      String?
+  amount       Float
+  meta         Json?
+  reconciledAt DateTime?
+  settlementId Int?
+  createdAt    DateTime  @default(now())
 
-  sale             Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
-  settlement       PaymentSettlement? @relation(fields: [settlementId], references: [id])
+  sale              Sale                      @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  settlement        PaymentSettlement?        @relation(fields: [settlementId], references: [id])
   bankStatementLine BankStatementLine?
+  bankAllocations   BankStatementAllocation[]
 
   @@index([saleId])
   @@index([method, reconciledAt])
@@ -304,146 +349,212 @@ model SalePayment {
 }
 
 model PaymentSettlement {
-  id           Int      @id @default(autoincrement())
-  branchId     Int
-  provider     String
-  periodStart  DateTime
-  periodEnd    DateTime
-  grossAmount  Float
-  feeAmount    Float   @default(0)
-  netAmount    Float
-  externalRef  String?
-  importedAt   DateTime @default(now())
-  meta         Json?
+  id          Int      @id @default(autoincrement())
+  branchId    Int
+  provider    String
+  periodStart DateTime
+  periodEnd   DateTime
+  grossAmount Float
+  feeAmount   Float    @default(0)
+  netAmount   Float
+  externalRef String?
+  importedAt  DateTime @default(now())
+  meta        Json?
 
-  branch       Branch @relation(fields: [branchId], references: [id])
-  payments     SalePayment[]
+  branch   Branch        @relation(fields: [branchId], references: [id])
+  payments SalePayment[]
+}
+
+model Cheque {
+  id           Int       @id @default(autoincrement())
+  branchId     Int
+  direction    String
+  chequeNo     String
+  bankName     String
+  bankBranch   String?
+  accountName  String?
+  accountNo    String?
+  drawerName   String?
+  payeeName    String?
+  amount       Float
+  chequeDate   DateTime
+  depositDate  DateTime?
+  clearedDate  DateTime?
+  bounceDate   DateTime?
+  status       String    @default("PENDING")
+  bounceReason String?
+  bounceFee    Float     @default(0)
+  linkedType   String?
+  linkedId     Int?
+  customerId   Int?
+  supplierId   Int?
+  notes        String?
+  createdById  Int?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  branch          Branch                    @relation(fields: [branchId], references: [id])
+  customer        Customer?                 @relation(fields: [customerId], references: [id])
+  supplier        Supplier?                 @relation(fields: [supplierId], references: [id])
+  creator         User?                     @relation("ChequeCreator", fields: [createdById], references: [id])
+  events          ChequeEvent[]
+  matchedBankLine BankStatementLine?
+  bankAllocations BankStatementAllocation[]
+
+  @@unique([branchId, direction, bankName, chequeNo])
+  @@index([branchId, status])
+  @@index([branchId, chequeDate])
+  @@index([branchId, depositDate])
+}
+
+model ChequeEvent {
+  id         Int      @id @default(autoincrement())
+  chequeId   Int
+  eventType  String
+  fromStatus String?
+  toStatus   String?
+  notes      String?
+  actorId    Int?
+  createdAt  DateTime @default(now())
+
+  cheque Cheque @relation(fields: [chequeId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorId], references: [id])
+
+  @@index([chequeId])
 }
 
 model GiftCard {
-  id         Int      @id @default(autoincrement())
+  id         Int       @id @default(autoincrement())
   branchId   Int
-  code       String   @unique
-  balance    Float    @default(0)
-  status     String   @default("ACTIVE")
+  code       String    @unique
+  balance    Float     @default(0)
+  status     String    @default("ACTIVE")
   expiresAt  DateTime?
   customerId Int?
-  createdAt  DateTime @default(now())
+  createdAt  DateTime  @default(now())
 
-  branch     Branch   @relation(fields: [branchId], references: [id])
-  customer   Customer? @relation(fields: [customerId], references: [id])
+  branch       Branch           @relation(fields: [branchId], references: [id])
+  customer     Customer?        @relation(fields: [customerId], references: [id])
   transactions StoredValueTxn[]
 
   @@index([branchId])
 }
 
 model StoredValueTxn {
-  id          Int      @id @default(autoincrement())
-  giftCardId  Int?
-  customerId  Int?
-  saleId      Int?
-  type        String
-  amount      Float
-  note        String?
-  createdAt   DateTime @default(now())
+  id         Int      @id @default(autoincrement())
+  giftCardId Int?
+  customerId Int?
+  saleId     Int?
+  type       String
+  amount     Float
+  note       String?
+  createdAt  DateTime @default(now())
 
-  giftCard    GiftCard? @relation(fields: [giftCardId], references: [id])
-  customer    Customer? @relation(fields: [customerId], references: [id])
-  sale        Sale?     @relation(fields: [saleId], references: [id])
+  giftCard GiftCard? @relation(fields: [giftCardId], references: [id])
+  customer Customer? @relation(fields: [customerId], references: [id])
+  sale     Sale?     @relation(fields: [saleId], references: [id])
 
   @@index([giftCardId])
   @@index([saleId])
 }
 
 model PromotionRule {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  name            String
-  type            String
-  productId       Int?
-  category        String?
-  buyQty          Int       @default(1)
-  getQty          Int       @default(1)
-  discountValue   Float     @default(0)
-  bundlePrice     Float?
+  id               Int       @id @default(autoincrement())
+  branchId         Int
+  name             String
+  type             String
+  productId        Int?
+  category         String?
+  buyQty           Int       @default(1)
+  getQty           Int       @default(1)
+  discountValue    Float     @default(0)
+  bundlePrice      Float?
   bundleProductIds String?
-  minBasketAmount Float     @default(0)
-  isActive        Boolean   @default(true)
-  startsAt        DateTime?
-  endsAt          DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  branch          Branch    @relation(fields: [branchId], references: [id])
-  product         Product?  @relation(fields: [productId], references: [id])
+  minBasketAmount  Float     @default(0)
+  isActive         Boolean   @default(true)
+  startsAt         DateTime?
+  endsAt           DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  branch           Branch    @relation(fields: [branchId], references: [id])
+  product          Product?  @relation(fields: [productId], references: [id])
 
   @@index([branchId, isActive])
 }
 
 model Role {
-  id           Int              @id @default(autoincrement())
-  name         String           @unique
-  users        User[]
+  id              Int              @id @default(autoincrement())
+  name            String           @unique
+  users           User[]
   rolePermissions RolePermission[]
 }
 
 model Permission {
-  id            Int             @id @default(autoincrement())
-  code          String          @unique
-  description   String?
+  id              Int              @id @default(autoincrement())
+  code            String           @unique
+  description     String?
   rolePermissions RolePermission[]
 }
 
 model RolePermission {
-  id           Int         @id @default(autoincrement())
+  id           Int        @id @default(autoincrement())
   roleId       Int
   permissionId Int
-  role         Role        @relation(fields: [roleId], references: [id])
-  permission   Permission  @relation(fields: [permissionId], references: [id])
+  role         Role       @relation(fields: [roleId], references: [id])
+  permission   Permission @relation(fields: [permissionId], references: [id])
 
   @@unique([roleId, permissionId])
 }
 
 model User {
-  id            Int              @id @default(autoincrement())
-  branchId      Int
-  roleId        Int
-  name          String
-  email         String           @unique
-  passwordHash  String
-  language      String           @default("en")
-  isActive      Boolean          @default(true)
-  createdAt     DateTime         @default(now())
-  branch        Branch           @relation(fields: [branchId], references: [id])
-  role          Role             @relation(fields: [roleId], references: [id])
-  sales         Sale[]
-  shifts        Shift[]
-  drawerMovements DrawerMovement[]
-  journals      Journal[]
-  expenses      Expense[]
-  auditLogs     AuditLog[]
+  id                         Int                       @id @default(autoincrement())
+  branchId                   Int
+  roleId                     Int
+  name                       String
+  email                      String                    @unique
+  passwordHash               String
+  language                   String                    @default("en")
+  isActive                   Boolean                   @default(true)
+  createdAt                  DateTime                  @default(now())
+  branch                     Branch                    @relation(fields: [branchId], references: [id])
+  role                       Role                      @relation(fields: [roleId], references: [id])
+  sales                      Sale[]
+  shifts                     Shift[]
+  drawerMovements            DrawerMovement[]
+  journals                   Journal[]
+  expenses                   Expense[]
+  auditLogs                  AuditLog[]
+  chequesCreated             Cheque[]                  @relation("ChequeCreator")
+  chequeEvents               ChequeEvent[]
+  pettyCashTxns              PettyCashTxn[]
+  pettyCashClaimsCreated     PettyCashClaim[]          @relation("PettyCashClaimCreator")
+  pettyCashClaimsReviewed    PettyCashClaim[]          @relation("PettyCashClaimReviewer")
+  bankStatementAllocations   BankStatementAllocation[]
+  closedBankImports          BankStatementImport[]     @relation("BankImportCloser")
+  resolvedBankLineExceptions BankStatementLine[]       @relation("BankLineExceptionResolver")
 }
 
 model Shift {
-  id            Int         @id @default(autoincrement())
-  branchId      Int
-  userId        Int
-  registerId    Int
-  openedAt      DateTime    @default(now())
-  closedAt      DateTime?
-  openingCash   Float       @default(0)
-  closingCash   Float?
-  varianceReason String?
-  user          User        @relation(fields: [userId], references: [id])
-  register      CashRegister @relation(fields: [registerId], references: [id])
+  id              Int              @id @default(autoincrement())
+  branchId        Int
+  userId          Int
+  registerId      Int
+  openedAt        DateTime         @default(now())
+  closedAt        DateTime?
+  openingCash     Float            @default(0)
+  closingCash     Float?
+  varianceReason  String?
+  user            User             @relation(fields: [userId], references: [id])
+  register        CashRegister     @relation(fields: [registerId], references: [id])
   drawerMovements DrawerMovement[]
 }
 
 model CashRegister {
-  id            Int         @id @default(autoincrement())
-  branchId      Int
-  name          String
-  branch        Branch      @relation(fields: [branchId], references: [id])
-  shifts        Shift[]
+  id       Int     @id @default(autoincrement())
+  branchId Int
+  name     String
+  branch   Branch  @relation(fields: [branchId], references: [id])
+  shifts   Shift[]
 }
 
 model DrawerMovement {
@@ -460,242 +571,420 @@ model DrawerMovement {
 }
 
 model Warehouse {
-  id            Int           @id @default(autoincrement())
-  branchId      Int
-  name          String
-  branch        Branch        @relation(fields: [branchId], references: [id])
-  stockLedgers  StockLedger[]
+  id           Int           @id @default(autoincrement())
+  branchId     Int
+  name         String
+  branch       Branch        @relation(fields: [branchId], references: [id])
+  stockLedgers StockLedger[]
 }
 
 model StockLedger {
-  id            Int           @id @default(autoincrement())
-  branchId      Int
-  warehouseId   Int?
-  productId     Int
-  refType       String
-  refId         Int?
-  inQty         Int           @default(0)
-  outQty        Int           @default(0)
-  outWeightKg   Float?
-  inWeightKg    Float?
-  unitCost      Float         @default(0)
-  createdAt     DateTime      @default(now())
-  product       Product       @relation(fields: [productId], references: [id])
-  warehouse     Warehouse?    @relation(fields: [warehouseId], references: [id])
+  id          Int        @id @default(autoincrement())
+  branchId    Int
+  warehouseId Int?
+  productId   Int
+  refType     String
+  refId       Int?
+  inQty       Int        @default(0)
+  outQty      Int        @default(0)
+  outWeightKg Float?
+  inWeightKg  Float?
+  unitCost    Float      @default(0)
+  createdAt   DateTime   @default(now())
+  product     Product    @relation(fields: [productId], references: [id])
+  warehouse   Warehouse? @relation(fields: [warehouseId], references: [id])
 }
 
 model StockTransfer {
-  id              Int                @id @default(autoincrement())
-  fromBranchId    Int
-  toBranchId      Int
-  status          String             @default("draft")
-  createdAt       DateTime           @default(now())
-  fromBranch      Branch             @relation("TransferFromBranch", fields: [fromBranchId], references: [id])
-  toBranch        Branch             @relation("TransferToBranch", fields: [toBranchId], references: [id])
-  items           StockTransferItem[]
+  id           Int                 @id @default(autoincrement())
+  fromBranchId Int
+  toBranchId   Int
+  status       String              @default("draft")
+  createdAt    DateTime            @default(now())
+  fromBranch   Branch              @relation("TransferFromBranch", fields: [fromBranchId], references: [id])
+  toBranch     Branch              @relation("TransferToBranch", fields: [toBranchId], references: [id])
+  items        StockTransferItem[]
 }
 
 model StockTransferItem {
-  id              Int       @id @default(autoincrement())
-  transferId      Int
-  fromProductId   Int
-  toProductId     Int
-  qty             Int
-  transfer        StockTransfer @relation(fields: [transferId], references: [id])
-  fromProduct     Product   @relation("TransferFromProduct", fields: [fromProductId], references: [id])
-  toProduct       Product   @relation("TransferToProduct", fields: [toProductId], references: [id])
+  id            Int           @id @default(autoincrement())
+  transferId    Int
+  fromProductId Int
+  toProductId   Int
+  qty           Int
+  transfer      StockTransfer @relation(fields: [transferId], references: [id])
+  fromProduct   Product       @relation("TransferFromProduct", fields: [fromProductId], references: [id])
+  toProduct     Product       @relation("TransferToProduct", fields: [toProductId], references: [id])
 }
 
 model StockAdjustment {
-  id              Int        @id @default(autoincrement())
-  branchId        Int
-  productId       Int
-  qtyChange       Int
-  reason          String
-  createdAt       DateTime   @default(now())
-  branch          Branch     @relation(fields: [branchId], references: [id])
+  id         Int      @id @default(autoincrement())
+  branchId   Int
+  productId  Int
+  qtyChange  Int
+  reason     String
+  reasonCode String?
+  journalId  Int?
+  createdAt  DateTime @default(now())
+  branch     Branch   @relation(fields: [branchId], references: [id])
+  journal    Journal? @relation(fields: [journalId], references: [id])
+}
+
+model InventoryAdjustReason {
+  id               Int      @id @default(autoincrement())
+  branchId         Int
+  code             String
+  label            String
+  direction        String   @default("BOTH")
+  accountingImpact String   @default("NONE")
+  accountCode      String?
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, code])
+  @@index([branchId, isActive])
 }
 
 model Supplier {
-  id              Int            @id @default(autoincrement())
-  branchId        Int
-  name            String
-  phone           String?
-  address         String?
-  payableBalance  Float          @default(0)
-  createdAt       DateTime       @default(now())
-  branch          Branch         @relation(fields: [branchId], references: [id])
-  purchases       Purchase[]
-  payments        PaymentVoucher[]
+  id             Int              @id @default(autoincrement())
+  branchId       Int
+  name           String
+  phone          String?
+  address        String?
+  payableBalance Float            @default(0)
+  createdAt      DateTime         @default(now())
+  branch         Branch           @relation(fields: [branchId], references: [id])
+  purchases      Purchase[]
+  payments       PaymentVoucher[]
+  cheques        Cheque[]
 }
 
 model Purchase {
-  id              Int            @id @default(autoincrement())
-  branchId        Int
-  supplierId      Int
-  invoiceNo       String?
-  total           Float
-  paidAmount      Float          @default(0)
-  dueAmount       Float          @default(0)
-  createdAt       DateTime       @default(now())
-  branch          Branch         @relation(fields: [branchId], references: [id])
-  supplier        Supplier       @relation(fields: [supplierId], references: [id])
-  items           PurchaseItem[]
-  journals        Journal[]
-  returns         PurchaseReturn[]
+  id         Int              @id @default(autoincrement())
+  branchId   Int
+  supplierId Int
+  invoiceNo  String?
+  total      Float
+  paidAmount Float            @default(0)
+  dueAmount  Float            @default(0)
+  createdAt  DateTime         @default(now())
+  branch     Branch           @relation(fields: [branchId], references: [id])
+  supplier   Supplier         @relation(fields: [supplierId], references: [id])
+  items      PurchaseItem[]
+  journals   Journal[]
+  returns    PurchaseReturn[]
 
   @@unique([branchId, invoiceNo])
 }
 
 model PurchaseItem {
-  id              Int       @id @default(autoincrement())
-  purchaseId      Int
-  productId       Int
-  qty             Int
-  cost            Float
-  purchase        Purchase  @relation(fields: [purchaseId], references: [id])
-  product         Product   @relation(fields: [productId], references: [id])
+  id         Int      @id @default(autoincrement())
+  purchaseId Int
+  productId  Int
+  qty        Int
+  cost       Float
+  purchase   Purchase @relation(fields: [purchaseId], references: [id])
+  product    Product  @relation(fields: [productId], references: [id])
 }
 
 model PurchaseReturn {
-  id              Int       @id @default(autoincrement())
-  purchaseId      Int
-  amount          Float
-  reason          String?
-  createdAt       DateTime  @default(now())
-  purchase        Purchase  @relation(fields: [purchaseId], references: [id])
+  id         Int      @id @default(autoincrement())
+  purchaseId Int
+  amount     Float
+  reason     String?
+  createdAt  DateTime @default(now())
+  purchase   Purchase @relation(fields: [purchaseId], references: [id])
 }
 
 model SaleReturn {
-  id              Int              @id @default(autoincrement())
-  saleId          Int
-  amount          Float
-  reason          String?
-  createdAt       DateTime         @default(now())
-  sale            Sale             @relation(fields: [saleId], references: [id])
-  items           SaleReturnItem[]
+  id        Int              @id @default(autoincrement())
+  saleId    Int
+  amount    Float
+  reason    String?
+  createdAt DateTime         @default(now())
+  sale      Sale             @relation(fields: [saleId], references: [id])
+  items     SaleReturnItem[]
 }
 
 model SaleReturnItem {
-  id              Int         @id @default(autoincrement())
-  saleReturnId    Int
-  productId       Int
-  qty             Int
-  amount          Float
-  saleReturn      SaleReturn  @relation(fields: [saleReturnId], references: [id])
-  product         Product     @relation(fields: [productId], references: [id])
+  id           Int        @id @default(autoincrement())
+  saleReturnId Int
+  productId    Int
+  qty          Int
+  amount       Float
+  saleReturn   SaleReturn @relation(fields: [saleReturnId], references: [id])
+  product      Product    @relation(fields: [productId], references: [id])
 }
 
 model ProductCategory {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  name            String
-  products        Product[]
+  id       Int       @id @default(autoincrement())
+  branchId Int
+  name     String
+  products Product[]
 }
 
 model TaxProfile {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  name            String
-  rate            Float
-  branch          Branch    @relation(fields: [branchId], references: [id])
-  products        Product[]
+  id       Int       @id @default(autoincrement())
+  branchId Int
+  name     String
+  rate     Float
+  branch   Branch    @relation(fields: [branchId], references: [id])
+  products Product[]
 }
 
 model FiscalPeriod {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  name            String
-  startDate       DateTime
-  endDate         DateTime
-  isClosed        Boolean   @default(false)
+  id        Int      @id @default(autoincrement())
+  branchId  Int
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  isClosed  Boolean  @default(false)
 }
 
 model Account {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  code            String
-  name            String
-  type            String
-  isSystem        Boolean   @default(false)
-  createdAt       DateTime  @default(now())
-  branch          Branch    @relation(fields: [branchId], references: [id])
-  journalLines    JournalLine[]
+  id           Int           @id @default(autoincrement())
+  branchId     Int
+  code         String
+  name         String
+  type         String
+  isSystem     Boolean       @default(false)
+  createdAt    DateTime      @default(now())
+  branch       Branch        @relation(fields: [branchId], references: [id])
+  journalLines JournalLine[]
 
   @@unique([branchId, code])
 }
 
 model Journal {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  saleId          Int?
-  purchaseId      Int?
-  createdBy       Int?
-  refType         String
-  refId           Int?
-  narration       String?
-  createdAt       DateTime  @default(now())
-  branch          Branch    @relation(fields: [branchId], references: [id])
-  sale            Sale?     @relation(fields: [saleId], references: [id])
-  purchase        Purchase? @relation(fields: [purchaseId], references: [id])
-  creator         User?     @relation(fields: [createdBy], references: [id])
-  lines           JournalLine[]
+  id                       Int                      @id @default(autoincrement())
+  branchId                 Int
+  saleId                   Int?
+  purchaseId               Int?
+  createdBy                Int?
+  refType                  String
+  refId                    Int?
+  costCenterId             Int?
+  narration                String?
+  createdAt                DateTime                 @default(now())
+  branch                   Branch                   @relation(fields: [branchId], references: [id])
+  sale                     Sale?                    @relation(fields: [saleId], references: [id])
+  purchase                 Purchase?                @relation(fields: [purchaseId], references: [id])
+  creator                  User?                    @relation(fields: [createdBy], references: [id])
+  lines                    JournalLine[]
+  assetDepreciationEntries AssetDepreciationEntry[]
+  costCenter               CostCenter?              @relation(fields: [costCenterId], references: [id])
+  pettyCashTxns            PettyCashTxn[]
+  pettyCashClaims          PettyCashClaim[]
+  stockAdjustments         StockAdjustment[]
 }
 
 model Expense {
-  id            Int       @id @default(autoincrement())
+  id            Int         @id @default(autoincrement())
   branchId      Int
   createdBy     Int?
   category      String
   description   String?
   amount        Float
-  paymentMethod String    @default("Cash")
+  paymentMethod String      @default("Cash")
+  costCenterId  Int?
   expenseDate   DateTime
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  branch        Branch    @relation(fields: [branchId], references: [id])
-  creator       User?     @relation(fields: [createdBy], references: [id])
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  branch        Branch      @relation(fields: [branchId], references: [id])
+  creator       User?       @relation(fields: [createdBy], references: [id])
+  costCenter    CostCenter? @relation(fields: [costCenterId], references: [id])
 }
 
 model JournalLine {
-  id              Int       @id @default(autoincrement())
-  journalId       Int
-  accountId       Int
-  debit           Float     @default(0)
-  credit          Float     @default(0)
-  journal         Journal   @relation(fields: [journalId], references: [id])
-  account         Account   @relation(fields: [accountId], references: [id])
+  id        Int     @id @default(autoincrement())
+  journalId Int
+  accountId Int
+  debit     Float   @default(0)
+  credit    Float   @default(0)
+  journal   Journal @relation(fields: [journalId], references: [id])
+  account   Account @relation(fields: [accountId], references: [id])
 }
 
 model PaymentVoucher {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  supplierId      Int?
-  amount          Float
-  method          String
-  note            String?
-  createdAt       DateTime  @default(now())
-  supplier        Supplier? @relation(fields: [supplierId], references: [id])
+  id         Int       @id @default(autoincrement())
+  branchId   Int
+  supplierId Int?
+  amount     Float
+  method     String
+  note       String?
+  createdAt  DateTime  @default(now())
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
 }
 
 model ReceiptVoucher {
-  id              Int       @id @default(autoincrement())
-  branchId        Int
-  customerId      Int?
-  amount          Float
-  method          String
-  note            String?
-  createdAt       DateTime  @default(now())
-  customer        Customer? @relation(fields: [customerId], references: [id])
+  id         Int       @id @default(autoincrement())
+  branchId   Int
+  customerId Int?
+  amount     Float
+  method     String
+  note       String?
+  createdAt  DateTime  @default(now())
+  customer   Customer? @relation(fields: [customerId], references: [id])
 }
 
 model AuditLog {
-  id              Int       @id @default(autoincrement())
-  userId          Int?
-  action          String
-  entity          String
-  entityId        Int?
-  payload         Json?
-  createdAt       DateTime  @default(now())
-  user            User?     @relation(fields: [userId], references: [id])
+  id        Int      @id @default(autoincrement())
+  userId    Int?
+  action    String
+  entity    String
+  entityId  Int?
+  payload   Json?
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id])
+}
+
+model Asset {
+  id                      Int       @id @default(autoincrement())
+  branchId                Int
+  assetCode               String?
+  name                    String
+  category                String?
+  purchaseDate            DateTime
+  inServiceDate           DateTime
+  cost                    Float
+  salvageValue            Float     @default(0)
+  usefulLifeMonths        Int
+  depreciationMethod      String    @default("STRAIGHT_LINE")
+  accumulatedDepreciation Float     @default(0)
+  lastDepreciationDate    DateTime?
+  status                  String    @default("ACTIVE")
+  disposedAt              DateTime?
+  disposalValue           Float?
+  notes                   String?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  branch              Branch                   @relation(fields: [branchId], references: [id])
+  depreciationEntries AssetDepreciationEntry[]
+
+  @@unique([branchId, assetCode])
+  @@index([branchId, status])
+}
+
+model AssetDepreciationEntry {
+  id        Int      @id @default(autoincrement())
+  branchId  Int
+  assetId   Int
+  periodKey String
+  amount    Float
+  runDate   DateTime
+  journalId Int?
+  createdAt DateTime @default(now())
+
+  asset   Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  journal Journal? @relation(fields: [journalId], references: [id])
+
+  @@unique([assetId, periodKey])
+  @@index([branchId, periodKey])
+}
+
+model CostCenter {
+  id        Int      @id @default(autoincrement())
+  branchId  Int
+  code      String
+  name      String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch   Branch             @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  journals Journal[]
+  expenses Expense[]
+  budgets  CostCenterBudget[]
+
+  @@unique([branchId, code])
+  @@index([branchId, isActive])
+}
+
+model CostCenterBudget {
+  id            Int      @id @default(autoincrement())
+  branchId      Int
+  costCenterId  Int
+  periodKey     String
+  expenseBudget Float    @default(0)
+  revenueBudget Float    @default(0)
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  costCenter CostCenter @relation(fields: [costCenterId], references: [id], onDelete: Cascade)
+
+  @@unique([costCenterId, periodKey])
+  @@index([branchId, periodKey])
+}
+
+model PettyCashFund {
+  id             Int      @id @default(autoincrement())
+  branchId       Int
+  name           String
+  custodianName  String?
+  imprestAmount  Float    @default(0)
+  currentBalance Float    @default(0)
+  isActive       Boolean  @default(true)
+  note           String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  branch Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  txns   PettyCashTxn[]
+  claims PettyCashClaim[]
+
+  @@index([branchId, isActive])
+}
+
+model PettyCashTxn {
+  id          Int      @id @default(autoincrement())
+  branchId    Int
+  fundId      Int
+  type        String
+  amount      Float
+  txnDate     DateTime
+  description String?
+  journalId   Int?
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  branch          Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  fund            PettyCashFund    @relation(fields: [fundId], references: [id], onDelete: Cascade)
+  journal         Journal?         @relation(fields: [journalId], references: [id])
+  createdBy       User?            @relation(fields: [createdById], references: [id])
+  pettyCashClaims PettyCashClaim[]
+
+  @@index([branchId, fundId, txnDate])
+}
+
+model PettyCashClaim {
+  id             Int       @id @default(autoincrement())
+  branchId       Int
+  fundId         Int
+  txnId          Int?
+  amount         Float
+  claimDate      DateTime
+  description    String?
+  attachmentNote String?
+  status         String    @default("PENDING")
+  createdById    Int?
+  reviewedById   Int?
+  reviewedAt     DateTime?
+  reviewRemark   String?
+  journalId      Int?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  branch     Branch        @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  fund       PettyCashFund @relation(fields: [fundId], references: [id], onDelete: Cascade)
+  txn        PettyCashTxn? @relation(fields: [txnId], references: [id])
+  createdBy  User?         @relation("PettyCashClaimCreator", fields: [createdById], references: [id])
+  reviewedBy User?         @relation("PettyCashClaimReviewer", fields: [reviewedById], references: [id])
+  journal    Journal?      @relation(fields: [journalId], references: [id])
+
+  @@index([branchId, status, claimDate])
 }

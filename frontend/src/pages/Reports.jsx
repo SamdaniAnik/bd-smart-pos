@@ -23,6 +23,12 @@ function Reports() {
   const canExportAdvanced = hasPermission("accounting.report", permissions);
   const [aging, setAging] = useState({ customers: [], suppliers: [] });
   const [stockValuation, setStockValuation] = useState({ totalValue: 0, rows: [] });
+  const [stockValuationFilter, setStockValuationFilter] = useState({
+    asOf: "",
+    category: "",
+    warehouseId: "",
+  });
+  const [warehouses, setWarehouses] = useState([]);
   const [settlementRange, setSettlementRange] = useState({ from: "", to: "" });
   const [settlement, setSettlement] = useState({
     from: null,
@@ -72,6 +78,15 @@ function Reports() {
     count: 0,
     rows: [],
   });
+  const [chequeLedger, setChequeLedger] = useState({
+    summary: { journalCount: 0, mismatchedJournalCount: 0, totalDebit: 0, totalCredit: 0 },
+    rows: [],
+  });
+  const [chequeLedgerFilter, setChequeLedgerFilter] = useState({
+    direction: "",
+    status: "",
+    onlyMismatched: false,
+  });
   const [reportsTab, setReportsTab] = useState("overview");
 
   useEffect(() => {
@@ -88,10 +103,15 @@ function Reports() {
       const loyaltyUrl = settlementQuery.toString()
         ? `/sales/loyalty/redemptions?${settlementQuery.toString()}`
         : "/sales/loyalty/redemptions";
-      const [agingRes, stockRes, settlementRes, loyaltyRes, vatSummaryRes, vatRegisterRes, shrinkageRes, staffKpiRes, auditTrailRes] =
+      const stockQuery = new URLSearchParams();
+      if (stockValuationFilter.asOf) stockQuery.set("asOf", stockValuationFilter.asOf);
+      if (stockValuationFilter.category) stockQuery.set("category", stockValuationFilter.category);
+      if (stockValuationFilter.warehouseId) stockQuery.set("warehouseId", stockValuationFilter.warehouseId);
+      const stockSuffix = stockQuery.toString() ? `?${stockQuery.toString()}` : "";
+      const [agingRes, stockRes, settlementRes, loyaltyRes, vatSummaryRes, vatRegisterRes, shrinkageRes, staffKpiRes, auditTrailRes, chequeLedgerRes, warehouseRes] =
         await Promise.all([
         api.get("/reports/aging"),
-        api.get("/reports/stock-valuation"),
+        api.get(`/reports/stock-valuation${stockSuffix}`),
         api.get(settlementUrl),
         api.get(loyaltyUrl),
         api.get(`/reports/vat/summary${settlementQuery.toString() ? `?${settlementQuery.toString()}` : ""}`),
@@ -99,9 +119,23 @@ function Reports() {
         api.get(`/reports/shrinkage-control${settlementQuery.toString() ? `?${settlementQuery.toString()}` : ""}`),
         api.get(`/reports/staff-kpi${settlementQuery.toString() ? `?${settlementQuery.toString()}` : ""}`),
         api.get(`/reports/audit-activity${settlementQuery.toString() ? `?${settlementQuery.toString()}` : ""}`),
+        api.get(
+          `/reports/cheque-ledger${
+            (() => {
+              const q = new URLSearchParams(settlementQuery.toString());
+              if (chequeLedgerFilter.direction) q.set("direction", chequeLedgerFilter.direction);
+              if (chequeLedgerFilter.status) q.set("status", chequeLedgerFilter.status);
+              if (chequeLedgerFilter.onlyMismatched) q.set("onlyMismatched", "1");
+              const s = q.toString();
+              return s ? `?${s}` : "";
+            })()
+          }`
+        ),
+        api.get("/warehouses"),
       ]);
       setAging(agingRes.data);
       setStockValuation(stockRes.data);
+      setWarehouses(warehouseRes.data || []);
       setSettlement(settlementRes.data);
       setLoyaltyRedemptions(loyaltyRes.data);
       setVatSummary(vatSummaryRes.data || {});
@@ -115,6 +149,12 @@ function Reports() {
       );
       setStaffKpi(staffKpiRes.data || { summary: { staffCount: 0, totalSales: 0, totalInvoices: 0 }, rows: [] });
       setAuditActivity(auditTrailRes.data || { count: 0, rows: [] });
+      setChequeLedger(
+        chequeLedgerRes.data || {
+          summary: { journalCount: 0, mismatchedJournalCount: 0, totalDebit: 0, totalCredit: 0 },
+          rows: [],
+        }
+      );
     };
     load();
   }, [
@@ -123,6 +163,12 @@ function Reports() {
     shrinkageThresholds.discountAlertMin,
     shrinkageThresholds.returnAlertMin,
     shrinkageThresholds.criticalAmount,
+    chequeLedgerFilter.direction,
+    chequeLedgerFilter.status,
+    chequeLedgerFilter.onlyMismatched,
+    stockValuationFilter.asOf,
+    stockValuationFilter.category,
+    stockValuationFilter.warehouseId,
   ]);
 
   const exportCSV = async (url, filename) => {
@@ -187,6 +233,36 @@ function Reports() {
     const endpoints = {
       csv: ["/reports/shrinkage-control/export.csv", "shrinkage-risk-summary.csv"],
       pdf: ["/reports/shrinkage-control/export.pdf", "shrinkage-risk-summary.pdf"],
+    };
+    const [url, filename] = endpoints[type];
+    await exportCSV(`${url}${suffix}`, filename);
+  };
+
+  const exportChequeLedger = async (type) => {
+    const query = new URLSearchParams();
+    if (settlementRange.from) query.set("from", settlementRange.from);
+    if (settlementRange.to) query.set("to", settlementRange.to);
+    if (chequeLedgerFilter.direction) query.set("direction", chequeLedgerFilter.direction);
+    if (chequeLedgerFilter.status) query.set("status", chequeLedgerFilter.status);
+    if (chequeLedgerFilter.onlyMismatched) query.set("onlyMismatched", "1");
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const endpoints = {
+      csv: ["/reports/cheque-ledger/export.csv", "cheque-ledger.csv"],
+      pdf: ["/reports/cheque-ledger/export.pdf", "cheque-ledger.pdf"],
+    };
+    const [url, filename] = endpoints[type];
+    await exportCSV(`${url}${suffix}`, filename);
+  };
+
+  const exportStockValuation = async (type) => {
+    const query = new URLSearchParams();
+    if (stockValuationFilter.asOf) query.set("asOf", stockValuationFilter.asOf);
+    if (stockValuationFilter.category) query.set("category", stockValuationFilter.category);
+    if (stockValuationFilter.warehouseId) query.set("warehouseId", stockValuationFilter.warehouseId);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const endpoints = {
+      csv: ["/reports/stock-valuation/export.csv", "stock-valuation.csv"],
+      pdf: ["/reports/stock-valuation/export.pdf", "stock-valuation.pdf"],
     };
     const [url, filename] = endpoints[type];
     await exportCSV(`${url}${suffix}`, filename);
@@ -267,8 +343,8 @@ function Reports() {
           <div className="pos-action-row" style={{ marginTop: 10 }}>
             <button onClick={() => exportCSV("/reports/aging/export.csv", "aging-report.csv")}>Aging CSV</button>
             <button onClick={() => exportCSV("/reports/aging/export.pdf", "aging-report.pdf")}>Aging PDF</button>
-            <button onClick={() => exportCSV("/reports/stock-valuation/export.csv", "stock-valuation.csv")}>Stock CSV</button>
-            <button onClick={() => exportCSV("/reports/stock-valuation/export.pdf", "stock-valuation.pdf")}>Stock PDF</button>
+            <button onClick={() => exportStockValuation("csv")}>Stock CSV</button>
+            <button onClick={() => exportStockValuation("pdf")}>Stock PDF</button>
             <button onClick={() => exportSettlement("methodCsv")}>Settlement Method CSV</button>
             <button onClick={() => exportSettlement("channelCsv")}>Settlement Channel CSV</button>
             <button onClick={() => exportSettlement("methodPdf")}>Settlement Method PDF</button>
@@ -279,6 +355,8 @@ function Reports() {
             <button onClick={() => exportVatSalesRegister("pdf")}>VAT Register PDF</button>
             <button onClick={() => exportShrinkageControl("csv")}>Shrinkage CSV</button>
             <button onClick={() => exportShrinkageControl("pdf")}>Shrinkage PDF</button>
+            <button onClick={() => exportChequeLedger("csv")}>Cheque Ledger CSV</button>
+            <button onClick={() => exportChequeLedger("pdf")}>Cheque Ledger PDF</button>
           </div>
         ) : (
           <div className="text-muted" style={{ marginTop: 10 }}>
@@ -677,7 +755,127 @@ function Reports() {
           { key: "payableBalance", label: "Payable", render: (v) => `৳${Number(v).toFixed(2)}` },
         ]}
       />
+      <div className="quick-stats" style={{ marginBottom: "12px" }}>
+        <div className="stat">Cheque Journals: {Number(chequeLedger.summary?.journalCount || 0)}</div>
+        <div className="stat">Total Debit: ৳{Number(chequeLedger.summary?.totalDebit || 0).toFixed(2)}</div>
+        <div className="stat">Total Credit: ৳{Number(chequeLedger.summary?.totalCredit || 0).toFixed(2)}</div>
+      </div>
+      <div className="form-grid" style={{ marginBottom: "12px" }}>
+        <select
+          value={chequeLedgerFilter.direction}
+          onChange={(e) => setChequeLedgerFilter((prev) => ({ ...prev, direction: e.target.value }))}
+        >
+          <option value="">All Directions</option>
+          <option value="RECEIVED">RECEIVED</option>
+          <option value="ISSUED">ISSUED</option>
+        </select>
+        <select
+          value={chequeLedgerFilter.status}
+          onChange={(e) => setChequeLedgerFilter((prev) => ({ ...prev, status: e.target.value }))}
+        >
+          <option value="">All Status</option>
+          <option value="CLEARED">CLEARED</option>
+          <option value="BOUNCED">BOUNCED</option>
+          <option value="DEPOSITED">DEPOSITED</option>
+          <option value="PENDING">PENDING</option>
+          <option value="CANCELLED">CANCELLED</option>
+        </select>
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={() => setChequeLedgerFilter({ direction: "", status: "", onlyMismatched: false })}
+        >
+          Reset Cheque Filters
+        </button>
+        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={Boolean(chequeLedgerFilter.onlyMismatched)}
+            onChange={(e) =>
+              setChequeLedgerFilter((prev) => ({
+                ...prev,
+                onlyMismatched: e.target.checked,
+              }))
+            }
+          />
+          Only mismatched journals (debit != credit)
+          {Number(chequeLedger.summary?.mismatchedJournalCount || 0) > 0 ? (
+            <span
+              style={{
+                background: "#fee2e2",
+                color: "#b91c1c",
+                border: "1px solid #fecaca",
+                borderRadius: 999,
+                padding: "1px 8px",
+                fontSize: 12,
+                fontWeight: 700,
+              }}
+            >
+              {Number(chequeLedger.summary?.mismatchedJournalCount || 0)} mismatch
+              {Number(chequeLedger.summary?.mismatchedJournalCount || 0) > 1 ? "es" : ""}
+            </span>
+          ) : null}
+        </label>
+      </div>
+      <DataTable
+        title="Cheque Ledger (Accounting Entries)"
+        rows={(chequeLedger.rows || []).map((row, idx) => ({
+          rowNo: idx + 1,
+          ...row,
+          journalDateLabel: row.journalDate ? new Date(row.journalDate).toLocaleString() : "-",
+          chequeAmountLabel: `৳${Number(row.chequeAmount || 0).toFixed(2)}`,
+          debitLabel: `৳${Number(row.debit || 0).toFixed(2)}`,
+          creditLabel: `৳${Number(row.credit || 0).toFixed(2)}`,
+        }))}
+        searchableKeys={["entryType", "chequeNo", "bankName", "direction", "status", "accountCode", "accountName", "partyName", "narration"]}
+        columns={[
+          { key: "rowNo", label: "ID" },
+          { key: "journalDateLabel", label: "Date/Time" },
+          { key: "entryType", label: "Entry" },
+          { key: "chequeNo", label: "Cheque" },
+          { key: "bankName", label: "Bank" },
+          { key: "direction", label: "Direction" },
+          { key: "status", label: "Status" },
+          { key: "chequeAmountLabel", label: "Cheque Amount" },
+          { key: "accountCode", label: "A/C Code" },
+          { key: "accountName", label: "A/C Name" },
+          { key: "debitLabel", label: "Debit" },
+          { key: "creditLabel", label: "Credit" },
+          { key: "partyName", label: "Drawer/Payee" },
+          { key: "narration", label: "Narration" },
+        ]}
+      />
       <h4 style={{ marginTop: "12px" }}>Stock Valuation</h4>
+      <div className="form-grid" style={{ marginBottom: "8px" }}>
+        <input
+          type="date"
+          value={stockValuationFilter.asOf}
+          onChange={(e) => setStockValuationFilter((prev) => ({ ...prev, asOf: e.target.value }))}
+        />
+        <input
+          placeholder="Filter category"
+          value={stockValuationFilter.category}
+          onChange={(e) => setStockValuationFilter((prev) => ({ ...prev, category: e.target.value }))}
+        />
+        <select
+          value={stockValuationFilter.warehouseId}
+          onChange={(e) => setStockValuationFilter((prev) => ({ ...prev, warehouseId: e.target.value }))}
+        >
+          <option value="">All Warehouses</option>
+          {(warehouses || []).map((w) => (
+            <option key={w.id} value={w.id}>
+              {w.name}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={() => setStockValuationFilter({ asOf: "", category: "", warehouseId: "" })}
+        >
+          Reset Valuation Filters
+        </button>
+      </div>
       <div>Total Value: ৳{Number(stockValuation.totalValue || 0).toFixed(2)}</div>
       <DataTable
         rows={stockValuation.rows.map((row, idx) => ({ rowNo: idx + 1, ...row }))}

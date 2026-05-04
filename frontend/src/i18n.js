@@ -21,6 +21,11 @@ export const dictionary = {
     quotations: "Quotations",
     roleManagement: "Role Management",
     pinned: "Pinned",
+    cheques: "Cheque Register",
+    fiscalPeriods: "Fiscal Periods",
+    assets: "Assets",
+    costCenters: "Cost Centers",
+    pettyCash: "Petty Cash",
   },
   bn: {
     appTitle: "বিডি স্মার্ট পস এন্টারপ্রাইজ",
@@ -44,6 +49,11 @@ export const dictionary = {
     quotations: "কোটেশন",
     roleManagement: "রোল ম্যানেজমেন্ট",
     pinned: "পিন করা",
+    cheques: "চেক রেজিস্টার",
+    fiscalPeriods: "ফিসক্যাল পিরিয়ড",
+    assets: "সম্পদ",
+    costCenters: "কস্ট সেন্টার",
+    pettyCash: "পেটি ক্যাশ",
   },
 };
 

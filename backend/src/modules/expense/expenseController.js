@@ -6,6 +6,8 @@ exports.createExpense = async (req, res) => {
   try {
     const branchId = req.branchId;
     const { category, description, amount, paymentMethod, expenseDate } = req.body;
+    const costCenterId =
+      req.body?.costCenterId != null && req.body?.costCenterId !== "" ? Number(req.body.costCenterId) : null;
     const parsedAmount = Number(amount);
     const parsedDate = expenseDate ? new Date(expenseDate) : new Date();
     if (!category || String(category).trim().length < 2) {
@@ -14,8 +16,15 @@ exports.createExpense = async (req, res) => {
     if (!(parsedAmount > 0)) {
       return res.status(400).json({ error: "Expense amount must be greater than zero" });
     }
+    if (costCenterId != null && !Number.isFinite(costCenterId)) {
+      return res.status(400).json({ error: "Invalid costCenterId" });
+    }
 
     await ensureOpenFiscalPeriod(branchId, parsedDate);
+    if (costCenterId != null) {
+      const cc = await prisma.costCenter.findFirst({ where: { id: costCenterId, branchId } });
+      if (!cc) return res.status(404).json({ error: "Cost center not found in this branch" });
+    }
 
     const created = await prisma.$transaction(async (tx) => {
       const expense = await tx.expense.create({
@@ -26,6 +35,7 @@ exports.createExpense = async (req, res) => {
           description: description || null,
           amount: parsedAmount,
           paymentMethod: paymentMethod || "Cash",
+          costCenterId: costCenterId || null,
           expenseDate: parsedDate,
         },
       });
@@ -44,6 +54,7 @@ exports.createExpense = async (req, res) => {
           createdBy: req.user?.id || null,
           refType: "EXPENSE",
           refId: expense.id,
+          costCenterId: costCenterId || null,
           narration: `Expense: ${expense.category}`,
           lines: {
             create: [
@@ -75,7 +86,10 @@ exports.getExpenses = async (req, res) => {
   try {
     const expenses = await prisma.expense.findMany({
       where: { branchId: req.branchId },
-      include: { creator: { select: { id: true, name: true, email: true } } },
+      include: {
+        creator: { select: { id: true, name: true, email: true } },
+        costCenter: { select: { id: true, code: true, name: true } },
+      },
       orderBy: { expenseDate: "desc" },
     });
     res.json(expenses);
@@ -90,7 +104,10 @@ exports.getExpenseDetails = async (req, res) => {
     if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid expense id" });
     const expense = await prisma.expense.findFirst({
       where: { id, branchId: req.branchId },
-      include: { creator: { select: { id: true, name: true, email: true } } },
+      include: {
+        creator: { select: { id: true, name: true, email: true } },
+        costCenter: { select: { id: true, code: true, name: true } },
+      },
     });
     if (!expense) return res.status(404).json({ error: "Expense not found" });
     res.json(expense);
@@ -107,6 +124,8 @@ exports.updateExpense = async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Expense not found" });
 
     const { category, description, amount, paymentMethod, expenseDate } = req.body;
+    const costCenterId =
+      req.body?.costCenterId != null && req.body?.costCenterId !== "" ? Number(req.body.costCenterId) : null;
     const parsedAmount = Number(amount);
     const parsedDate = expenseDate ? new Date(expenseDate) : existing.expenseDate;
     if (!category || String(category).trim().length < 2) {
@@ -115,8 +134,15 @@ exports.updateExpense = async (req, res) => {
     if (!(parsedAmount > 0)) {
       return res.status(400).json({ error: "Expense amount must be greater than zero" });
     }
+    if (costCenterId != null && !Number.isFinite(costCenterId)) {
+      return res.status(400).json({ error: "Invalid costCenterId" });
+    }
 
     await ensureOpenFiscalPeriod(req.branchId, parsedDate);
+    if (costCenterId != null) {
+      const cc = await prisma.costCenter.findFirst({ where: { id: costCenterId, branchId: req.branchId } });
+      if (!cc) return res.status(404).json({ error: "Cost center not found in this branch" });
+    }
 
     const updated = await prisma.$transaction(async (tx) => {
       const expense = await tx.expense.update({
@@ -126,6 +152,7 @@ exports.updateExpense = async (req, res) => {
           description: description || null,
           amount: parsedAmount,
           paymentMethod: paymentMethod || "Cash",
+          costCenterId: costCenterId || null,
           expenseDate: parsedDate,
         },
       });
@@ -147,6 +174,7 @@ exports.updateExpense = async (req, res) => {
           where: { id: journal.id },
           data: {
             narration: `Expense: ${expense.category}`,
+            costCenterId: costCenterId || null,
             lines: {
               create: [
                 { accountId: expenseAcc.id, debit: parsedAmount, credit: 0 },

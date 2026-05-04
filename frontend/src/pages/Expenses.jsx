@@ -4,19 +4,25 @@ import DataTable from "../components/DataTable";
 
 function Expenses() {
   const [rows, setRows] = useState([]);
+  const [costCenters, setCostCenters] = useState([]);
   const [form, setForm] = useState({
     category: "",
     description: "",
     amount: "",
     paymentMethod: "Cash",
+    costCenterId: "",
     expenseDate: new Date().toISOString().slice(0, 10),
   });
   const [editingId, setEditingId] = useState(null);
   const [selected, setSelected] = useState(null);
 
   const load = async () => {
-    const res = await api.get("/expenses");
+    const [res, ccRes] = await Promise.all([
+      api.get("/expenses"),
+      api.get("/cost-centers", { params: { active: 1 } }),
+    ]);
     setRows(res.data);
+    setCostCenters(Array.isArray(ccRes.data) ? ccRes.data : []);
   };
 
   useEffect(() => {
@@ -29,6 +35,7 @@ function Expenses() {
       description: "",
       amount: "",
       paymentMethod: "Cash",
+      costCenterId: "",
       expenseDate: new Date().toISOString().slice(0, 10),
     });
     setEditingId(null);
@@ -41,6 +48,7 @@ function Expenses() {
       description: form.description || null,
       amount: Number(form.amount),
       paymentMethod: form.paymentMethod,
+      costCenterId: form.costCenterId ? Number(form.costCenterId) : null,
       expenseDate: form.expenseDate,
     };
     if (editingId) {
@@ -61,6 +69,7 @@ function Expenses() {
       description: row.description || "",
       amount: row.amount ?? "",
       paymentMethod: row.paymentMethod || "Cash",
+      costCenterId: row.costCenterId ? String(row.costCenterId) : "",
       expenseDate: new Date(row.expenseDate).toISOString().slice(0, 10),
     });
   };
@@ -110,6 +119,17 @@ function Expenses() {
           value={form.expenseDate}
           onChange={(e) => setForm({ ...form, expenseDate: e.target.value })}
         />
+        <select
+          value={form.costCenterId}
+          onChange={(e) => setForm({ ...form, costCenterId: e.target.value })}
+        >
+          <option value="">Cost Center (optional)</option>
+          {costCenters.map((cc) => (
+            <option key={cc.id} value={cc.id}>
+              {cc.code} - {cc.name}
+            </option>
+          ))}
+        </select>
         <input
           placeholder="Description (optional)"
           value={form.description}
@@ -130,6 +150,10 @@ function Expenses() {
           <p><strong>Category:</strong> {selected.category}</p>
           <p><strong>Amount:</strong> ৳{Number(selected.amount || 0).toFixed(2)}</p>
           <p><strong>Payment Method:</strong> {selected.paymentMethod}</p>
+          <p>
+            <strong>Cost Center:</strong>{" "}
+            {selected.costCenter ? `${selected.costCenter.code} - ${selected.costCenter.name}` : "-"}
+          </p>
           <p><strong>Date:</strong> {new Date(selected.expenseDate).toLocaleDateString()}</p>
           <p><strong>Description:</strong> {selected.description || "-"}</p>
           <p><strong>Created By:</strong> {selected.creator?.name || selected.creator?.email || "-"}</p>
@@ -142,8 +166,9 @@ function Expenses() {
           ...r,
           expenseDateLabel: new Date(r.expenseDate).toLocaleDateString(),
           createdByName: r.creator?.name || r.creator?.email || "-",
+          costCenterLabel: r.costCenter ? `${r.costCenter.code} - ${r.costCenter.name}` : "-",
         }))}
-        searchableKeys={["category", "paymentMethod", "expenseDateLabel", "createdByName"]}
+        searchableKeys={["category", "paymentMethod", "expenseDateLabel", "createdByName", "costCenterLabel"]}
         filters={[
           {
             key: "paymentMethod",
@@ -153,6 +178,12 @@ function Expenses() {
               value: x,
             })),
           },
+          {
+            key: "costCenterLabel",
+            label: "Cost Center",
+            options: [...new Set(rows.map((x) => (x.costCenter ? `${x.costCenter.code} - ${x.costCenter.name}` : "-")))]
+              .map((x) => ({ label: x, value: x })),
+          },
         ]}
         columns={[
           { key: "id", label: "ID" },
@@ -160,6 +191,7 @@ function Expenses() {
           { key: "category", label: "Category" },
           { key: "amount", label: "Amount", render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "paymentMethod", label: "Payment" },
+          { key: "costCenterLabel", label: "Cost Center" },
           { key: "createdByName", label: "Created By" },
           {
             key: "actions",

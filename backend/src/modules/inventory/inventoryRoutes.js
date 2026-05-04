@@ -35,12 +35,18 @@ const {
   createExpiryMarkdownCampaign,
   approveStockTransfer,
   rejectStockTransfer,
+  listInventoryAdjustReasons,
+  createInventoryAdjustReason,
+  updateInventoryAdjustReason,
 } = require("./inventoryController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
 const router = express.Router();
 
 router.get("/ledger", requireAuth, requirePermission("inventory.view"), getStockLedger);
+router.get("/adjust-reasons", requireAuth, requirePermission("inventory.view"), listInventoryAdjustReasons);
+router.post("/adjust-reasons", requireAuth, requirePermission("inventory.adjust"), createInventoryAdjustReason);
+router.patch("/adjust-reasons/:id", requireAuth, requirePermission("inventory.adjust"), updateInventoryAdjustReason);
 router.post("/adjustments", requireAuth, requirePermission("inventory.adjust"), adjustStock);
 router.get("/adjustments", requireAuth, requirePermission("inventory.view"), getStockAdjustments);
 router.put("/adjustments/:id", requireAuth, requirePermission("inventory.adjust"), updateStockAdjustment);

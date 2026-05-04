@@ -9,6 +9,8 @@ const {
   updateUserRole,
   getRoleTemplates,
   applyRoleTemplate,
+  getPermissionMatrix,
+  bulkUpdatePermissionMatrix,
 } = require("./rbacController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -20,6 +22,8 @@ router.post("/roles/:roleId/permissions", requireAuth, requirePermission("rbac.m
 router.get("/roles/templates", requireAuth, requirePermission("rbac.manage"), getRoleTemplates);
 router.post("/roles/:roleId/apply-template", requireAuth, requirePermission("rbac.manage"), applyRoleTemplate);
 router.get("/permissions", requireAuth, requirePermission("rbac.manage"), getPermissions);
+router.get("/permission-matrix", requireAuth, requirePermission("rbac.manage"), getPermissionMatrix);
+router.post("/permission-matrix/bulk-update", requireAuth, requirePermission("rbac.manage"), bulkUpdatePermissionMatrix);
 
 router.get("/users", requireAuth, requirePermission("rbac.manage"), getUsers);
 router.post("/users", requireAuth, requirePermission("rbac.manage"), createUser);

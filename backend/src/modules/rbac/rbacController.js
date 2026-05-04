@@ -16,6 +16,11 @@ const roleTemplates = {
     "report.view",
     "supplier.view",
     "customer.view",
+    "cheque.view",
+    "cheque.manage",
+    "asset.view",
+    "costcenter.view",
+    "pettycash.view",
   ],
   Accountant: [
     "accounting.view",
@@ -24,6 +29,15 @@ const roleTemplates = {
     "purchase.view",
     "sale.view",
     "report.view",
+    "cheque.view",
+    "cheque.manage",
+    "cheque.clear",
+    "asset.view",
+    "asset.manage",
+    "costcenter.view",
+    "costcenter.manage",
+    "pettycash.view",
+    "pettycash.manage",
   ],
   Admin: ["*"],
 };
@@ -177,6 +191,66 @@ exports.applyRoleTemplate = async (req, res) => {
     });
 
     res.json({ message: "Role template applied" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getPermissionMatrix = async (_req, res) => {
+  try {
+    const [roles, permissions, rolePermissions] = await Promise.all([
+      prisma.role.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+      prisma.permission.findMany({ select: { id: true, code: true }, orderBy: { code: "asc" } }),
+      prisma.rolePermission.findMany({ select: { roleId: true, permissionId: true } }),
+    ]);
+    const map = new Map();
+    for (const rp of rolePermissions) {
+      const key = `${rp.roleId}:${rp.permissionId}`;
+      map.set(key, true);
+    }
+    const rows = permissions.map((permission) => ({
+      permissionId: permission.id,
+      code: permission.code,
+      roleChecks: roles.map((role) => ({
+        roleId: role.id,
+        checked: Boolean(map.get(`${role.id}:${permission.id}`)),
+      })),
+    }));
+    res.json({ roles, permissions, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.bulkUpdatePermissionMatrix = async (req, res) => {
+  try {
+    const updates = Array.isArray(req.body?.updates) ? req.body.updates : [];
+    if (!updates.length) return res.status(400).json({ error: "updates array is required" });
+    await prisma.$transaction(async (tx) => {
+      for (const row of updates) {
+        const roleId = Number(row.roleId);
+        const permissionId = Number(row.permissionId);
+        const checked = Boolean(row.checked);
+        if (!Number.isFinite(roleId) || !Number.isFinite(permissionId)) continue;
+        const existing = await tx.rolePermission.findUnique({
+          where: { roleId_permissionId: { roleId, permissionId } },
+        });
+        if (checked && !existing) {
+          await tx.rolePermission.create({ data: { roleId, permissionId } });
+        }
+        if (!checked && existing) {
+          await tx.rolePermission.delete({ where: { roleId_permissionId: { roleId, permissionId } } });
+        }
+      }
+    });
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "RBAC_MATRIX_BULK_UPDATE",
+      entity: "RolePermission",
+      entityId: null,
+      payload: { updatesCount: updates.length },
+    });
+    res.json({ message: "Permission matrix updated", updatesCount: updates.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

@@ -403,17 +403,8 @@ exports.getAging = async (req, res) => {
 
 exports.getStockValuation = async (req, res) => {
   try {
-    const branchId = req.branchId;
-    const products = await prisma.product.findMany({ where: { branchId } });
-    const rows = products.map((p) => ({
-      productId: p.id,
-      name: p.name,
-      stock: p.stock,
-      unitCost: p.price,
-      valuation: Number(p.stock) * Number(p.price),
-    }));
-    const totalValue = rows.reduce((sum, r) => sum + r.valuation, 0);
-    res.json({ totalValue, rows });
+    const payload = await buildStockValuationPayload(req.branchId, req.query || {});
+    res.json(payload);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -421,14 +412,14 @@ exports.getStockValuation = async (req, res) => {
 
 exports.exportStockValuationCSV = async (req, res) => {
   try {
-    const branchId = req.branchId;
-    const products = await prisma.product.findMany({ where: { branchId } });
-    const rows = products.map((p) => ({
-      product_id: p.id,
+    const payload = await buildStockValuationPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((p) => ({
+      product_id: p.productId,
       product_name: p.name,
-      stock: p.stock,
-      unit_cost: p.price,
-      valuation: Number(p.stock) * Number(p.price),
+      category: p.category || "",
+      stock: Number(p.stock || 0).toFixed(2),
+      unit_cost: Number(p.unitCost || 0).toFixed(2),
+      valuation: Number(p.valuation || 0).toFixed(2),
     }));
     const csv = toCSV(rows);
     res.setHeader("Content-Type", "text/csv");
@@ -475,19 +466,20 @@ exports.exportAgingCSV = async (req, res) => {
 
 exports.exportStockValuationPDF = async (req, res) => {
   try {
-    const branchId = req.branchId;
-    const products = await prisma.product.findMany({ where: { branchId } });
-    const rows = products.map((p) => ({
+    const payload = await buildStockValuationPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((p) => ({
       name: p.name,
-      stock: p.stock,
-      unitCost: Number(p.price).toFixed(2),
-      valuation: (Number(p.stock) * Number(p.price)).toFixed(2),
+      category: p.category || "-",
+      stock: Number(p.stock || 0).toFixed(2),
+      unitCost: Number(p.unitCost || 0).toFixed(2),
+      valuation: Number(p.valuation || 0).toFixed(2),
     }));
     writePdfTableReport(
       res,
       "Stock Valuation Report",
       [
         { key: "name", label: "Product" },
+        { key: "category", label: "Category" },
         { key: "stock", label: "Stock" },
         { key: "unitCost", label: "Unit Cost" },
         { key: "valuation", label: "Valuation" },
@@ -498,6 +490,93 @@ exports.exportStockValuationPDF = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+async function buildStockValuationPayload(branchId, query = {}) {
+  const asOf = query.asOf ? new Date(`${query.asOf}T23:59:59.999Z`) : null;
+  const category = String(query.category || "").trim();
+  const warehouseId = query.warehouseId ? Number(query.warehouseId) : null;
+
+  const products = await prisma.product.findMany({
+    where: {
+      branchId,
+      ...(category ? { category: { contains: category } } : {}),
+    },
+    select: { id: true, name: true, category: true, stock: true, price: true },
+    orderBy: { name: "asc" },
+    take: 5000,
+  });
+  const productIds = products.map((p) => p.id);
+  if (!productIds.length) {
+    return { totalValue: 0, asOf: asOf ? asOf.toISOString().slice(0, 10) : null, category, warehouseId, rows: [] };
+  }
+
+  const shouldUseLedger = Boolean(asOf || warehouseId);
+  if (!shouldUseLedger) {
+    const rows = products.map((p) => ({
+      productId: p.id,
+      name: p.name,
+      category: p.category || "",
+      stock: Number(p.stock || 0),
+      unitCost: Number(p.price || 0),
+      valuation: Number((Number(p.stock || 0) * Number(p.price || 0)).toFixed(2)),
+    }));
+    const totalValue = rows.reduce((sum, r) => sum + Number(r.valuation || 0), 0);
+    return {
+      totalValue: Number(totalValue.toFixed(2)),
+      asOf: null,
+      category,
+      warehouseId: null,
+      rows,
+    };
+  }
+
+  const ledgers = await prisma.stockLedger.findMany({
+    where: {
+      branchId,
+      productId: { in: productIds },
+      ...(warehouseId ? { warehouseId } : {}),
+      ...(asOf ? { createdAt: { lte: asOf } } : {}),
+    },
+    select: { productId: true, inQty: true, outQty: true, unitCost: true },
+    take: 50000,
+  });
+  const agg = new Map();
+  for (const row of ledgers) {
+    const pid = Number(row.productId);
+    if (!agg.has(pid)) agg.set(pid, { qty: 0, value: 0 });
+    const current = agg.get(pid);
+    const inQty = Number(row.inQty || 0);
+    const outQty = Number(row.outQty || 0);
+    const unitCost = Number(row.unitCost || 0);
+    current.qty += inQty - outQty;
+    current.value += inQty * unitCost - outQty * unitCost;
+    agg.set(pid, current);
+  }
+
+  const rows = products.map((p) => {
+    const current = agg.get(p.id) || { qty: 0, value: 0 };
+    const qty = Number(current.qty || 0);
+    const value = Number(current.value || 0);
+    const unitCost = qty > 0 ? value / qty : Number(p.price || 0);
+    const valuation = qty > 0 ? value : 0;
+    return {
+      productId: p.id,
+      name: p.name,
+      category: p.category || "",
+      stock: Number(qty.toFixed(2)),
+      unitCost: Number(unitCost.toFixed(2)),
+      valuation: Number(valuation.toFixed(2)),
+    };
+  });
+  const totalValue = rows.reduce((sum, r) => sum + Number(r.valuation || 0), 0);
+  return {
+    totalValue: Number(totalValue.toFixed(2)),
+    asOf: asOf ? asOf.toISOString().slice(0, 10) : null,
+    category,
+    warehouseId: warehouseId || null,
+    rows,
+  };
+}
 
 exports.exportAgingPDF = async (req, res) => {
   try {
@@ -967,6 +1046,257 @@ exports.getAuditActivityTrail = async (req, res) => {
       count: rows.length,
       rows,
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function getChequeLedgerRows(branchId, query = {}) {
+  const { from, to } = parseDateRange(query || {});
+  const direction = String(query.direction || "").trim().toUpperCase();
+  const status = String(query.status || "").trim().toUpperCase();
+  const onlyMismatched =
+    String(query.onlyMismatched || "").trim() === "1" ||
+    String(query.onlyMismatched || "").trim().toLowerCase() === "true";
+  const where = { branchId };
+  if (from || to) {
+    where.createdAt = {
+      ...(from ? { gte: from } : {}),
+      ...(to ? { lte: to } : {}),
+    };
+  }
+  if (direction) where.direction = direction;
+  if (status) where.status = status;
+
+  const journals = await prisma.journal.findMany({
+    where: {
+      branchId,
+      refType: { in: ["CHEQUE_CLEAR", "CHEQUE_BOUNCE"] },
+      ...(from || to
+        ? {
+            createdAt: {
+              ...(from ? { gte: from } : {}),
+              ...(to ? { lte: to } : {}),
+            },
+          }
+        : {}),
+    },
+    include: {
+      lines: { include: { account: { select: { code: true, name: true } } } },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 2000,
+  });
+  const chequeIds = [...new Set(journals.map((j) => Number(j.refId || 0)).filter(Boolean))];
+  const cheques = chequeIds.length
+    ? await prisma.cheque.findMany({
+        where: { branchId, id: { in: chequeIds }, ...(direction ? { direction } : {}), ...(status ? { status } : {}) },
+        select: {
+          id: true,
+          chequeNo: true,
+          bankName: true,
+          direction: true,
+          status: true,
+          amount: true,
+          createdAt: true,
+          chequeDate: true,
+          depositDate: true,
+          clearedDate: true,
+          bounceDate: true,
+          bounceReason: true,
+          bounceFee: true,
+          drawerName: true,
+          payeeName: true,
+        },
+      })
+    : [];
+  const chequeMap = new Map(cheques.map((c) => [c.id, c]));
+
+  const rows = [];
+  const journalTotals = new Map();
+  for (const journal of journals) {
+    const chequeId = Number(journal.refId || 0);
+    const cheque = chequeMap.get(chequeId);
+    if (!cheque) continue;
+    for (const line of journal.lines || []) {
+      const journalId = Number(journal.id || 0);
+      if (!journalTotals.has(journalId)) {
+        journalTotals.set(journalId, { debit: 0, credit: 0 });
+      }
+      const totals = journalTotals.get(journalId);
+      totals.debit += Number(line.debit || 0);
+      totals.credit += Number(line.credit || 0);
+      journalTotals.set(journalId, totals);
+      rows.push({
+        journalId: journal.id,
+        journalDate: journal.createdAt.toISOString(),
+        entryType: journal.refType,
+        chequeId: cheque.id,
+        chequeNo: cheque.chequeNo,
+        bankName: cheque.bankName,
+        direction: cheque.direction,
+        status: cheque.status,
+        chequeAmount: Number(cheque.amount || 0),
+        chequeDate: cheque.chequeDate ? cheque.chequeDate.toISOString().slice(0, 10) : "",
+        depositDate: cheque.depositDate ? cheque.depositDate.toISOString().slice(0, 10) : "",
+        clearedDate: cheque.clearedDate ? cheque.clearedDate.toISOString().slice(0, 10) : "",
+        bounceDate: cheque.bounceDate ? cheque.bounceDate.toISOString().slice(0, 10) : "",
+        bounceReason: cheque.bounceReason || "",
+        bounceFee: Number(cheque.bounceFee || 0),
+        partyName: cheque.direction === "RECEIVED" ? cheque.drawerName || "" : cheque.payeeName || "",
+        accountCode: line.account?.code || "",
+        accountName: line.account?.name || "",
+        debit: Number(line.debit || 0),
+        credit: Number(line.credit || 0),
+        narration: journal.narration || "",
+      });
+    }
+  }
+  if (!onlyMismatched) return rows;
+  const mismatchedJournalIds = new Set(
+    [...journalTotals.entries()]
+      .filter(([, totals]) => Math.abs(Number(totals.debit || 0) - Number(totals.credit || 0)) > 0.001)
+      .map(([journalId]) => Number(journalId))
+  );
+  return rows.filter((row) => mismatchedJournalIds.has(Number(row.journalId || 0)));
+}
+
+async function getChequeLedgerSummary(branchId, query = {}) {
+  const { from, to } = parseDateRange(query || {});
+  const direction = String(query.direction || "").trim().toUpperCase();
+  const status = String(query.status || "").trim().toUpperCase();
+
+  const journals = await prisma.journal.findMany({
+    where: {
+      branchId,
+      refType: { in: ["CHEQUE_CLEAR", "CHEQUE_BOUNCE"] },
+      ...(from || to
+        ? {
+            createdAt: {
+              ...(from ? { gte: from } : {}),
+              ...(to ? { lte: to } : {}),
+            },
+          }
+        : {}),
+    },
+    include: {
+      lines: { select: { debit: true, credit: true } },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 2000,
+  });
+
+  const chequeIds = [...new Set(journals.map((j) => Number(j.refId || 0)).filter(Boolean))];
+  const cheques = chequeIds.length
+    ? await prisma.cheque.findMany({
+        where: {
+          branchId,
+          id: { in: chequeIds },
+          ...(direction ? { direction } : {}),
+          ...(status ? { status } : {}),
+        },
+        select: { id: true },
+      })
+    : [];
+  const chequeIdSet = new Set(cheques.map((c) => Number(c.id)));
+
+  const filteredJournals = journals.filter((j) => chequeIdSet.has(Number(j.refId || 0)));
+  let totalDebit = 0;
+  let totalCredit = 0;
+  let mismatchedJournals = 0;
+  for (const journal of filteredJournals) {
+    let debit = 0;
+    let credit = 0;
+    for (const line of journal.lines || []) {
+      const d = Number(line.debit || 0);
+      const c = Number(line.credit || 0);
+      debit += d;
+      credit += c;
+      totalDebit += d;
+      totalCredit += c;
+    }
+    if (Math.abs(debit - credit) > 0.001) mismatchedJournals += 1;
+  }
+
+  return {
+    journalCount: filteredJournals.length,
+    mismatchedJournalCount: mismatchedJournals,
+    totalDebit: Number(totalDebit.toFixed(2)),
+    totalCredit: Number(totalCredit.toFixed(2)),
+  };
+}
+
+exports.getChequeLedger = async (req, res) => {
+  try {
+    const rows = await getChequeLedgerRows(req.branchId, req.query || {});
+    const summary = await getChequeLedgerSummary(req.branchId, req.query || {});
+    res.json({
+      summary,
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportChequeLedgerCSV = async (req, res) => {
+  try {
+    const rows = await getChequeLedgerRows(req.branchId, req.query || {});
+    const csv = toCSV(
+      rows.map((row) => ({
+        journal_id: row.journalId,
+        journal_date: row.journalDate,
+        entry_type: row.entryType,
+        cheque_id: row.chequeId,
+        cheque_no: row.chequeNo,
+        bank_name: row.bankName,
+        direction: row.direction,
+        status: row.status,
+        cheque_amount: Number(row.chequeAmount || 0).toFixed(2),
+        cheque_date: row.chequeDate,
+        deposit_date: row.depositDate,
+        cleared_date: row.clearedDate,
+        bounce_date: row.bounceDate,
+        bounce_reason: row.bounceReason,
+        bounce_fee: Number(row.bounceFee || 0).toFixed(2),
+        party_name: row.partyName,
+        account_code: row.accountCode,
+        account_name: row.accountName,
+        debit: Number(row.debit || 0).toFixed(2),
+        credit: Number(row.credit || 0).toFixed(2),
+        narration: row.narration,
+      }))
+    );
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="cheque-ledger.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportChequeLedgerPDF = async (req, res) => {
+  try {
+    const rows = await getChequeLedgerRows(req.branchId, req.query || {});
+    writePdfTableReport(
+      res,
+      "Cheque Ledger",
+      [
+        { key: "journalDate", label: "Date" },
+        { key: "entryType", label: "Entry" },
+        { key: "chequeNo", label: "Cheque" },
+        { key: "direction", label: "Direction" },
+        { key: "accountCode", label: "A/C" },
+        { key: "debit", label: "Debit" },
+        { key: "credit", label: "Credit" },
+      ],
+      rows.map((row) => ({
+        ...row,
+        journalDate: row.journalDate ? new Date(row.journalDate).toLocaleString() : "",
+        debit: Number(row.debit || 0).toFixed(2),
+        credit: Number(row.credit || 0).toFixed(2),
+      }))
+    );
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

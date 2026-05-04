@@ -12,6 +12,7 @@ import {
 } from "../utils/notify";
 
 const PURCHASE_DRAFT_KEY = "bd_pos_purchase_draft_v1";
+const APPROVAL_FOCUS_KEY = "bd_pos_approval_focus_id";
 const SEARCH_SELECT_STYLES = createSearchSelectStyles(32);
 
 function Inventory() {
@@ -26,6 +27,8 @@ function Inventory() {
   const [lowStockRows, setLowStockRows] = useState([]);
   const [lowStockSummary, setLowStockSummary] = useState({ totalTracked: 0, outOfStock: 0, lowStock: 0 });
   const [products, setProducts] = useState([]);
+  const [adjustReasons, setAdjustReasons] = useState([]);
+  const [allAdjustReasons, setAllAdjustReasons] = useState([]);
   const [warehouses, setWarehouses] = useState([]);
   const [branches, setBranches] = useState([]);
   const [targetBranchProducts, setTargetBranchProducts] = useState([]);
@@ -48,7 +51,13 @@ function Inventory() {
     suggestedReorderCount: 0,
     seasonalityAdjustedCount: 0,
   });
-  const [adjustment, setAdjustment] = useState({ productId: "", warehouseId: "", qtyChange: "", reason: "" });
+  const [adjustment, setAdjustment] = useState({
+    productId: "",
+    warehouseId: "",
+    qtyChange: "",
+    reason: "",
+    reasonCode: "",
+  });
   const [editingAdjustmentId, setEditingAdjustmentId] = useState(null);
   const [transferForm, setTransferForm] = useState({
     toBranchId: "",
@@ -64,6 +73,15 @@ function Inventory() {
     note: "",
   });
   const [batchAdjustForm, setBatchAdjustForm] = useState({ batchId: "", qtyChange: "", reason: "" });
+  const [reasonForm, setReasonForm] = useState({
+    code: "",
+    label: "",
+    direction: "BOTH",
+    accountingImpact: "NONE",
+    accountCode: "",
+    isActive: true,
+  });
+  const [editingReasonId, setEditingReasonId] = useState(null);
   const [inventoryTab, setInventoryTab] = useState("overview");
 
   const load = useCallback(async () => {
@@ -71,6 +89,8 @@ function Inventory() {
       ledgerRes,
       adjustmentRes,
       productRes,
+      adjustReasonRes,
+      adjustReasonAllRes,
       warehouseRes,
       transferRes,
       lowStockRes,
@@ -83,6 +103,8 @@ function Inventory() {
       api.get("/inventory/ledger"),
       api.get("/inventory/adjustments"),
       api.get("/products"),
+      api.get("/inventory/adjust-reasons?active=1"),
+      api.get("/inventory/adjust-reasons"),
       api.get("/warehouses"),
       api.get("/inventory/transfers"),
       api.get(`/inventory/alerts/low-stock?onlyCritical=${showOnlyCriticalLowStock}`),
@@ -99,6 +121,8 @@ function Inventory() {
     setLedger(ledgerRes.data);
     setAdjustments(adjustmentRes.data);
     setProducts(productRes.data);
+    setAdjustReasons(adjustReasonRes.data || []);
+    setAllAdjustReasons(adjustReasonAllRes.data || []);
     setWarehouses(warehouseRes.data);
     setTransfers(transferRes.data || []);
     setLowStockRows(lowStockRes.data?.rows || []);
@@ -156,13 +180,29 @@ function Inventory() {
       warehouseId: adjustment.warehouseId ? Number(adjustment.warehouseId) : null,
       qtyChange: Number(adjustment.qtyChange),
       reason: adjustment.reason,
+      reasonCode: adjustment.reasonCode || null,
     };
-    if (editingAdjustmentId) {
-      await api.put(`/inventory/adjustments/${editingAdjustmentId}`, payload);
-    } else {
-      await api.post("/inventory/adjustments", payload);
+    try {
+      if (editingAdjustmentId) {
+        await api.put(`/inventory/adjustments/${editingAdjustmentId}`, payload);
+      } else {
+        await api.post("/inventory/adjustments", payload);
+      }
+    } catch (error) {
+      if (error?.response?.status === 403) {
+        const pin = window.prompt("Manager PIN required for this high-value write-off:");
+        if (!pin) return;
+        const retryPayload = { ...payload, managerApprovalPin: pin };
+        if (editingAdjustmentId) {
+          await api.put(`/inventory/adjustments/${editingAdjustmentId}`, retryPayload);
+        } else {
+          await api.post("/inventory/adjustments", retryPayload);
+        }
+      } else {
+        throw error;
+      }
     }
-    setAdjustment({ productId: "", warehouseId: "", qtyChange: "", reason: "" });
+    setAdjustment({ productId: "", warehouseId: "", qtyChange: "", reason: "", reasonCode: "" });
     setEditingAdjustmentId(null);
     load();
   };
@@ -174,6 +214,7 @@ function Inventory() {
       warehouseId: row.warehouseId ? String(row.warehouseId) : "",
       qtyChange: String(row.qtyChange),
       reason: row.reason || "",
+      reasonCode: row.reasonCode || "",
     });
   };
 
@@ -186,7 +227,7 @@ function Inventory() {
     await api.delete(`/inventory/adjustments/${row.id}`);
     if (editingAdjustmentId === row.id) {
       setEditingAdjustmentId(null);
-      setAdjustment({ productId: "", warehouseId: "", qtyChange: "", reason: "" });
+      setAdjustment({ productId: "", warehouseId: "", qtyChange: "", reason: "", reasonCode: "" });
     }
     load();
   };
@@ -234,6 +275,14 @@ function Inventory() {
         label: w.name,
       })),
     [warehouses]
+  );
+  const adjustReasonOptions = useMemo(
+    () =>
+      (adjustReasons || []).map((r) => ({
+        value: String(r.code),
+        label: `${r.code} - ${r.label}`,
+      })),
+    [adjustReasons]
   );
   const batchOptions = useMemo(
     () =>
@@ -318,6 +367,76 @@ function Inventory() {
       note: "",
     });
     load();
+  };
+
+  const submitReasonMaster = async (e) => {
+    e.preventDefault();
+    if (!canAdjustInventory) {
+      notifyPermissionRequired("inventory.adjust.");
+      return;
+    }
+    if (!reasonForm.code.trim() || !reasonForm.label.trim()) {
+      notifyActionRequired("reason code and label are required.");
+      return;
+    }
+    const payload = {
+      code: reasonForm.code.trim().toUpperCase(),
+      label: reasonForm.label.trim(),
+      direction: reasonForm.direction,
+      accountingImpact: reasonForm.accountingImpact,
+      accountCode: reasonForm.accountCode.trim() || null,
+      isActive: Boolean(reasonForm.isActive),
+    };
+    if (editingReasonId) {
+      await api.patch(`/inventory/adjust-reasons/${editingReasonId}`, payload);
+    } else {
+      await api.post("/inventory/adjust-reasons", payload);
+    }
+    setReasonForm({
+      code: "",
+      label: "",
+      direction: "BOTH",
+      accountingImpact: "NONE",
+      accountCode: "",
+      isActive: true,
+    });
+    setEditingReasonId(null);
+    notifySuccess(editingReasonId ? "adjustment reason updated." : "adjustment reason saved.");
+    load();
+  };
+
+  const toggleReasonActive = async (row) => {
+    if (!canAdjustInventory) {
+      notifyPermissionRequired("inventory.adjust.");
+      return;
+    }
+    await api.patch(`/inventory/adjust-reasons/${row.id}`, { isActive: !row.isActive });
+    notifySuccess("reason status updated.");
+    load();
+  };
+
+  const startEditReason = (row) => {
+    setEditingReasonId(row.id);
+    setReasonForm({
+      code: row.code || "",
+      label: row.label || "",
+      direction: row.direction || "BOTH",
+      accountingImpact: row.accountingImpact || "NONE",
+      accountCode: row.accountCode || "",
+      isActive: Boolean(row.isActive),
+    });
+  };
+
+  const cancelEditReason = () => {
+    setEditingReasonId(null);
+    setReasonForm({
+      code: "",
+      label: "",
+      direction: "BOTH",
+      accountingImpact: "NONE",
+      accountCode: "",
+      isActive: true,
+    });
   };
 
   const submitBatchAdjustment = async (e) => {
@@ -841,6 +960,80 @@ function Inventory() {
       ) : null}
       {inventoryTab === "ops" ? (
         <div className="pos-tab-panel">
+      <div className="page-card" style={{ marginBottom: 12 }}>
+        <h3>Adjustment Reason Master</h3>
+        <form onSubmit={submitReasonMaster} className="form-grid" style={{ marginBottom: 8 }}>
+          <input
+            placeholder="Code (e.g., DAMAGE)"
+            value={reasonForm.code}
+            onChange={(e) => setReasonForm((p) => ({ ...p, code: e.target.value }))}
+          />
+          <input
+            placeholder="Label"
+            value={reasonForm.label}
+            onChange={(e) => setReasonForm((p) => ({ ...p, label: e.target.value }))}
+          />
+          <select value={reasonForm.direction} onChange={(e) => setReasonForm((p) => ({ ...p, direction: e.target.value }))}>
+            <option value="BOTH">Both</option>
+            <option value="IN">IN only</option>
+            <option value="OUT">OUT only</option>
+          </select>
+          <select
+            value={reasonForm.accountingImpact}
+            onChange={(e) => setReasonForm((p) => ({ ...p, accountingImpact: e.target.value }))}
+          >
+            <option value="NONE">No accounting impact</option>
+            <option value="WRITE_OFF">Write-off</option>
+            <option value="GAIN">Gain</option>
+          </select>
+          <input
+            placeholder="Account code (optional)"
+            value={reasonForm.accountCode}
+            onChange={(e) => setReasonForm((p) => ({ ...p, accountCode: e.target.value }))}
+          />
+          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={Boolean(reasonForm.isActive)}
+              onChange={(e) => setReasonForm((p) => ({ ...p, isActive: e.target.checked }))}
+            />
+            Active
+          </label>
+          <button type="submit" disabled={!canAdjustInventory}>{editingReasonId ? "Update Reason" : "Save Reason"}</button>
+          {editingReasonId ? (
+            <button type="button" className="btn-secondary" onClick={cancelEditReason}>
+              Cancel Edit
+            </button>
+          ) : null}
+        </form>
+        <DataTable
+          title="Reason Codes"
+          rows={allAdjustReasons}
+          searchableKeys={["code", "label", "direction", "accountingImpact", "accountCode"]}
+          columns={[
+            { key: "code", label: "Code" },
+            { key: "label", label: "Label" },
+            { key: "direction", label: "Direction" },
+            { key: "accountingImpact", label: "Impact" },
+            { key: "accountCode", label: "Account", render: (v) => v || "-" },
+            { key: "isActive", label: "Status", render: (v) => (v ? "Active" : "Inactive") },
+            {
+              key: "actions",
+              label: "Action",
+              render: (_, row) => (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => startEditReason(row)} disabled={!canAdjustInventory}>
+                    Edit
+                  </button>
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => toggleReasonActive(row)} disabled={!canAdjustInventory}>
+                    {row.isActive ? "Deactivate" : "Activate"}
+                  </button>
+                </div>
+              ),
+            },
+          ]}
+        />
+      </div>
       <form onSubmit={submitAdjustment} className="form-grid">
         <Select
           className="form-select-sm"
@@ -872,6 +1065,16 @@ function Inventory() {
           value={adjustment.reason}
           onChange={(e) => setAdjustment({ ...adjustment, reason: e.target.value })}
         />
+        <Select
+          className="form-select-sm"
+          value={adjustReasonOptions.find((opt) => opt.value === String(adjustment.reasonCode)) || null}
+          options={adjustReasonOptions}
+          onChange={(opt) => setAdjustment({ ...adjustment, reasonCode: opt?.value || "" })}
+          placeholder="Reason Code (Optional)"
+          isClearable
+          isSearchable
+          styles={SEARCH_SELECT_STYLES}
+        />
         <button type="submit" disabled={!canAdjustInventory}>{editingAdjustmentId ? "Update Adjustment" : "Add Adjustment"}</button>
         {editingAdjustmentId ? (
           <button
@@ -879,7 +1082,7 @@ function Inventory() {
             className="btn-secondary"
             onClick={() => {
               setEditingAdjustmentId(null);
-              setAdjustment({ productId: "", warehouseId: "", qtyChange: "", reason: "" });
+              setAdjustment({ productId: "", warehouseId: "", qtyChange: "", reason: "", reasonCode: "" });
             }}
           >
             Cancel
@@ -899,7 +1102,39 @@ function Inventory() {
           { key: "productName", label: "Product" },
           { key: "warehouseName", label: "Warehouse" },
           { key: "qtyChange", label: "Qty Change" },
-          { key: "reason", label: "Reason", render: (v) => v || "-" },
+          {
+            key: "approvalStatus",
+            label: "Approval",
+            render: (v, row) => {
+              const status = String(v || "").toUpperCase();
+              let badge = "-";
+              if (status === "PENDING") badge = <span className="badge badge-warning">PENDING</span>;
+              else if (status === "APPROVED") badge = <span className="badge badge-success">APPROVED</span>;
+              else if (status === "REJECTED") badge = <span className="badge badge-danger">REJECTED</span>;
+              else if (status) badge = <span className="badge">{status}</span>;
+              if (!row.approvalEventId) return badge;
+              return (
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  {badge}
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={() => {
+                      localStorage.setItem(APPROVAL_FOCUS_KEY, String(row.approvalEventId));
+                      window.dispatchEvent(new CustomEvent("bd_pos_navigate", { detail: { view: "approvals" } }));
+                    }}
+                  >
+                    Open
+                  </button>
+                </div>
+              );
+            },
+          },
+          {
+            key: "reason",
+            label: "Reason",
+            render: (_, row) => (row.reasonCode ? `${row.reasonCode} - ${row.reasonLabel || row.reason || "-"}` : row.reason || "-"),
+          },
           {
             key: "actions",
             label: "Actions",

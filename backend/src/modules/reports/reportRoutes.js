@@ -17,6 +17,9 @@ const {
   exportShrinkageControlPDF,
   getStaffPerformanceScorecard,
   getAuditActivityTrail,
+  getChequeLedger,
+  exportChequeLedgerCSV,
+  exportChequeLedgerPDF,
 } = require("./reportController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -39,5 +42,8 @@ router.get("/shrinkage-control/export.csv", requireAuth, requirePermission("repo
 router.get("/shrinkage-control/export.pdf", requireAuth, requirePermission("report.view"), exportShrinkageControlPDF);
 router.get("/staff-kpi", requireAuth, requirePermission("report.view"), getStaffPerformanceScorecard);
 router.get("/audit-activity", requireAuth, requirePermission("report.view"), getAuditActivityTrail);
+router.get("/cheque-ledger", requireAuth, requirePermission("report.view"), getChequeLedger);
+router.get("/cheque-ledger/export.csv", requireAuth, requirePermission("report.view"), exportChequeLedgerCSV);
+router.get("/cheque-ledger/export.pdf", requireAuth, requirePermission("report.view"), exportChequeLedgerPDF);
 
 module.exports = router;

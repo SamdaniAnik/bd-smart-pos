@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { getLang, t } from "../i18n";
 
 function normalize(v) {
   return String(v ?? "").toLowerCase();
@@ -12,6 +13,18 @@ function DataTable({
   pageSize = 8,
   allowExport = true,
 }) {
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+
   const [sortKey, setSortKey] = useState(columns[0]?.key || "");
   const [sortDir, setSortDir] = useState("asc");
   const [page, setPage] = useState(1);
@@ -102,136 +115,147 @@ function DataTable({
 
   return (
     <div className="datatable">
-      {title ? <h4>{title}</h4> : null}
-      <div className="datatable-toolbar">
-        <select
-          value={pageSizeState}
-          onChange={(e) => {
-            setPageSizeState(Number(e.target.value));
-            setPage(1);
-          }}
+      <div className="datatable-surface">
+        <div
+          className={`datatable-card-head ${title ? "" : "datatable-card-head--toolbar-only"}`}
         >
-          <option value={5}>5 rows</option>
-          <option value={8}>8 rows</option>
-          <option value={10}>10 rows</option>
-          <option value={20}>20 rows</option>
-          <option value={50}>50 rows</option>
-        </select>
-        <button type="button" className="btn-secondary btn-sm" onClick={() => setShowColumnPicker((p) => !p)}>
-          Columns
-        </button>
-        {allowExport ? (
-          <button type="button" className="btn-secondary btn-sm" onClick={exportFilteredCSV}>
-            Export CSV
-          </button>
-        ) : null}
-      </div>
-      {showColumnPicker ? (
-        <div className="datatable-column-picker">
-          {columns.map((c) => (
-            <label key={c.key}>
-              <input
-                type="checkbox"
-                checked={!hiddenColumns.includes(c.key)}
-                onChange={() => toggleColumn(c.key)}
-                style={{ width: "auto", marginRight: 6 }}
-              />
-              {c.label}
+          {title ? <h4 className="datatable-title">{title}</h4> : null}
+          <div className="datatable-toolbar">
+            <label className="datatable-page-size">
+              <span className="datatable-page-size-label">{tt("dtRowsPerPage")}</span>
+              <select
+                className="form-select-sm"
+                value={pageSizeState}
+                onChange={(e) => {
+                  setPageSizeState(Number(e.target.value));
+                  setPage(1);
+                }}
+              >
+                <option value={5}>5</option>
+                <option value={8}>8</option>
+                <option value={10}>10</option>
+                <option value={20}>20</option>
+                <option value={50}>50</option>
+              </select>
             </label>
-          ))}
+            <button type="button" className="btn-secondary btn-sm" onClick={() => setShowColumnPicker((p) => !p)}>
+              {tt("dtColumns")}
+            </button>
+            {allowExport ? (
+              <button type="button" className="btn-secondary btn-sm" onClick={exportFilteredCSV}>
+                {tt("dtExportCsv")}
+              </button>
+            ) : null}
+          </div>
         </div>
-      ) : null}
-      <div className="datatable-wrapper">
-        <table>
-          <thead>
-            <tr>
-              {visibleColumns.map((c) => (
-                <th key={c.key} onClick={() => onSort(c.key)} style={{ cursor: "pointer" }}>
-                  {c.label} {sortKey === c.key ? (sortDir === "asc" ? "↑" : "↓") : ""}
-                </th>
-              ))}
-            </tr>
-            <tr>
-              {visibleColumns.map((c) => {
-                const cfg = filterConfigMap[c.key];
-                if (c.key === "actions") {
-                  return <th key={`${c.key}-filter`} />;
-                }
-                return (
-                  <th key={`${c.key}-filter`} onClick={(e) => e.stopPropagation()}>
-                    {cfg ? (
-                      <select
-                        className="datatable-header-filter"
-                        value={columnFilters[c.key] || ""}
-                        onChange={(e) => {
-                          setColumnFilters((prev) => ({ ...prev, [c.key]: e.target.value }));
-                          setPage(1);
-                        }}
-                      >
-                        <option value="">{cfg.label}</option>
-                        {cfg.options.map((o) => (
-                          <option key={String(o.value)} value={o.value}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input
-                        className="datatable-header-filter"
-                        placeholder={`Filter ${c.label}`}
-                        value={columnFilters[c.key] || ""}
-                        onChange={(e) => {
-                          setColumnFilters((prev) => ({ ...prev, [c.key]: e.target.value }));
-                          setPage(1);
-                        }}
-                      />
-                    )}
-                  </th>
-                );
-              })}
-            </tr>
-          </thead>
-          <tbody>
-            {pagedRows.map((row, idx) => (
-              <tr key={row.id || idx}>
+        {showColumnPicker ? (
+          <div className="datatable-column-picker">
+            {columns.map((c) => (
+              <label key={c.key} className="datatable-column-picker-item">
+                <input type="checkbox" checked={!hiddenColumns.includes(c.key)} onChange={() => toggleColumn(c.key)} />
+                <span>{c.label}</span>
+              </label>
+            ))}
+          </div>
+        ) : null}
+        <div className="datatable-wrapper">
+          <table className="datatable-table">
+            <thead>
+              <tr>
                 {visibleColumns.map((c) => (
-                  <td key={c.key} className={c.key === "actions" ? "actions-cell" : undefined}>
-                    {c.render ? c.render(row[c.key], row) : row[c.key]}
-                  </td>
+                  <th key={c.key} className="datatable-th-sortable" scope="col">
+                    <button type="button" className="datatable-sort-btn" onClick={() => onSort(c.key)}>
+                      <span>{c.label}</span>
+                      <span className="datatable-sort-icon" aria-hidden>
+                        {sortKey === c.key ? (sortDir === "asc" ? "↑" : "↓") : "↕"}
+                      </span>
+                    </button>
+                  </th>
                 ))}
               </tr>
-            ))}
-            {!pagedRows.length ? (
-              <tr>
-                <td colSpan={visibleColumns.length || 1} style={{ textAlign: "center", color: "var(--muted)", padding: "24px 12px" }}>
-                  No data found
-                </td>
+              <tr className="datatable-filter-row">
+                {visibleColumns.map((c) => {
+                  const cfg = filterConfigMap[c.key];
+                  if (c.key === "actions") {
+                    return <th key={`${c.key}-filter`} className="datatable-th-filter" />;
+                  }
+                  return (
+                    <th key={`${c.key}-filter`} className="datatable-th-filter" onClick={(e) => e.stopPropagation()}>
+                      {cfg ? (
+                        <select
+                          className="form-select-sm datatable-header-filter"
+                          value={columnFilters[c.key] || ""}
+                          onChange={(e) => {
+                            setColumnFilters((prev) => ({ ...prev, [c.key]: e.target.value }));
+                            setPage(1);
+                          }}
+                        >
+                          <option value="">{cfg.label}</option>
+                          {cfg.options.map((o) => (
+                            <option key={String(o.value)} value={o.value}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          className="datatable-header-filter"
+                          placeholder={tt("dtFilterPlaceholder", { label: c.label })}
+                          value={columnFilters[c.key] || ""}
+                          onChange={(e) => {
+                            setColumnFilters((prev) => ({ ...prev, [c.key]: e.target.value }));
+                            setPage(1);
+                          }}
+                        />
+                      )}
+                    </th>
+                  );
+                })}
               </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </div>
-      <div className="datatable-footer">
-        <span>
-          {filteredRows.length} rows • Page {safePage}/{totalPages}
-        </span>
-        <div style={{ display: "flex", gap: 6 }}>
-          <button className="btn-secondary btn-sm" onClick={() => setPage(1)} disabled={safePage === 1}>
-            First
-          </button>
-          <button className="btn-secondary btn-sm" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={safePage === 1}>
-            Prev
-          </button>
-          <button
-            className="btn-secondary btn-sm"
-            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-            disabled={safePage === totalPages}
-          >
-            Next
-          </button>
-          <button className="btn-secondary btn-sm" onClick={() => setPage(totalPages)} disabled={safePage === totalPages}>
-            Last
-          </button>
+            </thead>
+            <tbody>
+              {pagedRows.map((row, idx) => (
+                <tr key={row.id ?? idx}>
+                  {visibleColumns.map((c) => (
+                    <td key={c.key} className={c.key === "actions" ? "actions-cell" : undefined}>
+                      {c.render ? c.render(row[c.key], row) : row[c.key]}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+              {!pagedRows.length ? (
+                <tr>
+                  <td colSpan={visibleColumns.length || 1} className="datatable-empty">
+                    {tt("dtNoData")}
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+        <div className="datatable-footer">
+          <span className="datatable-footer-meta">
+            <strong>{filteredRows.length}</strong> {tt("dtFooterRows")} · {tt("dtFooterPage", { page: safePage, total: totalPages })}
+          </span>
+          <div className="datatable-pagination">
+            <button type="button" className="btn-secondary btn-sm" onClick={() => setPage(1)} disabled={safePage === 1}>
+              {tt("dtFirst")}
+            </button>
+            <button type="button" className="btn-secondary btn-sm" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={safePage === 1}>
+              {tt("dtPrev")}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={safePage === totalPages}
+            >
+              {tt("dtNext")}
+            </button>
+            <button type="button" className="btn-secondary btn-sm" onClick={() => setPage(totalPages)} disabled={safePage === totalPages}>
+              {tt("dtLast")}
+            </button>
+          </div>
         </div>
       </div>
     </div>

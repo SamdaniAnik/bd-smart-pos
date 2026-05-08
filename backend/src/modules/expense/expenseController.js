@@ -1,5 +1,5 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
 
 exports.createExpense = async (req, res) => {
@@ -78,6 +78,7 @@ exports.createExpense = async (req, res) => {
 
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -94,6 +95,7 @@ exports.getExpenses = async (req, res) => {
     });
     res.json(expenses);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -112,6 +114,7 @@ exports.getExpenseDetails = async (req, res) => {
     if (!expense) return res.status(404).json({ error: "Expense not found" });
     res.json(expense);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -197,6 +200,7 @@ exports.updateExpense = async (req, res) => {
 
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -228,6 +232,7 @@ exports.deleteExpense = async (req, res) => {
 
     res.json({ message: "Expense deleted" });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

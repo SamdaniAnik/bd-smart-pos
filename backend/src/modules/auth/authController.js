@@ -1,6 +1,7 @@
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const prisma = require("../../utils/prisma");
+const config = require("../../utils/config");
 const { writeAuditLog } = require("../../utils/audit");
 
 exports.register = async (req, res) => {
@@ -36,8 +37,8 @@ exports.login = async (req, res) => {
 
     const token = jwt.sign(
       { userId: user.id, branchId: user.branchId, roleId: user.roleId },
-      process.env.JWT_SECRET || "dev_secret",
-      { expiresIn: "24h" }
+      config.jwtSecret,
+      { expiresIn: config.jwtExpiresIn }
     );
     const permissions = user.role.rolePermissions.map((rp) => rp.permission.code);
     res.json({ token, user, permissions });

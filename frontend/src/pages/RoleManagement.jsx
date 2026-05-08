@@ -3,10 +3,22 @@ import api from "../services/api";
 import DataTable from "../components/DataTable";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
 import { notifyPermissionRequired } from "../utils/notify";
+import { getLang, t } from "../i18n";
 
 function RoleManagement() {
   const permissionsForUser = getStoredPermissions();
   const canManageRbac = hasPermission("rbac.manage", permissionsForUser);
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
 
   const [roles, setRoles] = useState([]);
   const [permissions, setPermissions] = useState([]);
@@ -55,7 +67,7 @@ function RoleManagement() {
   const createRole = async (e) => {
     e.preventDefault();
     if (!canManageRbac) {
-      notifyPermissionRequired("rbac.manage.");
+      notifyPermissionRequired(tt("rmNeedPermManage"));
       return;
     }
     await api.post("/rbac/roles", { name: newRole });
@@ -65,7 +77,7 @@ function RoleManagement() {
 
   const savePermissions = async () => {
     if (!canManageRbac) {
-      notifyPermissionRequired("rbac.manage.");
+      notifyPermissionRequired(tt("rmNeedPermManage"));
       return;
     }
     if (!selectedRoleId) return;
@@ -77,7 +89,7 @@ function RoleManagement() {
 
   const applyTemplate = async () => {
     if (!canManageRbac) {
-      notifyPermissionRequired("rbac.manage.");
+      notifyPermissionRequired(tt("rmNeedPermManage"));
       return;
     }
     if (!selectedRoleId || !selectedTemplateName) return;
@@ -90,7 +102,7 @@ function RoleManagement() {
   const createUser = async (e) => {
     e.preventDefault();
     if (!canManageRbac) {
-      notifyPermissionRequired("rbac.manage.");
+      notifyPermissionRequired(tt("rmNeedPermManage"));
       return;
     }
     await api.post("/rbac/users", {
@@ -104,7 +116,7 @@ function RoleManagement() {
 
   const updateUserRole = async (userId, roleId) => {
     if (!canManageRbac) {
-      notifyPermissionRequired("rbac.manage.");
+      notifyPermissionRequired(tt("rmNeedPermManage"));
       return;
     }
     await api.patch(`/rbac/users/${userId}/role`, { roleId: Number(roleId) });
@@ -174,7 +186,7 @@ function RoleManagement() {
 
   const saveMatrixBulk = async () => {
     if (!canManageRbac) {
-      notifyPermissionRequired("rbac.manage.");
+      notifyPermissionRequired(tt("rmNeedPermManage"));
       return;
     }
     if (!matrixDraftUpdates.length) return;
@@ -183,22 +195,29 @@ function RoleManagement() {
   };
 
   return (
-    <div>
-      <h2>Role Management</h2>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Role management</div>
+          <div className="page-title">{tt("roleManagement")}</div>
+          <div className="page-subtitle">{tt("rmSubtitle")}</div>
+        </div>
+      </div>
       {!canManageRbac ? (
         <div className="page-card" style={{ marginBottom: 12 }}>
-          <strong>Permission required:</strong> <code>rbac.manage</code> to create roles/users and change permission assignments.
+          <p style={{ margin: 0, fontSize: 13 }}>{tt("rmPermBanner")}</p>
         </div>
       ) : null}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
         <div>
-          <h4>Create Role</h4>
+          <h4>{tt("rmCreateRole")}</h4>
           <form onSubmit={createRole}>
-            <input placeholder="Role name" value={newRole} onChange={(e) => setNewRole(e.target.value)} />
-            <button type="submit" disabled={!canManageRbac}>Create Role</button>
+            <input placeholder={tt("rmPhRoleName")} value={newRole} onChange={(e) => setNewRole(e.target.value)} />
+            <button type="submit" disabled={!canManageRbac}>{tt("rmCreateRoleBtn")}</button>
           </form>
-          <h4 style={{ marginTop: "14px" }}>Assign Permissions</h4>
+          <h4 style={{ marginTop: "14px" }}>{tt("rmAssignPerms")}</h4>
           <select
+            className="form-select-sm"
             value={selectedRoleId}
             onChange={(e) => {
               const nextRoleId = e.target.value;
@@ -207,7 +226,7 @@ function RoleManagement() {
               setSelectedPermissionIds((role?.rolePermissions || []).map((rp) => rp.permissionId));
             }}
           >
-            <option value="">Select Role</option>
+            <option value="">{tt("rmPhSelectRole")}</option>
             {roles.map((role) => (
               <option key={role.id} value={role.id}>
                 {role.name}
@@ -228,11 +247,11 @@ function RoleManagement() {
             ))}
           </div>
           <button style={{ marginTop: "10px" }} onClick={savePermissions} disabled={!canManageRbac}>
-            Save Permissions
+            {tt("rmSavePerms")}
           </button>
-          <h4 style={{ marginTop: "14px" }}>Apply Role Template</h4>
-          <select value={selectedTemplateName} onChange={(e) => setSelectedTemplateName(e.target.value)}>
-            <option value="">Select Template</option>
+          <h4 style={{ marginTop: "14px" }}>{tt("rmApplyTemplate")}</h4>
+          <select className="form-select-sm" value={selectedTemplateName} onChange={(e) => setSelectedTemplateName(e.target.value)}>
+            <option value="">{tt("rmPhSelectTemplate")}</option>
             {Object.keys(templates).map((templateName) => (
               <option key={templateName} value={templateName}>
                 {templateName}
@@ -240,60 +259,60 @@ function RoleManagement() {
             ))}
           </select>
           <button style={{ marginTop: "8px" }} onClick={applyTemplate} disabled={!canManageRbac}>
-            Apply Template
+            {tt("rmApplyTemplateBtn")}
           </button>
         </div>
         <div>
-          <h4>Create User</h4>
+          <h4>{tt("rmCreateUser")}</h4>
           <form onSubmit={createUser}>
-            <input placeholder="Name" value={userForm.name} onChange={(e) => setUserForm({ ...userForm, name: e.target.value })} />
-            <input placeholder="Email" value={userForm.email} onChange={(e) => setUserForm({ ...userForm, email: e.target.value })} />
+            <input placeholder={tt("colName")} value={userForm.name} onChange={(e) => setUserForm({ ...userForm, name: e.target.value })} />
+            <input placeholder={tt("email")} value={userForm.email} onChange={(e) => setUserForm({ ...userForm, email: e.target.value })} />
             <input
               type="password"
-              placeholder="Password"
+              placeholder={tt("password")}
               value={userForm.password}
               onChange={(e) => setUserForm({ ...userForm, password: e.target.value })}
             />
-            <select value={userForm.roleId} onChange={(e) => setUserForm({ ...userForm, roleId: e.target.value })}>
-              <option value="">Select Role</option>
+            <select className="form-select-sm" value={userForm.roleId} onChange={(e) => setUserForm({ ...userForm, roleId: e.target.value })}>
+              <option value="">{tt("rmPhSelectRole")}</option>
               {roles.map((role) => (
                 <option key={role.id} value={role.id}>
                   {role.name}
                 </option>
               ))}
             </select>
-            <select value={userForm.branchId} onChange={(e) => setUserForm({ ...userForm, branchId: e.target.value })}>
-              <option value="">Select Branch</option>
+            <select className="form-select-sm" value={userForm.branchId} onChange={(e) => setUserForm({ ...userForm, branchId: e.target.value })}>
+              <option value="">{tt("rmPhSelectBranch")}</option>
               {branches.map((branch) => (
                 <option key={branch.id} value={branch.id}>
                   {branch.name}
                 </option>
               ))}
             </select>
-            <button type="submit" disabled={!canManageRbac}>Create User</button>
+            <button type="submit" disabled={!canManageRbac}>{tt("rmCreateUserBtn")}</button>
           </form>
         </div>
       </div>
       <div className="page-card" style={{ marginTop: 14, marginBottom: 12 }}>
-        <h4 style={{ marginTop: 0 }}>Role-based Action Matrix</h4>
+        <h4 style={{ marginTop: 0 }}>{tt("rmMatrixTitle")}</h4>
         <div className="form-grid" style={{ marginBottom: 8 }}>
           <input
-            placeholder="Search permission (e.g. sale.create)"
+            placeholder={tt("rmPhSearchPerm")}
             value={matrixFilter}
             onChange={(e) => setMatrixFilter(e.target.value)}
           />
-          <select value={matrixGroup} onChange={(e) => setMatrixGroup(e.target.value)}>
+          <select className="form-select-sm" value={matrixGroup} onChange={(e) => setMatrixGroup(e.target.value)}>
             {permissionGroups.map((group) => (
               <option key={group} value={group}>
-                {group === "all" ? "All modules" : group}
+                {group === "all" ? tt("rmAllModules") : group}
               </option>
             ))}
           </select>
           <button type="button" className="btn-secondary" onClick={() => setMatrixDraft({})} disabled={!Object.keys(matrixDraft).length}>
-            Reset Unsaved
+            {tt("rmResetUnsaved")}
           </button>
           <button type="button" onClick={saveMatrixBulk} disabled={!canManageRbac || !matrixDraftUpdates.length}>
-            Save Matrix Changes ({matrixDraftUpdates.length})
+            {tt("rmSaveMatrixChanges", { n: matrixDraftUpdates.length })}
           </button>
         </div>
         <div style={{ maxHeight: 380, overflow: "auto", border: "1px solid #ddd", borderRadius: 10 }}>
@@ -301,7 +320,7 @@ function RoleManagement() {
             <thead>
               <tr>
                 <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e2e8f0", position: "sticky", top: 0, background: "#fff" }}>
-                  Action
+                  {tt("rmAction")}
                 </th>
                 {roles.map((role) => (
                   <th
@@ -330,7 +349,7 @@ function RoleManagement() {
                             setMatrixDraft((prev) => ({ ...prev, [key]: !Boolean(checked) }));
                           }}
                           style={{ width: "auto" }}
-                          title={!canManageRbac ? "Requires rbac.manage permission" : "Editable in bulk matrix mode"}
+                          title={!canManageRbac ? tt("rmTitleNeedsPerm") : tt("rmTitleBulkEditable")}
                         />
                       </td>
                     );
@@ -340,7 +359,7 @@ function RoleManagement() {
               {!matrixPermissions.length ? (
                 <tr>
                   <td colSpan={roles.length + 1} style={{ padding: 10, textAlign: "center", color: "var(--muted)" }}>
-                    No permissions found for current filter.
+                    {tt("rmNoPermFound")}
                   </td>
                 </tr>
               ) : null}
@@ -348,12 +367,12 @@ function RoleManagement() {
           </table>
         </div>
         <div style={{ marginTop: 8, color: "var(--muted)" }}>
-          Tip: toggle any cells across roles, then click "Save Matrix Changes" once.
+          {tt("rmTip")}
         </div>
       </div>
 
       <DataTable
-        title="Users"
+        title={tt("rmUsersTitle")}
         rows={users.map((u) => ({
           ...u,
           branchName: u.branch?.name || "-",
@@ -361,16 +380,17 @@ function RoleManagement() {
         }))}
         searchableKeys={["name", "email", "branchName", "roleName"]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "name", label: "Name" },
-          { key: "email", label: "Email" },
-          { key: "branchName", label: "Branch" },
-          { key: "roleName", label: "Role" },
+          { key: "id", label: tt("colId") },
+          { key: "name", label: tt("colName") },
+          { key: "email", label: tt("email") },
+          { key: "branchName", label: tt("rmBranch") },
+          { key: "roleName", label: tt("rmRole") },
           {
             key: "roleId",
-            label: "Change Role",
+            label: tt("rmChangeRole"),
             render: (v, row) => (
               <select
+                className="form-select-sm"
                 value={v}
                 onChange={(e) => updateUserRole(row.id, e.target.value)}
                 disabled={!canManageRbac}

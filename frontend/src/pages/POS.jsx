@@ -3,6 +3,15 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Select from "react-select";
 import api from "../services/api";
 import socket from "../services/socket";
+import {
+  CUSTOMER_DISPLAY_STATUS,
+  openCustomerDisplayWindow,
+  publishCustomerDisplayCleared,
+  publishCustomerDisplayCompleted,
+  publishCustomerDisplayState,
+} from "../services/customerDisplay";
+import { downloadMushak63XmlWithCompletenessHint } from "../services/nbrMushak63";
+import { getLang, t } from "../i18n";
 import DataTable from "../components/DataTable";
 import ManagerPinModal from "../components/ManagerPinModal";
 import { getStoredPermissions, hasAnyPermission } from "../utils/permissions";
@@ -14,12 +23,14 @@ import {
   notifyPermissionRequired,
   notifySuccess,
 } from "../utils/notify";
+import { formatBDT as formatBdtBd } from "../utils/currency";
 
 const OFFLINE_QUEUE_KEY = "bd_pos_offline_queue_v1";
 const OFFLINE_LOG_KEY = "bd_pos_offline_log_v1";
 const OFFLINE_SYNC_LOCK_KEY = "bd_pos_offline_sync_lock_v1";
 const OFFLINE_DISCARD_PIN_KEY = "bd_pos_manager_pin";
 const CART_TEMPLATE_KEY = "bd_pos_cart_templates_v1";
+const PRODUCTS_OFFLINE_CACHE_KEY = "bd_pos_products_offline_cache_v1";
 const PRICE_OVERRIDE_APPROVAL_PERCENT = 5;
 const PRICE_OVERRIDE_APPROVAL_AMOUNT = 50;
 const DIGITAL_METHODS = new Set(["bKash", "Nagad", "Rocket", "Card"]);
@@ -222,6 +233,18 @@ function POS() {
   const pinResolveRef = useRef(null);
   const barcodeInputRef = useRef(null);
 
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+
   const queryClient = useQueryClient();
   const invalidatePosQueries = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ["pos"] });
@@ -229,7 +252,27 @@ function POS() {
 
   const { data: products = [] } = useQuery({
     queryKey: ["pos", "products"],
-    queryFn: async () => (await api.get("/products?include=variants")).data,
+    queryFn: async () => {
+      try {
+        const res = await api.get("/products?include=variants");
+        if (Array.isArray(res.data)) {
+          writeJsonStorage(PRODUCTS_OFFLINE_CACHE_KEY, {
+            data: res.data,
+            cachedAt: Date.now(),
+          });
+        }
+        return res.data;
+      } catch (error) {
+        const cached = readJsonStorage(PRODUCTS_OFFLINE_CACHE_KEY, null);
+        if (cached && Array.isArray(cached.data)) return cached.data;
+        throw error;
+      }
+    },
+    initialData: () => {
+      const cached = readJsonStorage(PRODUCTS_OFFLINE_CACHE_KEY, null);
+      if (cached && Array.isArray(cached.data)) return cached.data;
+      return undefined;
+    },
     staleTime: 15_000,
   });
 
@@ -268,6 +311,16 @@ function POS() {
     staleTime: 5_000,
   });
 
+  const branchIdForFiscal = typeof window !== "undefined" ? localStorage.getItem("bd_pos_branch_id") || "1" : "1";
+  const { data: fiscalGateData } = useQuery({
+    queryKey: ["fiscal-gate", branchIdForFiscal],
+    queryFn: async () => (await api.get("/fiscal/fiscal-period-status")).data,
+    staleTime: 45_000,
+    refetchOnWindowFocus: true,
+    retry: 1,
+  });
+  const fiscalBlocked = Boolean(fiscalGateData && fiscalGateData.ok === false);
+
   const customerPhoneReady = debouncedCustomerPhone.length >= 6;
 
   const { data: customerLoyaltyData, isSuccess: loyaltyLookupOk } = useQuery({
@@ -299,11 +352,7 @@ function POS() {
   const receiptLanguage = storeSettings.receiptLanguage === "bn" ? "bn" : "en";
   const receiptLocale = receiptLanguage === "bn" ? "bn-BD" : "en-US";
   const formatBDT = (value) =>
-    new Intl.NumberFormat(receiptLocale, {
-      style: "currency",
-      currency: "BDT",
-      maximumFractionDigits: 2,
-    }).format(Number(value || 0));
+    formatBdtBd(value, { lang: receiptLanguage, decimals: 2 });
   const filteredProducts = useMemo(() => {
     const q = String(productSearch || "").trim().toLowerCase();
     if (!q) return products;
@@ -327,41 +376,26 @@ function POS() {
       minute: "2-digit",
       second: "2-digit",
     });
-  const receiptText = receiptLanguage === "bn"
-    ? {
-        invoice: "ইনভয়েস",
-        date: "তারিখ",
-        payment: "পেমেন্ট",
-        customer: "কাস্টমার",
-        walkInCustomer: "ওয়াক-ইন কাস্টমার",
-        item: "পণ্য",
-        qty: "পরিমাণ",
-        rate: "দর",
-        amount: "মূল্য",
-        subTotal: "সাবটোটাল",
-        vat: "ভ্যাট",
-        discount: "ডিসকাউন্ট",
-        total: "সর্বমোট",
-        paid: "পরিশোধিত",
-        due: "বাকি",
-      }
-    : {
-        invoice: "Invoice",
-        date: "Date",
-        payment: "Payment",
-        customer: "Customer",
-        walkInCustomer: "Walk-in Customer",
-        item: "Item",
-        qty: "Qty",
-        rate: "Rate",
-        amount: "Amount",
-        subTotal: "Subtotal",
-        vat: "VAT",
-        discount: "Discount",
-        total: "Total",
-        paid: "Paid",
-        due: "Due",
-      };
+  const receiptText = useMemo(
+    () => ({
+      invoice: t(receiptLanguage, "receiptInvoice"),
+      date: t(receiptLanguage, "receiptDate"),
+      payment: t(receiptLanguage, "receiptPayment"),
+      customer: t(receiptLanguage, "receiptCustomer"),
+      walkInCustomer: t(receiptLanguage, "receiptWalkIn"),
+      item: t(receiptLanguage, "receiptItem"),
+      qty: t(receiptLanguage, "receiptQty"),
+      rate: t(receiptLanguage, "receiptRate"),
+      amount: t(receiptLanguage, "receiptAmount"),
+      subTotal: t(receiptLanguage, "receiptSubTotal"),
+      vat: t(receiptLanguage, "receiptVat"),
+      discount: t(receiptLanguage, "receiptDiscount"),
+      total: t(receiptLanguage, "receiptTotal"),
+      paid: t(receiptLanguage, "receiptPaid"),
+      due: t(receiptLanguage, "receiptDue"),
+    }),
+    [receiptLanguage]
+  );
 
   const persistOfflineQueue = (updater) => {
     setOfflineQueue((prev) => {
@@ -396,7 +430,7 @@ function POS() {
       pinResolveRef.current = resolve;
       setPinModal({
         open: true,
-        title: title || "Manager approval",
+        title: title || tt("posPinManagerApproval"),
         message: message || "",
       });
     });
@@ -605,7 +639,7 @@ function POS() {
     const variantId = scannedVariant?.id ?? selectedVariantId ?? null;
 
     if (product.hasVariants && !variantId) {
-      notifyActionRequired("this product has variants. Scan a variant barcode or select size/color on the product tile.");
+      notifyActionRequired(tt("posNotifyVariantScanTile"));
       return;
     }
     if (product.sellByWeight && variantId) {
@@ -627,7 +661,7 @@ function POS() {
         : null;
     }
     if (product.hasVariants && (!matchedVariant || !matchedVariant.id)) {
-      notifyError("selected variant is not available for this product.");
+      notifyError(tt("posNotifyVariantUnavailable"));
       return;
     }
 
@@ -686,7 +720,7 @@ function POS() {
       setBarcode("");
       barcodeInputRef.current?.focus();
     } catch (error) {
-      notifyError(error.response?.data?.error || "product not found for barcode/SKU");
+      notifyError(error.response?.data?.error || tt("posNotifyProductNotFound"));
       barcodeInputRef.current?.focus();
     }
   };
@@ -990,12 +1024,12 @@ function POS() {
 
   const saveCartTemplate = () => {
     if (!cart.length) {
-      notifyActionRequired("cart is empty. Add items before saving a template.");
+      notifyActionRequired(tt("posNotifyTplCartEmpty"));
       return;
     }
     const name = String(cartTemplateName || "").trim();
     if (!name) {
-      notifyActionRequired("enter a template name.");
+      notifyActionRequired(tt("posNotifyTplName"));
       return;
     }
     const template = {
@@ -1106,12 +1140,16 @@ function POS() {
   }, [customer.phone]);
 
   const handleCheckout = async () => {
+    if (fiscalBlocked) {
+      notifyActionRequired(fiscalGateData?.message || tt("posNotifyFiscalCheckout"));
+      return;
+    }
     if (cart.some((x) => x.sellByWeight && !(Number(x.weightKg) > 0))) {
-      notifyActionRequired("enter weight (kg) for each weighed item before checkout.");
+      notifyActionRequired(tt("posNotifyWeightCheckout"));
       return;
     }
     if (paymentMethod !== "Split" && DIGITAL_METHODS.has(paymentMethod) && !String(paymentChannel || "").trim()) {
-      notifyActionRequired(`transaction/reference ID is required for ${paymentMethod} payment.`);
+      notifyActionRequired(tt("posNotifyTxnRef", { method: paymentMethod }));
       return;
     }
     if (paymentMethod === "Split") {
@@ -1119,17 +1157,17 @@ function POS() {
         (line) => DIGITAL_METHODS.has(String(line.method || "")) && !String(line.channel || "").trim()
       );
       if (missingRef) {
-        notifyActionRequired(`transaction/reference ID is required for split ${missingRef.method} line.`);
+        notifyActionRequired(tt("posNotifyTxnRefSplitLine", { method: missingRef.method }));
         return;
       }
     }
     if (managerApprovalNeeded && !String(approvalReason || "").trim()) {
-      notifyActionRequired("approval reason is required for manager-approved checkout actions.");
+      notifyActionRequired(tt("posNotifyApprovalReason"));
       return;
     }
     const payload = buildCheckoutPayload();
     try {
-      const response = await api.post("/sales/checkout", payload);
+      const response = await api.post("/sales/checkout", payload, { skipGlobalErrorToast: true });
 
       setCart([]);
       setPaidAmount("");
@@ -1155,21 +1193,52 @@ function POS() {
 
       const loyalty = response?.data?.loyalty;
       if (loyalty) {
-        notifySuccess(`sale completed. Loyalty: ${loyalty.points} pts available (${loyalty.tier}).`);
+        notifySuccess(
+          tt("posNotifySaleDoneLoyalty", {
+            points: loyalty.points,
+            tier: loyalty.tier,
+          })
+        );
       } else {
-        notifySuccess("sale completed.");
+        notifySuccess(tt("posNotifySaleCompleted"));
       }
+      const completedSale = response?.data?.sale || response?.data || {};
+      publishCustomerDisplayCompleted({
+        invoice: {
+          id: completedSale.id || null,
+          number: completedSale.invoiceNo || null,
+          date: completedSale.createdAt || new Date().toISOString(),
+        },
+        totals: {
+          subTotal,
+          vatAmount,
+          totalDiscount,
+          total,
+          paid: checkoutPaidAmount,
+          due: checkoutDue,
+        },
+      });
       invalidatePosQueries();
       barcodeInputRef.current?.focus();
     } catch (error) {
-      const apiError = error.response?.data?.error;
+      const raw = error.response?.data;
+      const apiError =
+        typeof raw === "string"
+          ? raw
+          : raw && typeof raw === "object" && raw.error != null
+            ? String(raw.error)
+            : "";
+      const apiCode =
+        raw && typeof raw === "object" && raw.code != null ? String(raw.code) : "";
+      const message =
+        String(apiError || "").trim() || error.message || tt("posNotifyCheckoutFailed");
       const shouldQueue = !error.response || error.code === "ERR_NETWORK";
       if (shouldQueue) {
         if (managerApprovalNeeded) {
-          notifyActionRequired("this checkout needs real-time manager approval and cannot be queued offline.");
+          notifyActionRequired(tt("posNotifyOfflineNeedsApproval"));
           return;
         }
-        const localRef = queueOfflineSale(payload, apiError || "Network unavailable");
+        const localRef = queueOfflineSale(payload, apiError || tt("posNotifyNetworkUnavailable"));
         setCart([]);
         setPaidAmount("");
         setDiscountType("AMOUNT");
@@ -1188,7 +1257,14 @@ function POS() {
         setPaymentBreakdown([{ method: "Cash", amount: "", channel: "" }]);
         setActiveHoldAuditLogId(null);
         setActiveQuoteAuditLogId(null);
-        notifySuccess(`network unavailable. Sale saved offline (${localRef}) and will auto-sync.`);
+        notifySuccess(tt("posNotifyOfflineQueued", { n: localRef }));
+      } else {
+        queryClient.invalidateQueries({ queryKey: ["fiscal-gate"] });
+        if (apiCode === "FISCAL_PERIOD_BLOCKED") {
+          notifyActionRequired(message);
+        } else {
+          notifyError(message);
+        }
       }
       barcodeInputRef.current?.focus();
     }
@@ -1219,7 +1295,7 @@ function POS() {
       setHoldNote("");
       setShowHeldPanel(true);
       invalidatePosQueries();
-      notifySuccess("cart held.");
+      notifySuccess(tt("posNotifyCartHeld"));
     } catch {
       consumeGlobalSubmitError();
     }
@@ -1231,7 +1307,7 @@ function POS() {
       const payload = buildCheckoutPayload();
       await api.post("/sales/quotes", { ...payload, quoteNote });
       setQuoteNote("");
-      notifySuccess("quotation saved. Open it from the Quotations menu.");
+      notifySuccess(tt("posNotifyQuoteSaved"));
     } catch {
       consumeGlobalSubmitError();
     }
@@ -1239,7 +1315,7 @@ function POS() {
 
   const applyHeldDraftToPos = (draft) => {
     if (!Array.isArray(draft?.cart) || !draft.cart.length) {
-      notifyActionRequired("held cart is empty.");
+      notifyActionRequired(tt("posNotifyHoldEmpty"));
       return false;
     }
     setCart(
@@ -1288,7 +1364,7 @@ function POS() {
         setShowHeldPanel(false);
         barcodeInputRef.current?.focus();
       } catch (error) {
-        if (!cancelled) notifyError(error?.response?.data?.error || "could not load quotation");
+        if (!cancelled) notifyError(error?.response?.data?.error || tt("posNotifyQuoteLoadFail"));
       }
     })();
     return () => {
@@ -1310,8 +1386,8 @@ function POS() {
     let resumePinExtra = "";
     if (!isOwnHold) {
       const entered = await askManagerPin({
-        title: "Resume another cashier's hold",
-        message: "This hold belongs to another cashier. Enter the manager PIN to load it.",
+        title: tt("posPinResumeTitle"),
+        message: tt("posPinResumeMsg"),
       });
       if (entered == null) return;
       resumePinExtra = String(entered).trim();
@@ -1328,15 +1404,15 @@ function POS() {
   };
 
   const discardHeldCart = async (row) => {
-    if (!window.confirm("Discard this held cart?")) return;
+    if (!window.confirm(tt("posConfirmDiscardHold"))) return;
     const holderId = row?.heldByUserId != null ? Number(row.heldByUserId) : null;
     const myId = currentUser?.id != null ? Number(currentUser.id) : null;
     const isOwnHold = holderId != null && myId != null && holderId === myId;
     let discardPinExtra = "";
     if (!isOwnHold) {
       const entered = await askManagerPin({
-        title: "Discard another cashier's hold",
-        message: "Enter the manager PIN to discard this hold.",
+        title: tt("posPinDiscardTitle"),
+        message: tt("posPinDiscardMsg"),
       });
       if (entered == null) return;
       discardPinExtra = String(entered).trim();
@@ -1437,7 +1513,7 @@ function POS() {
       try {
         parsed = JSON.parse(edited);
       } catch {
-        notifyError("invalid JSON. Conflict update canceled.");
+        notifyError(tt("posNotifyJsonInvalid"));
         return;
       }
       persistOfflineQueue((prev) =>
@@ -1528,7 +1604,7 @@ function POS() {
       message: `Auto-resolved ${resolvedCount} stock conflict item(s), skipped ${skippedCount}.`,
       createdAt: new Date().toISOString(),
     });
-    notifySuccess(`auto-resolved ${resolvedCount} stock conflict item(s). Skipped: ${skippedCount}.`);
+    notifySuccess(tt("posNotifyAutoResolveStock", { n: resolvedCount, m: skippedCount }));
   };
 
   const autoResolveFilteredConflicts = () => {
@@ -1538,7 +1614,7 @@ function POS() {
       return isFailed && (offlineConflictFilter === "ALL" ? true : conflictType === offlineConflictFilter);
     });
     if (!targetRows.length) {
-      notifyActionRequired("no failed conflicts found in the current filter.");
+      notifyActionRequired(tt("posNotifyNoFailedConflicts"));
       return;
     }
     const stockByProductId = new Map((products || []).map((p) => [Number(p.id), Number(p.stock || 0)]));
@@ -1605,17 +1681,17 @@ function POS() {
       message: `Auto-resolved ${resolvedCount} filtered conflict(s), skipped ${skippedCount}.`,
       createdAt: new Date().toISOString(),
     });
-    notifySuccess(`filtered resolver completed. Resolved: ${resolvedCount}, skipped: ${skippedCount}.`);
+    notifySuccess(tt("posNotifyFilteredResolver", { n: resolvedCount, m: skippedCount }));
   };
 
   const retryFilteredFailedItems = async () => {
     const filteredRows = offlineQueueRows.filter((row) => String(row.status || "").toUpperCase() === "FAILED");
     if (!filteredRows.length) {
-      notifyActionRequired("no failed rows in the current filter.");
+      notifyActionRequired(tt("posNotifyNoFailedRows"));
       return;
     }
     if (typeof navigator !== "undefined" && !navigator.onLine) {
-      notifyActionRequired("you are offline. Connect to the internet before retrying.");
+      notifyActionRequired(tt("posNotifyOnlineRequired"));
       return;
     }
     const ok = window.confirm(`Retry ${filteredRows.length} failed row(s) in current filter now?`);
@@ -1638,7 +1714,7 @@ function POS() {
       updated_at: String(row.updatedAtLabel || ""),
     }));
     if (!rows.length) {
-      notifyActionRequired("no queue rows found in the current filter.");
+      notifyActionRequired(tt("posNotifyNoQueueRows"));
       return;
     }
     const headers = Object.keys(rows[0]);
@@ -1666,7 +1742,7 @@ function POS() {
     const payload = row?.payload || {};
     const payloadCart = Array.isArray(payload.cart) ? payload.cart : [];
     if (!payloadCart.length) {
-      notifyError("queued payload has no cart lines.");
+      notifyError(tt("posNotifyQueueNoCartLines"));
       return;
     }
     setCart(
@@ -1712,7 +1788,7 @@ function POS() {
       localRef: row.localRef,
       createdAt: new Date().toISOString(),
     });
-    notifySuccess("queued sale loaded into POS cart. Review and checkout manually.");
+    notifySuccess(tt("posNotifyQueueLoaded"));
   };
 
   const markQueuedSaleResolved = (row) => {
@@ -1736,7 +1812,7 @@ function POS() {
       ["RESOLVED", "REVIEWING"].includes(String(row.status || "").toUpperCase())
     );
     if (!filteredResolved.length) {
-      notifyActionRequired("no REVIEWING or RESOLVED rows in the current filter.");
+      notifyActionRequired(tt("posNotifyNoReviewResolved"));
       return;
     }
     const ok = window.confirm(`Remove ${filteredResolved.length} REVIEWING/RESOLVED row(s) from queue?`);
@@ -1772,11 +1848,11 @@ function POS() {
   const applyBulkTagToFiltered = () => {
     const tag = String(bulkConflictTag || "").trim();
     if (!tag) {
-      notifyActionRequired("enter a tag or note first.");
+      notifyActionRequired(tt("posNotifyEnterTagFirst"));
       return;
     }
     if (!offlineQueueRows.length) {
-      notifyActionRequired("no rows in the current filter.");
+      notifyActionRequired(tt("posNotifyNoRowsInFilter"));
       return;
     }
     const refs = new Set(offlineQueueRows.map((x) => String(x.localRef)));
@@ -1797,7 +1873,7 @@ function POS() {
   const markFilteredFailedAsReviewing = () => {
     const targets = offlineQueueRows.filter((row) => String(row.status || "").toUpperCase() === "FAILED");
     if (!targets.length) {
-      notifyActionRequired("no FAILED rows in the current filter.");
+      notifyActionRequired(tt("posNotifyNoFailedInFilter"));
       return;
     }
     const refs = new Set(targets.map((x) => String(x.localRef)));
@@ -1848,11 +1924,11 @@ function POS() {
   const retryFailedQueuedSales = async () => {
     const failedRows = offlineQueue.filter((x) => String(x.status || "").toUpperCase() === "FAILED");
     if (!failedRows.length) {
-      notifyActionRequired("no failed queued sales to retry.");
+      notifyActionRequired(tt("posNotifyNoFailedToRetry"));
       return;
     }
     if (typeof navigator !== "undefined" && !navigator.onLine) {
-      notifyActionRequired("you are offline. Connect to the internet before retrying failed queue items.");
+      notifyActionRequired(tt("posNotifyOnlineForRetryFailed"));
       return;
     }
     const ok = window.confirm(`Retry ${failedRows.length} failed queued sale(s) now?`);
@@ -1900,7 +1976,7 @@ function POS() {
     invalidatePosQueries();
 
     if (!failedResults.length) {
-      notifySuccess(`bulk retry completed. Synced ${successCount}/${failedRows.length} failed queued sale(s).`);
+      notifySuccess(tt("posNotifyBulkRetryOk", { n: successCount, m: failedRows.length }));
       return;
     }
     const topFailures = failedResults
@@ -1908,23 +1984,27 @@ function POS() {
       .map((x) => `${x.localRef}: ${x.reason}`)
       .join("\n");
     notifyError(
-      `Bulk retry finished.\nSynced: ${successCount}\nStill failed: ${failedResults.length}\n\nTop errors:\n${topFailures}`
+      tt("posNotifyBulkRetryPartial", {
+        success: successCount,
+        stillFailed: failedResults.length,
+        topErrors: topFailures,
+      })
     );
   };
 
   const discardQueuedSale = async (row) => {
     if (!canDiscardOfflineQueue) {
-      notifyPermissionRequired("admin role or branch.manage/rbac.manage to discard queued sales.");
+      notifyPermissionRequired(tt("posNotifyPermDiscardQueue"));
       return;
     }
     const enteredPin = await askManagerPin({
-      title: "Discard offline queued sale",
-      message: "Admin only — enter manager PIN from Settings to discard this queued sale.",
+      title: tt("posPinDiscardQueueTitle"),
+      message: tt("posPinDiscardQueueMsg"),
     });
     if (enteredPin == null) return;
     const expectedPin = String(localStorage.getItem(OFFLINE_DISCARD_PIN_KEY) || "1234");
     if (String(enteredPin).trim() !== expectedPin) {
-      notifyError("invalid manager PIN. Discard canceled.");
+      notifyError(tt("posNotifyInvalidPinDiscard"));
       return;
     }
     persistOfflineQueue((prev) => prev.filter((x) => x.localRef !== row.localRef));
@@ -2045,7 +2125,7 @@ function POS() {
       const sale = res.data;
       buildAndPrintReceipt(sale);
     } catch (error) {
-      notifyError(error.response?.data?.error || "unable to print invoice");
+      notifyError(error.response?.data?.error || tt("posErrPrintInvoice"));
     }
   };
 
@@ -2055,7 +2135,17 @@ function POS() {
       const url = URL.createObjectURL(res.data);
       window.open(url, "_blank", "noopener,noreferrer");
     } catch (error) {
-      notifyError(error.response?.data?.error || "unable to open Mushak PDF");
+      notifyError(error.response?.data?.error || tt("posErrMushakPdf"));
+    }
+  };
+
+  const downloadMushak63Xml = async (sale) => {
+    const saleId = sale?.id;
+    if (!saleId) return;
+    try {
+      await downloadMushak63XmlWithCompletenessHint(saleId, sale?.mushakDocumentNo);
+    } catch (error) {
+      notifyError(error.response?.data?.error || tt("posErrMushakXml"));
     }
   };
 
@@ -2165,7 +2255,7 @@ function POS() {
       printWin.focus();
       printWin.print();
     } catch (error) {
-      notifyError(error.message || "unable to print test receipt");
+      notifyError(error.message || tt("posErrTestReceipt"));
     }
   };
 
@@ -2357,7 +2447,7 @@ function POS() {
       setPreviewHtml(html);
       setShowPreview(true);
     } catch (error) {
-      notifyError(error.response?.data?.error || "unable to preview invoice");
+      notifyError(error.response?.data?.error || tt("posErrPreviewInvoice"));
     }
   };
 
@@ -2395,44 +2485,161 @@ function POS() {
       (line) => DIGITAL_METHODS.has(String(line.method || "")) && !String(line.channel || "").trim()
     );
   const hasMissingApprovalReason = managerApprovalNeeded && !String(approvalReason || "").trim();
-  const checkoutRequirements = [
-    { label: "Cart has items", ok: cart.length > 0, hint: "Add at least one item" },
-    { label: "All weighted items have kg", ok: !hasMissingWeight, hint: "Enter weight for each kg item" },
-    {
-      label: "Payment reference is complete",
-      ok: !hasMissingDigitalRef && !hasMissingSplitRef,
-      hint: "Fill transaction/reference ID for digital payments",
-    },
-    {
-      label: "Approval reason added",
-      ok: !hasMissingApprovalReason,
-      hint: "Required only when manager approval is triggered",
-      optional: !managerApprovalNeeded,
-    },
-  ];
+  const checkoutRequirements = useMemo(
+    () => [
+      {
+        label: t(uiLang, "posReqCartItems"),
+        ok: cart.length > 0,
+        hint: t(uiLang, "posReqCartItemsHintAdd"),
+      },
+      {
+        label: t(uiLang, "posReqFiscal"),
+        ok: !fiscalBlocked,
+        hint: fiscalGateData?.message || t(uiLang, "posReqFiscalHintFb"),
+      },
+      {
+        label: t(uiLang, "posReqWeight"),
+        ok: !hasMissingWeight,
+        hint: t(uiLang, "posReqWeightHint"),
+      },
+      {
+        label: t(uiLang, "posReqPayRef"),
+        ok: !hasMissingDigitalRef && !hasMissingSplitRef,
+        hint: t(uiLang, "posReqPayRefHint"),
+      },
+      {
+        label: t(uiLang, "posReqApproval"),
+        ok: !hasMissingApprovalReason,
+        hint: t(uiLang, "posReqApprovalHint"),
+        optional: !managerApprovalNeeded,
+      },
+    ],
+    [
+      uiLang,
+      cart.length,
+      fiscalBlocked,
+      fiscalGateData?.message,
+      hasMissingWeight,
+      hasMissingDigitalRef,
+      hasMissingSplitRef,
+      hasMissingApprovalReason,
+      managerApprovalNeeded,
+    ]
+  );
   const checkoutBlockers = checkoutRequirements.filter((x) => !x.ok && !x.optional);
-  const holdRequirements = [
-    { label: "Cart has items", ok: cart.length > 0, hint: "Add at least one item before holding" },
-  ];
+  const holdRequirements = useMemo(
+    () => [
+      {
+        label: t(uiLang, "posReqCartItems"),
+        ok: cart.length > 0,
+        hint: t(uiLang, "posHoldNeedItems"),
+      },
+    ],
+    [uiLang, cart.length]
+  );
   const holdBlockers = holdRequirements.filter((x) => !x.ok);
-  const quoteRequirements = [
-    { label: "Cart has items", ok: cart.length > 0, hint: "Add at least one item before saving quote" },
-  ];
+  const quoteRequirements = useMemo(
+    () => [
+      {
+        label: t(uiLang, "posReqCartItems"),
+        ok: cart.length > 0,
+        hint: t(uiLang, "posQuoteNeedItems"),
+      },
+    ],
+    [uiLang, cart.length]
+  );
   const quoteBlockers = quoteRequirements.filter((x) => !x.ok);
 
+  useEffect(() => {
+    const storeForDisplay = {
+      name: storeSettings.storeName,
+      address: storeSettings.storeAddress,
+      phone: storeSettings.storePhone,
+      logoDataUrl: storeSettings.logoDataUrl,
+    };
+    const customerForDisplay =
+      customer.name || customer.phone
+        ? { name: customer.name, phone: customer.phone }
+        : null;
+    if (cart.length === 0) {
+      publishCustomerDisplayCleared({
+        store: storeForDisplay,
+        lang: receiptLanguage,
+        customer: customerForDisplay,
+        paymentMethod,
+      });
+      return;
+    }
+    publishCustomerDisplayState({
+      status: CUSTOMER_DISPLAY_STATUS.SHOPPING,
+      store: storeForDisplay,
+      lang: receiptLanguage,
+      cart: cart.map((item) => {
+        const unit = getUnitSellPrice(item);
+        const units = getBillingUnitsForItem(item);
+        return {
+          lineId: item.lineId || `${item.id}`,
+          id: item.id,
+          name: item.name,
+          variantLabel: item.matchedVariant?.label || "",
+          sellByWeight: !!item.sellByWeight,
+          qty: Number(item.qty || 0),
+          weightKg: Number(item.weightKg || 0),
+          unitPrice: unit,
+          lineTotal: unit * units,
+          vatRate: Number(item.vatRate || 0),
+        };
+      }),
+      totals: {
+        subTotal,
+        vatAmount,
+        totalDiscount,
+        total,
+        paid: checkoutPaidAmount,
+        due: checkoutDue,
+      },
+      customer: customerForDisplay,
+      paymentMethod,
+    });
+  }, [
+    cart,
+    subTotal,
+    vatAmount,
+    totalDiscount,
+    total,
+    checkoutPaidAmount,
+    checkoutDue,
+    paymentMethod,
+    customer.name,
+    customer.phone,
+    storeSettings.storeName,
+    storeSettings.storeAddress,
+    storeSettings.storePhone,
+    storeSettings.logoDataUrl,
+    receiptLanguage,
+  ]);
+
+  const handleOpenCustomerDisplay = () => {
+    const win = openCustomerDisplayWindow();
+    if (!win) {
+      notifyActionRequired(tt("posNotifyPopupBlocked"));
+    }
+  };
+
   return (
-    <div className="pos-layout">
+    <div className="page-stack page-stack--fluid">
+      <div className="pos-layout">
       {/* LEFT: PRODUCTS */}
       <div className="pos-panel pos-products">
         <header className="pos-header">
-          <h2>Products</h2>
+          <h2>{tt("products")}</h2>
           <div className="pos-status-badges">
             <span className={`badge ${isOnline ? "badge-success" : "badge-danger"}`}>
-              {isOnline ? "Online" : "Offline"}
+              {isOnline ? tt("posOnline") : tt("posOffline")}
             </span>
             {offlineQueue.length > 0 ? (
               <span className="badge badge-warning">
-                {isSyncingOffline ? "Syncing…" : `${offlineQueue.length} pending`}
+                {isSyncingOffline ? tt("posSyncing") : tt("posPending", { n: offlineQueue.length })}
               </span>
             ) : null}
             <button
@@ -2446,7 +2653,15 @@ function POS() {
                 });
               }}
             >
-              Held ({heldCarts.length})
+              {tt("posHeld", { n: heldCarts.length })}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={handleOpenCustomerDisplay}
+              title={tt("posCustomerDisplayTitle")}
+            >
+              🖥️ {tt("posCustomerDisplay")}
             </button>
           </div>
         </header>
@@ -2454,15 +2669,15 @@ function POS() {
         <form onSubmit={handleBarcodeAdd} className="pos-barcode-form">
           <input
             ref={barcodeInputRef}
-            placeholder="Scan barcode / SKU and press Enter"
+            placeholder={tt("posBarcodePlaceholder")}
             value={barcode}
             onChange={(e) => setBarcode(e.target.value)}
             className="pos-barcode-input"
           />
-          <button type="submit">Add</button>
+          <button type="submit">{tt("posAdd")}</button>
         </form>
         <input
-          placeholder="Search products by name, SKU, or category"
+          placeholder={tt("posSearchPlaceholder")}
           value={productSearch}
           onChange={(e) => setProductSearch(e.target.value)}
           className="pos-barcode-input"
@@ -2470,25 +2685,25 @@ function POS() {
 
         <div className="pos-metric-strip">
           <div className="metric">
-            <div className="metric-label">Today's Sales</div>
+            <div className="metric-label">{tt("posMetricTodaySales")}</div>
             <div className="metric-value">{formatBDT(summary.totalSales)}</div>
           </div>
           <div className="metric">
-            <div className="metric-label">Paid</div>
+            <div className="metric-label">{tt("posMetricPaid")}</div>
             <div className="metric-value">{formatBDT(summary.totalPaid)}</div>
           </div>
           <div className="metric">
-            <div className="metric-label">Due</div>
+            <div className="metric-label">{tt("posMetricDue")}</div>
             <div className="metric-value">{formatBDT(summary.totalDue)}</div>
           </div>
           <div className="metric">
-            <div className="metric-label">Bills</div>
+            <div className="metric-label">{tt("posMetricBills")}</div>
             <div className="metric-value">{summary.billCount}</div>
           </div>
         </div>
 
         <div className="pos-tabs">
-          <div className="pos-tablist" role="tablist" aria-label="Products">
+          <div className="pos-tablist" role="tablist" aria-label={tt("products")}>
             <button
               type="button"
               role="tab"
@@ -2496,7 +2711,7 @@ function POS() {
               className={`pos-tab ${posProductsTab === "catalog" ? "pos-tab-active" : ""}`}
               onClick={() => setPosProductsTab("catalog")}
             >
-              Browse
+              {tt("posTabBrowse")}
             </button>
             <button
               type="button"
@@ -2505,7 +2720,7 @@ function POS() {
               className={`pos-tab ${posProductsTab === "offline" ? "pos-tab-active" : ""}`}
               onClick={() => setPosProductsTab("offline")}
             >
-              Offline sync
+              {tt("posTabOfflineSync")}
               {offlineQueue.length > 0 ? (
                 <span
                   className={`pos-tab-badge ${failedQueueCount > 0 ? "pos-tab-badge-danger" : "pos-tab-badge-warn"}`}
@@ -2540,14 +2755,14 @@ function POS() {
               (!hasV && p.sellByWeight && inStockKg) ||
               (hasV && inStockVariant);
             const stockLabel = hasV
-              ? `${p.variants.length} variants`
+              ? tt("posVariantsN", { n: p.variants.length })
               : p.sellByWeight
                 ? `${Number(p.stockKg || 0).toFixed(3)} kg`
                 : p.stock;
 
             const onAdd = () => {
               if (hasV && (!selectedVid || Number.isNaN(selectedVid))) {
-                notifyActionRequired("pick a variant first.");
+                notifyActionRequired(tt("posPickVariant"));
                 return;
               }
               addToCart(p, hasV ? { variantId: selectedVid } : {});
@@ -2577,16 +2792,23 @@ function POS() {
                   <div className="pos-product-name">{p.name}</div>
                   <div className="pos-product-meta">
                     <span>{formatBDT(showPrice)}</span>
-                    <span>Stock: {stockLabel}</span>
-                    <span>VAT: {p.vatRate}%</span>
+                    <span>
+                      {tt("posStock")} {stockLabel}
+                    </span>
+                    <span>
+                      {tt("receiptVat")}: {p.vatRate}%
+                    </span>
                     {selVariant ? (
-                      <span>{getVariantDisplayMeta(selVariant) || (selVariant.label ? `Variant: ${selVariant.label}` : "")}</span>
+                      <span>
+                        {getVariantDisplayMeta(selVariant) ||
+                          (selVariant.label ? `${tt("posVariantPrefix")} ${selVariant.label}` : "")}
+                      </span>
                     ) : null}
-                    {p.sellByWeight ? <span className="badge badge-primary">Sell by kg</span> : null}
-                    {hasV ? <span className="badge badge-primary">Has variants</span> : null}
+                    {p.sellByWeight ? <span className="badge badge-primary">{tt("posSellByKg")}</span> : null}
+                    {hasV ? <span className="badge badge-primary">{tt("posHasVariants")}</span> : null}
                     {p.defaultDiscountType ? (
                       <span className="badge badge-primary">
-                        Disc:{" "}
+                        {tt("posDiscBadge")}{" "}
                         {p.defaultDiscountType === "PERCENT"
                           ? `${Number(p.defaultDiscountValue || 0)}%`
                           : formatBDT(p.defaultDiscountValue || 0)}
@@ -2607,9 +2829,9 @@ function POS() {
                           .map((v) => ({
                             value: String(v.id),
                             label:
-                              (String(v.label || "").trim() || `Variant ${v.id}`) +
+                              (String(v.label || "").trim() || tt("posVariantFallback", { n: v.id })) +
                               (getVariantDisplayMeta(v) ? ` (${getVariantDisplayMeta(v)})` : "") +
-                              (v.stock != null ? ` — stock ${v.stock}` : ""),
+                              (v.stock != null ? tt("posStockLabelSuffix", { n: v.stock }) : ""),
                           }))
                           .find((opt) => opt.value === String(selectedVid ?? ""))
                           || null
@@ -2617,9 +2839,9 @@ function POS() {
                       options={p.variants.map((v) => ({
                         value: String(v.id),
                         label:
-                          (String(v.label || "").trim() || `Variant ${v.id}`) +
+                          (String(v.label || "").trim() || tt("posVariantFallback", { n: v.id })) +
                           (getVariantDisplayMeta(v) ? ` (${getVariantDisplayMeta(v)})` : "") +
-                          (v.stock != null ? ` — stock ${v.stock}` : ""),
+                          (v.stock != null ? tt("posStockLabelSuffix", { n: v.stock }) : ""),
                       }))}
                       onChange={(opt) =>
                         setVariantChoiceByProduct((prev) => ({
@@ -2642,16 +2864,15 @@ function POS() {
             <div className="pos-tab-panel" role="tabpanel">
               {offlineQueue.length === 0 ? (
                 <p className="pos-inline-note" style={{ padding: "8px 0 12px" }}>
-                  Nothing is waiting to sync. If you complete a sale while offline, it is saved here and uploads when the
-                  connection returns.
+                  {tt("posOfflineEmpty")}
                 </p>
               ) : (
                 <p className="pos-inline-note" style={{ marginBottom: 8 }}>
-                  <strong>{offlineQueue.length}</strong> sale(s) in the queue
+                  <strong>{tt("posOfflineQueueLine", { n: offlineQueue.length })}</strong>
                   {failedQueueCount > 0 ? (
                     <>
                       {" "}
-                      · <strong style={{ color: "#b91c1c" }}>{failedQueueCount}</strong> failed
+                      · <strong style={{ color: "#b91c1c" }}>{failedQueueCount}</strong> {tt("posOfflineFailedSuffix")}
                     </>
                   ) : null}
                 </p>
@@ -2663,7 +2884,7 @@ function POS() {
                   onClick={() => syncOfflineQueue()}
                   disabled={isSyncingOffline || offlineQueue.length === 0}
                 >
-                  Sync All Now
+                  {tt("posSyncAllNow")}
                 </button>
                 <button
                   type="button"
@@ -2671,7 +2892,7 @@ function POS() {
                   onClick={retryFailedQueuedSales}
                   disabled={isSyncingOffline || failedQueueCount === 0}
                 >
-                  Retry Failed
+                  {tt("posRetryFailed")}
                 </button>
                 <button
                   type="button"
@@ -2679,42 +2900,54 @@ function POS() {
                   onClick={autoResolveStockConflicts}
                   disabled={isSyncingOffline || stockConflictCount === 0}
                 >
-                  Auto-Resolve Stock Conflicts
+                  {tt("posAutoResolveStock")}
                 </button>
               </div>
               {!canDiscardOfflineQueue ? (
-                <p className="pos-inline-note">
-                  Permission required: admin role or <code>branch.manage</code>/<code>rbac.manage</code> to discard queued sales.
-                </p>
+                <p className="pos-inline-note">{tt("posOfflineDiscardPerm")}</p>
               ) : null}
               <p className="pos-inline-note" style={{ margin: "12px 0 6px", fontWeight: 600 }}>
-                Filters &amp; bulk actions
+                {tt("posOffFiltersBulk")}
               </p>
               <div className="quick-stats" style={{ marginBottom: 8 }}>
-                <div className="stat">Total: {offlineConflictSummary.total}</div>
-                <div className="stat">Failed: {offlineConflictSummary.failed}</div>
-                <div className="stat">Reviewing: {offlineConflictSummary.reviewing}</div>
-                <div className="stat">Resolved: {offlineConflictSummary.resolved}</div>
-                <div className="stat">Stock: {Number(offlineConflictSummary.STOCK_MISMATCH || 0)}</div>
-                <div className="stat">Approval: {Number(offlineConflictSummary.APPROVAL_REQUIRED || 0)}</div>
-                <div className="stat">Validation: {Number(offlineConflictSummary.PAYLOAD_VALIDATION || 0)}</div>
+                <div className="stat">
+                  {tt("posOffStatTotal")} {offlineConflictSummary.total}
+                </div>
+                <div className="stat">
+                  {tt("posOffStatFailed")} {offlineConflictSummary.failed}
+                </div>
+                <div className="stat">
+                  {tt("posOffStatReviewing")} {offlineConflictSummary.reviewing}
+                </div>
+                <div className="stat">
+                  {tt("posOffStatResolved")} {offlineConflictSummary.resolved}
+                </div>
+                <div className="stat">
+                  {tt("posOffStatStock")} {Number(offlineConflictSummary.STOCK_MISMATCH || 0)}
+                </div>
+                <div className="stat">
+                  {tt("posOffStatApproval")} {Number(offlineConflictSummary.APPROVAL_REQUIRED || 0)}
+                </div>
+                <div className="stat">
+                  {tt("posOffStatValidation")} {Number(offlineConflictSummary.PAYLOAD_VALIDATION || 0)}
+                </div>
               </div>
               <div className="form-grid">
-                <select value={offlineConflictFilter} onChange={(e) => setOfflineConflictFilter(e.target.value)}>
-                  <option value="ALL">All conflicts</option>
-                  <option value="STOCK_MISMATCH">Stock mismatch</option>
-                  <option value="APPROVAL_REQUIRED">Approval required</option>
-                  <option value="CUSTOMER_CREDIT_RULE">Customer/credit rule</option>
-                  <option value="PAYLOAD_VALIDATION">Payload validation</option>
-                  <option value="SYNC_CONFLICT">Generic sync conflict</option>
-                  <option value="UNKNOWN">Unknown</option>
+                <select className="form-select-sm" value={offlineConflictFilter} onChange={(e) => setOfflineConflictFilter(e.target.value)}>
+                  <option value="ALL">{tt("posOffConfAll")}</option>
+                  <option value="STOCK_MISMATCH">{tt("posOffConfStock")}</option>
+                  <option value="APPROVAL_REQUIRED">{tt("posOffConfApproval")}</option>
+                  <option value="CUSTOMER_CREDIT_RULE">{tt("posOffConfCredit")}</option>
+                  <option value="PAYLOAD_VALIDATION">{tt("posOffConfPayload")}</option>
+                  <option value="SYNC_CONFLICT">{tt("posOffConfSync")}</option>
+                  <option value="UNKNOWN">{tt("posOffConfUnknown")}</option>
                 </select>
-                <select value={offlineStatusFilter} onChange={(e) => setOfflineStatusFilter(e.target.value)}>
-                  <option value="ALL">All statuses</option>
-                  <option value="FAILED">FAILED</option>
-                  <option value="QUEUED">QUEUED</option>
-                  <option value="REVIEWING">REVIEWING</option>
-                  <option value="RESOLVED">RESOLVED</option>
+                <select className="form-select-sm" value={offlineStatusFilter} onChange={(e) => setOfflineStatusFilter(e.target.value)}>
+                  <option value="ALL">{tt("posOffStAll")}</option>
+                  <option value="FAILED">{tt("posOffStFailed")}</option>
+                  <option value="QUEUED">{tt("posOffStQueued")}</option>
+                  <option value="REVIEWING">{tt("posOffStReviewing")}</option>
+                  <option value="RESOLVED">{tt("posOffStResolved")}</option>
                 </select>
                 <button
                   type="button"
@@ -2722,7 +2955,7 @@ function POS() {
                   onClick={retryFilteredFailedItems}
                   disabled={isSyncingOffline || offlineQueueRows.filter((x) => String(x.status || "").toUpperCase() === "FAILED").length === 0}
                 >
-                  Retry Filtered
+                  {tt("posRetryFiltered")}
                 </button>
                 <button
                   type="button"
@@ -2730,7 +2963,7 @@ function POS() {
                   onClick={autoResolveFilteredConflicts}
                   disabled={isSyncingOffline || offlineQueueRows.filter((x) => String(x.status || "").toUpperCase() === "FAILED").length === 0}
                 >
-                  Auto-Resolve Filtered
+                  {tt("posAutoResolveFiltered")}
                 </button>
                 <button
                   type="button"
@@ -2738,7 +2971,7 @@ function POS() {
                   onClick={exportFilteredConflictReport}
                   disabled={offlineQueueRows.length === 0}
                 >
-                  Export CSV
+                  {tt("posExportCsv")}
                 </button>
                 <button
                   type="button"
@@ -2746,7 +2979,7 @@ function POS() {
                   onClick={markFilteredFailedAsReviewing}
                   disabled={offlineQueueRows.filter((x) => String(x.status || "").toUpperCase() === "FAILED").length === 0}
                 >
-                  Mark reviewing
+                  {tt("posMarkReviewing")}
                 </button>
                 <button
                   type="button"
@@ -2758,10 +2991,10 @@ function POS() {
                     ).length === 0
                   }
                 >
-                  Clear resolved
+                  {tt("posClearResolved")}
                 </button>
                 <input
-                  placeholder="Bulk tag for filtered rows"
+                  placeholder={tt("posBulkTagPh")}
                   value={bulkConflictTag}
                   onChange={(e) => setBulkConflictTag(e.target.value)}
                 />
@@ -2771,7 +3004,7 @@ function POS() {
                   onClick={applyBulkTagToFiltered}
                   disabled={offlineQueueRows.length === 0 || !String(bulkConflictTag || "").trim()}
                 >
-                  Apply Tag
+                  {tt("posApplyTag")}
                 </button>
               </div>
             </div>
@@ -2781,8 +3014,8 @@ function POS() {
 
       {/* RIGHT: CART */}
       <div className="pos-panel pos-cart">
-        <h2>Cart</h2>
-        <p className="pos-inline-note">Follow the steps: review items → set payment → submit.</p>
+        <h2>{tt("posCartTitle")}</h2>
+        <p className="pos-inline-note">{tt("posCartIntro")}</p>
 
         {cart.map((item) => (
           <div key={item.lineId || item.id} className="pos-cart-item">
@@ -2794,14 +3027,14 @@ function POS() {
             </strong>
             {item.matchedVariant ? (
               <div className="pos-inline-note">
-                {getVariantDisplayMeta(item.matchedVariant) || "Variant selected"}
+                {getVariantDisplayMeta(item.matchedVariant) || tt("posCartVariantSel")}
               </div>
             ) : null}
             <div className="pos-cart-item-row">
               {formatBDT(getUnitSellPrice(item))}{" "}
               {item.sellByWeight ? (
                 <>
-                  × kg{" "}
+                  {tt("posTimesKg")}{" "}
                   <input
                     type="number"
                     step={0.001}
@@ -2811,7 +3044,7 @@ function POS() {
                     className="pos-qty-input"
                   />
                   <span className="pos-inline-note">
-                    Max {maxQtyOrWeightForCartLine(item).toFixed(3)} kg
+                    {tt("posMaxKg", { n: maxQtyOrWeightForCartLine(item).toFixed(3) })}
                   </span>
                 </>
               ) : (
@@ -2828,10 +3061,10 @@ function POS() {
               )}
             </div>
             <div className="pos-cart-item-row">
-              <span style={{ minWidth: 72 }}>Override:</span>
+              <span style={{ minWidth: 72 }}>{tt("posOverrideLabel")}</span>
               <input
                 type="number"
-                placeholder={item.sellByWeight ? "Custom price / kg" : "Custom price"}
+                placeholder={item.sellByWeight ? tt("posOverridePhKg") : tt("posOverridePhPiece")}
                 value={item.overridePrice ?? ""}
                 onChange={(e) => updateOverridePrice(item.lineId, e.target.value)}
                 className="pos-qty-input"
@@ -2843,18 +3076,18 @@ function POS() {
                 onClick={() => resetOverridePrice(item.lineId)}
                 disabled={String(item.overridePrice ?? "").trim() === ""}
               >
-                Reset
+                {tt("posReset")}
               </button>
             </div>
             {String(item.overridePrice ?? "").trim() !== "" ? (
               <div className="pos-inline-note">
-                Base: {formatBDT(getCartLineBaseUnitPrice(item))} | Selling:{" "}
-                {formatBDT(getUnitSellPrice(item))}
+                {tt("posBasePipeSell")} {formatBDT(getCartLineBaseUnitPrice(item))}{" "}
+                {tt("posSellingPipe")} {formatBDT(getUnitSellPrice(item))}
               </div>
             ) : null}
             {item.defaultDiscountType ? (
               <div className="pos-inline-note">
-                Predefined Disc:{" "}
+                {tt("posPredefinedDisc")}{" "}
                 {item.defaultDiscountType === "PERCENT"
                   ? `${Number(item.defaultDiscountValue || 0)}%`
                   : formatBDT(item.defaultDiscountValue || 0)}
@@ -2862,19 +3095,19 @@ function POS() {
             ) : null}
 
             <button className="btn-danger btn-sm" onClick={() => removeItem(item.lineId)}>
-              Remove
+              {tt("posRemove")}
             </button>
           </div>
         ))}
 
         {!cart.length ? (
           <p className="pos-inline-note" style={{ padding: "20px 0", textAlign: "center" }}>
-            Cart is empty. Scan a barcode or click a product to begin.
+            {tt("posCartEmpty")}
           </p>
         ) : null}
 
         <div className="pos-tabs">
-          <div className="pos-tablist" role="tablist" aria-label="Sale options">
+          <div className="pos-tablist" role="tablist" aria-label={tt("posAriaSaleOptions")}>
             <button
               type="button"
               role="tab"
@@ -2882,7 +3115,7 @@ function POS() {
               className={`pos-tab ${posCartTab === "payment" ? "pos-tab-active" : ""}`}
               onClick={() => setPosCartTab("payment")}
             >
-              1. Payment
+              {tt("posTabPay")}
             </button>
             <button
               type="button"
@@ -2891,7 +3124,7 @@ function POS() {
               className={`pos-tab ${posCartTab === "customer" ? "pos-tab-active" : ""}`}
               onClick={() => setPosCartTab("customer")}
             >
-              2. Customer
+              {tt("posTabCust")}
             </button>
             <button
               type="button"
@@ -2900,7 +3133,7 @@ function POS() {
               className={`pos-tab ${posCartTab === "offers" ? "pos-tab-active" : ""}`}
               onClick={() => setPosCartTab("offers")}
             >
-              3. Offers
+              {tt("posTabOffers")}
             </button>
             <button
               type="button"
@@ -2909,7 +3142,7 @@ function POS() {
               className={`pos-tab ${posCartTab === "more" ? "pos-tab-active" : ""}`}
               onClick={() => setPosCartTab("more")}
             >
-              4. More
+              {tt("posTabMore")}
             </button>
             <button
               type="button"
@@ -2918,7 +3151,7 @@ function POS() {
               className={`pos-tab ${posCartTab === "activity" ? "pos-tab-active" : ""}`}
               onClick={() => setPosCartTab("activity")}
             >
-              5. Activity
+              {tt("posTabActivity")}
               {offlineQueue.length > 0 ? (
                 <span
                   className={`pos-tab-badge ${failedQueueCount > 0 ? "pos-tab-badge-danger" : "pos-tab-badge-warn"}`}
@@ -2932,18 +3165,25 @@ function POS() {
           {posCartTab === "payment" ? (
             <div className="pos-tab-panel" role="tabpanel">
         <div className="pos-step-card">
-          <strong className="pos-step-title">Step 1: Review Bill</strong>
+          <strong className="pos-step-title">{tt("posStep1ReviewBill")}</strong>
         {cart.length ? (
           <div className="pos-cart-totals">
-            <p>Subtotal: <span style={{ float: "right" }}>{formatBDT(subTotal)}</span></p>
-            <p>VAT: <span style={{ float: "right" }}>{formatBDT(vatAmount)}</span></p>
+            <p>
+              {tt("posBillSubtotal")} <span style={{ float: "right" }}>{formatBDT(subTotal)}</span>
+            </p>
+            <p>
+              {tt("posBillVat")} <span style={{ float: "right" }}>{formatBDT(vatAmount)}</span>
+            </p>
             {predefinedDiscount > 0 ? (
-              <p>Product discount: <span style={{ float: "right" }}>− {formatBDT(predefinedDiscount)}</span></p>
+              <p>
+                {tt("posLineProdDisc")}{" "}
+                <span style={{ float: "right" }}>− {formatBDT(predefinedDiscount)}</span>
+              </p>
             ) : null}
             <div className="pos-discount-row" style={{ margin: "6px 0" }}>
-              <select value={discountType} onChange={(e) => setDiscountType(e.target.value)} className="pos-discount-type">
-                <option value="AMOUNT">Discount ৳</option>
-                <option value="PERCENT">Discount %</option>
+              <select value={discountType} onChange={(e) => setDiscountType(e.target.value)} className="form-select-sm pos-discount-type">
+                <option value="AMOUNT">{tt("posDiscTypeTaka")}</option>
+                <option value="PERCENT">{tt("posDiscTypePct")}</option>
               </select>
               <input
                 type="number"
@@ -2954,22 +3194,31 @@ function POS() {
               />
             </div>
             {totalDiscount > 0 ? (
-              <p>Total discount: <span style={{ float: "right" }}>− {formatBDT(totalDiscount)}</span></p>
+              <p>
+                {tt("posLineTotalDisc")}{" "}
+                <span style={{ float: "right" }}>− {formatBDT(totalDiscount)}</span>
+              </p>
             ) : null}
             {promotionDiscountAmount > 0 ? (
-              <p>Promotion: <span style={{ float: "right" }}>− {formatBDT(promotionDiscountAmount)}</span></p>
+              <p>
+                {tt("posLinePromo")}{" "}
+                <span style={{ float: "right" }}>− {formatBDT(promotionDiscountAmount)}</span>
+              </p>
             ) : null}
             {priceOverrideSummary.totalReduction > 0 ? (
-              <p>Price override: <span style={{ float: "right" }}>− {formatBDT(priceOverrideSummary.totalReduction)}</span></p>
+              <p>
+                {tt("posLinePriceOv")}{" "}
+                <span style={{ float: "right" }}>− {formatBDT(priceOverrideSummary.totalReduction)}</span>
+              </p>
             ) : null}
             <div className="grand-total">
-              <span>Total</span>
+              <span>{tt("receiptTotal")}</span>
               <span>{formatBDT(total)}</span>
             </div>
             {promotionEstimate.applied.length > 0 ? (
               <details style={{ marginTop: 6 }}>
                 <summary className="pos-inline-note" style={{ cursor: "pointer" }}>
-                  {promotionEstimate.applied.length} offer(s) applied — view breakdown
+                  {tt("posOffersSummary", { n: promotionEstimate.applied.length })}
                 </summary>
                 <ul style={{ margin: "6px 0 0 16px", padding: 0, fontSize: 12 }}>
                   {promotionEstimate.applied.map((offer) => (
@@ -2983,53 +3232,58 @@ function POS() {
           </div>
         ) : (
           <p className="pos-inline-note" style={{ marginBottom: 10 }}>
-            Add items to the cart to see totals and complete payment.
+            {tt("posAddItemsSeeTotals")}
           </p>
         )}
         </div>
 
         <div className="pos-step-card">
-        <strong className="pos-step-title">Step 2: Choose Payment</strong>
-        <label className="pos-inline-note" style={{ display: "block", marginTop: 6 }}>Payment method</label>
+        <strong className="pos-step-title">{tt("posStep2Pay")}</strong>
+        <label className="pos-inline-note" style={{ display: "block", marginTop: 6 }}>
+          {tt("posPayMethod")}
+        </label>
         <select
+          className="form-select-sm"
           value={paymentMethod}
           onChange={(e) => setPaymentMethod(e.target.value)}
         >
-          <option value="Cash">Cash</option>
-          <option value="bKash">bKash</option>
-          <option value="Nagad">Nagad</option>
-          <option value="Rocket">Rocket</option>
-          <option value="Card">Card</option>
-          <option value="Split">Split Payment</option>
-          <option value="Due">Due / Baki</option>
+          <option value="Cash">{t(uiLang, "dashMethodCash")}</option>
+          <option value="bKash">{t(uiLang, "dashMethodBkash")}</option>
+          <option value="Nagad">{t(uiLang, "dashMethodNagad")}</option>
+          <option value="Rocket">{t(uiLang, "dashMethodRocket")}</option>
+          <option value="Card">{t(uiLang, "dashMethodCard")}</option>
+          <option value="Split">{tt("posPaySplit")}</option>
+          <option value="Due">{tt("posPayDueCredit")}</option>
         </select>
 
         {paymentMethod !== "Split" ? (
           <>
             <input
               type="number"
-              placeholder="Paid amount"
+              placeholder={tt("posPaidAmtPh")}
               value={paidAmount}
               onChange={(e) => setPaidAmount(e.target.value)}
               style={{ marginTop: 6 }}
             />
             <input
-              placeholder={DIGITAL_METHODS.has(paymentMethod) ? "Transaction ID (required)" : "Payment note (optional)"}
+              placeholder={
+                DIGITAL_METHODS.has(paymentMethod) ? tt("posTxnRefRequired") : tt("posPayNoteOpt")
+              }
               value={paymentChannel}
               onChange={(e) => setPaymentChannel(e.target.value)}
             />
             <div className="pos-action-row">
               <button type="button" className="btn-secondary btn-sm" onClick={() => quickApplyPaymentMode("cash")}>
-                Cash full (Alt+1)
+                {tt("posQuickCashFull")}
               </button>
               <button type="button" className="btn-secondary btn-sm" onClick={() => quickApplyPaymentMode("bkash")}>
-                bKash full (Alt+2)
+                {tt("posQuickBkashFull")}
               </button>
               <button type="button" className="btn-secondary btn-sm" onClick={() => quickApplyPaymentMode("card")}>
-                Card full (Alt+3)
+                {tt("posQuickCardFull")}
               </button>
               <button type="button" className="btn-secondary btn-sm" onClick={() => quickApplyPaymentMode("due")}>
-                Due (Alt+4)
+                {tt("posQuickDueFull")}
               </button>
             </div>
           </>
@@ -3037,24 +3291,24 @@ function POS() {
           <div className="pos-settings-box" style={{ marginTop: 6 }}>
             {paymentBreakdown.map((line, idx) => (
               <div key={`pay-line-${idx}`} className="pos-discount-row" style={{ marginBottom: 6 }}>
-                <select value={line.method} onChange={(e) => updatePaymentLine(idx, "method", e.target.value)}>
-                  <option value="Cash">Cash</option>
-                  <option value="bKash">bKash</option>
-                  <option value="Nagad">Nagad</option>
-                  <option value="Rocket">Rocket</option>
-                  <option value="Card">Card</option>
+                <select className="form-select-sm" value={line.method} onChange={(e) => updatePaymentLine(idx, "method", e.target.value)}>
+                  <option value="Cash">{t(uiLang, "dashMethodCash")}</option>
+                  <option value="bKash">{t(uiLang, "dashMethodBkash")}</option>
+                  <option value="Nagad">{t(uiLang, "dashMethodNagad")}</option>
+                  <option value="Rocket">{t(uiLang, "dashMethodRocket")}</option>
+                  <option value="Card">{t(uiLang, "dashMethodCard")}</option>
                 </select>
                 <input
                   type="number"
-                  placeholder="Amount"
+                  placeholder={tt("posAmtShort")}
                   value={line.amount}
                   onChange={(e) => updatePaymentLine(idx, "amount", e.target.value)}
                 />
                 <input
                   placeholder={
                     DIGITAL_METHODS.has(String(line.method || ""))
-                      ? "Transaction ID (required)"
-                      : "Note"
+                      ? tt("posTxnRefRequired")
+                      : tt("posNoteShort")
                   }
                   value={line.channel}
                   onChange={(e) => updatePaymentLine(idx, "channel", e.target.value)}
@@ -3066,37 +3320,37 @@ function POS() {
             ))}
             <div className="pos-action-row">
               <button type="button" className="btn-secondary btn-sm" onClick={addPaymentLine}>
-                + Add line
+                {tt("posAddPayLine")}
               </button>
-              <span className="pos-inline-note">Split paid: {formatBDT(splitPaidTotal)}</span>
+              <span className="pos-inline-note">{tt("posSplitPaid", { n: formatBDT(splitPaidTotal) })}</span>
             </div>
           </div>
         )}
         {checkoutDue > 0 ? (
           <p className="pos-inline-note" style={{ color: "#b91c1c" }}>
-            Due after payment: {formatBDT(checkoutDue)}
+            {tt("posDueAfter", { n: formatBDT(checkoutDue) })}
           </p>
         ) : null}
         </div>
 
         <div className="pos-step-card">
-        <strong className="pos-step-title">Step 3: Submit</strong>
+        <strong className="pos-step-title">{tt("posStep3Submit")}</strong>
         {managerApprovalNeeded && !canManageSettings ? (
           <p className="pos-inline-note" style={{ marginBottom: 8 }}>
-            Permission required: <code>branch.manage</code> to configure manager PIN rules in Settings.
+            {tt("posMgrPermSettings")}
           </p>
         ) : null}
         {managerApprovalNeeded ? (
           <div className="pos-settings-box" style={{ borderColor: "#fca5a5", background: "#fff5f5" }}>
-            <strong style={{ color: "#b91c1c" }}>Manager approval required</strong>
+            <strong style={{ color: "#b91c1c" }}>{tt("posMgrApprovalReq")}</strong>
             <input
-              placeholder="Manager Approval PIN"
+              placeholder={tt("posMgrPinPh")}
               value={managerApprovalPin}
               onChange={(e) => setManagerApprovalPin(e.target.value)}
               style={{ marginTop: 6 }}
             />
             <input
-              placeholder="Approval reason (required)"
+              placeholder={tt("posAprReasonPh")}
               value={approvalReason}
               onChange={(e) => setApprovalReason(e.target.value)}
             />
@@ -3104,18 +3358,36 @@ function POS() {
         ) : null}
 
         {activeHoldAuditLogId != null ? (
-          <p className="pos-inline-note">Checkout will close held cart #{activeHoldAuditLogId}.</p>
+          <p className="pos-inline-note">{tt("posCheckoutCloseHold", { n: activeHoldAuditLogId })}</p>
         ) : null}
         {activeQuoteAuditLogId != null ? (
-          <p className="pos-inline-note">Checkout will mark quotation #{activeQuoteAuditLogId} as converted.</p>
+          <p className="pos-inline-note">{tt("posCheckoutQuoteConv", { n: activeQuoteAuditLogId })}</p>
+        ) : null}
+
+        {fiscalBlocked ? (
+          <div
+            className="page-card"
+            style={{
+              marginBottom: 12,
+              padding: "10px 12px",
+              border: "1px solid #fdba74",
+              background: "#fff7ed",
+              borderRadius: 8,
+            }}
+          >
+            <strong style={{ color: "#9a3412" }}>{tt("posFiscalBlockedTitle")}</strong>
+            <p style={{ margin: "6px 0 0", fontSize: 13, color: "#9a3412" }}>
+              {fiscalGateData?.message || tt("posFiscalNoPeriod")}
+            </p>
+          </div>
         ) : null}
 
         <div className="pos-submit-guide">
-          <strong>Before submit</strong>
+          <strong>{tt("posBeforeSubmit")}</strong>
           <div className="pos-submit-checks">
-            {checkoutRequirements.map((check) => (
+            {checkoutRequirements.map((check, idx) => (
               <span
-                key={check.label}
+                key={`chk-${idx}`}
                 className={`pos-check-chip ${
                   check.ok || check.optional ? "pos-check-chip-ok" : "pos-check-chip-bad"
                 }`}
@@ -3127,30 +3399,30 @@ function POS() {
           </div>
           {checkoutBlockers.length ? (
             <p className="pos-submit-warning">
-              Missing: {checkoutBlockers.map((x) => x.hint).join(" · ")}
+              {tt("posMissingPrefix")} {checkoutBlockers.map((x) => x.hint).join(" · ")}
             </p>
           ) : (
-            <p className="pos-submit-ready">Ready to submit this sale.</p>
+            <p className="pos-submit-ready">{tt("posReadySubmitSale")}</p>
           )}
         </div>
 
         <button
           className="pos-checkout-btn"
-          disabled={cart.length === 0}
+          disabled={cart.length === 0 || fiscalBlocked}
           onClick={handleCheckout}
         >
-          Complete Checkout · {formatBDT(total)}
+          {tt("posCompleteCheckout", { n: formatBDT(total) })}
         </button>
         <p className="pos-inline-note" style={{ marginTop: 6 }}>
-          Main action: completes sale, updates stock, and prints invoice.
+          {tt("posMainCheckoutNote")}
         </p>
         <div className="pos-secondary-row">
           <div className="pos-mini-guide">
             <button className="btn-secondary" disabled={cart.length === 0} onClick={handleHoldCart}>
-              Hold Sale (F6)
+              {tt("posHoldSaleF6")}
             </button>
             <p className={holdBlockers.length ? "pos-submit-warning" : "pos-submit-ready"}>
-              {holdBlockers.length ? holdBlockers.map((x) => x.hint).join(" · ") : "Ready to hold this cart."}
+              {holdBlockers.length ? holdBlockers.map((x) => x.hint).join(" · ") : tt("posReadyHold")}
             </p>
           </div>
           <div className="pos-mini-guide">
@@ -3160,12 +3432,10 @@ function POS() {
               disabled={cart.length === 0}
               onClick={handleSaveQuote}
             >
-              Save Quotation
+              {tt("posSaveQuotation")}
             </button>
             <p className={quoteBlockers.length ? "pos-submit-warning" : "pos-submit-ready"}>
-              {quoteBlockers.length
-                ? quoteBlockers.map((x) => x.hint).join(" · ")
-                : "Ready to save quotation."}
+              {quoteBlockers.length ? quoteBlockers.map((x) => x.hint).join(" · ") : tt("posReadyQuote")}
             </p>
           </div>
         </div>
@@ -3176,29 +3446,31 @@ function POS() {
 
           {posCartTab === "customer" ? (
             <div className="pos-tab-panel" role="tabpanel">
-        <label className="pos-inline-note" style={{ display: "block", marginBottom: 6 }}>Customer (optional)</label>
+        <label className="pos-inline-note" style={{ display: "block", marginBottom: 6 }}>
+          {tt("posCustOptional")}
+        </label>
         <input
-          placeholder="Customer name"
+          placeholder={tt("posCustNamePh")}
           value={customer.name}
           onChange={(e) => setCustomer({ ...customer, name: e.target.value })}
         />
         <input
-          placeholder="Customer phone"
+          placeholder={tt("posCustPhonePh")}
           value={customer.phone}
           onChange={(e) => setCustomer({ ...customer, phone: e.target.value })}
         />
 
         {String(customer.phone || "").trim().length >= 6 ? (
           <div className="pos-settings-box" style={{ marginTop: 10 }}>
-            <strong>Purchase history</strong>
+            <strong>{tt("posPurchaseHist")}</strong>
             <span className="pos-inline-note" style={{ marginLeft: 8 }}>
-              {customerHistoryLoading ? "loading…" : `${customerRecentSales.length} recent`}
+              {customerHistoryLoading ? tt("posLoadingEllipsis") : tt("posNRecent", { n: customerRecentSales.length })}
             </span>
             <div style={{ marginTop: 8 }}>
               {customerHistoryLoading ? (
-                <p className="pos-inline-note">Loading recent bills…</p>
+                <p className="pos-inline-note">{tt("posLoadingBills")}</p>
               ) : !customerRecentSales.length ? (
-                <p className="pos-inline-note">No past sales on file for this phone in this branch.</p>
+                <p className="pos-inline-note">{tt("posNoPastSalesBranch")}</p>
               ) : (
                 <div style={{ maxHeight: 220, overflow: "auto" }}>
                   {customerRecentSales.map((sale) => {
@@ -3228,13 +3500,16 @@ function POS() {
                             font: "inherit",
                           }}
                         >
-                          <strong>{sale.invoiceNo || `Sale ${sale.id}`}</strong>
+                          <strong>{sale.invoiceNo || tt("posSaleNum", { n: sale.id })}</strong>
                           {" · "}
                           {when}
                           <br />
                           <span>{formatBDT(sale.total)}</span>
                           {Number(sale.dueAmount || 0) > 0 ? (
-                            <span className="pos-inline-note"> · Due {formatBDT(sale.dueAmount)}</span>
+                            <span className="pos-inline-note">
+                              {" "}
+                              · {tt("posDueWord")} {formatBDT(sale.dueAmount)}
+                            </span>
                           ) : null}
                           <span className="pos-inline-note">{open ? " ▲" : " ▼"}</span>
                         </button>
@@ -3250,7 +3525,7 @@ function POS() {
                               </li>
                             ))}
                             {sale.lines.length > 12 ? (
-                              <li className="pos-inline-note">+{sale.lines.length - 12} more lines…</li>
+                              <li className="pos-inline-note">{tt("posMoreLines", { n: sale.lines.length - 12 })}</li>
                             ) : null}
                           </ul>
                         ) : null}
@@ -3266,30 +3541,41 @@ function POS() {
         {customerLoyalty ? (
           <div className="pos-settings-box" style={{ marginTop: 10 }}>
             <strong>
-              Loyalty &amp; rewards · {Number(customerLoyalty.loyaltyPoints || 0).toFixed(0)} pts ·{" "}
+              {tt("posLoyaltyRewards")} · {Number(customerLoyalty.loyaltyPoints || 0).toFixed(0)} {tt("posPtsAbbr")} ·{" "}
               {customerLoyalty.loyaltyTier || "—"}
             </strong>
-            <p><strong>Wallet:</strong> {formatBDT(Number(customerLoyalty.storedValueBalance || 0))}</p>
-            <p><strong>Tier discount:</strong> {tierDiscountPercent}% ({formatBDT(tierDiscountAmount)})</p>
-            <p><strong>Max redeem (20% rule):</strong> {maxRedeemByPercentPoints.toFixed(0)} pts</p>
+            <p>
+              <strong>{tt("posWalletLabel")}</strong> {formatBDT(Number(customerLoyalty.storedValueBalance || 0))}
+            </p>
+            <p>
+              <strong>{tt("posTierDiscLabel")}</strong> {tierDiscountPercent}% ({formatBDT(tierDiscountAmount)})
+            </p>
+            <p>
+              <strong>{tt("posMaxRedeemRule")}</strong> {maxRedeemByPercentPoints.toFixed(0)} {tt("posPtsAbbr")}
+            </p>
             <input
               type="number"
-              placeholder="Redeem points"
+              placeholder={tt("posRedeemPtsPh")}
               value={redeemPoints}
               onChange={(e) => setRedeemPoints(e.target.value)}
             />
-            <p>Redeem discount: {formatBDT(redeemDiscountAmount)}</p>
+            <p>
+              <strong>{tt("posRedeemDiscLabel")}</strong> {formatBDT(redeemDiscountAmount)}
+            </p>
             {safeRedeemPoints > appliedRedeemPoints ? (
-              <p className="pos-inline-note">Requested redeem adjusted to allowed limit.</p>
+              <p className="pos-inline-note">{tt("posRedeemAdjusted")}</p>
             ) : null}
             {creditLimitVal > 0 ? (
               <>
-                <p><strong>Credit limit:</strong> {formatBDT(creditLimitVal)} · <strong>Current due:</strong> {formatBDT(customerBalance)}</p>
+                <p>
+                  <strong>{tt("posCreditLimitLabel")}</strong> {formatBDT(creditLimitVal)} ·{" "}
+                  <strong>{tt("posCurrentDueLabel")}</strong> {formatBDT(customerBalance)}
+                </p>
                 {checkoutDue > 0 ? (
                   <p>
-                    <strong>After this bill:</strong> {formatBDT(customerBalance + checkoutDue)}
+                    <strong>{tt("posAfterThisBill")}</strong> {formatBDT(customerBalance + checkoutDue)}
                     {creditWouldExceed ? (
-                      <span style={{ color: "#b91c1c", marginLeft: 8 }}>Over limit — manager PIN required.</span>
+                      <span style={{ color: "#b91c1c", marginLeft: 8 }}>{tt("posOverLimitPin")}</span>
                     ) : null}
                   </p>
                 ) : null}
@@ -3303,22 +3589,24 @@ function POS() {
 
           {posCartTab === "offers" ? (
             <div className="pos-tab-panel" role="tabpanel">
-            <p className="pos-inline-note" style={{ marginBottom: 8 }}>Coupon, gift card, wallet, and tax invoice notes.</p>
+            <p className="pos-inline-note" style={{ marginBottom: 8 }}>
+              {tt("posOffersTabIntro")}
+            </p>
             <input
-              placeholder="Promo coupon code"
+              placeholder={tt("posCouponPh")}
               value={couponCode}
               onChange={(e) => setCouponCode(e.target.value)}
             />
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 6 }}>
               <input
-                placeholder="Gift card code"
+                placeholder={tt("posGiftCodePh")}
                 value={giftCardCode}
                 onChange={(e) => setGiftCardCode(e.target.value)}
                 style={{ minWidth: 120, flex: 1 }}
               />
               <input
                 type="number"
-                placeholder="Gift amount"
+                placeholder={tt("posGiftAmtPh")}
                 value={giftCardAmount}
                 onChange={(e) => setGiftCardAmount(e.target.value)}
                 style={{ width: 130 }}
@@ -3326,19 +3614,19 @@ function POS() {
             </div>
             <input
               type="number"
-              placeholder="Wallet redeem (BDT)"
+              placeholder={tt("posWalletRedeemPh")}
               value={walletRedeemAmount}
               onChange={(e) => setWalletRedeemAmount(e.target.value)}
               style={{ marginTop: 6 }}
             />
             <input
-              placeholder="Buyer BIN / NID note (Mushak invoice)"
+              placeholder={tt("posBuyerBinPh")}
               value={buyerBinOrNidNote}
               onChange={(e) => setBuyerBinOrNidNote(e.target.value)}
               style={{ marginTop: 6 }}
             />
             <p className="pos-inline-note" style={{ marginTop: 6 }}>
-              Bill after wallet/gift: {formatBDT(billAfterWalletGift)}
+              {tt("posBillAfterWallet", { n: formatBDT(billAfterWalletGift) })}
             </p>
             </div>
           ) : null}
@@ -3347,17 +3635,17 @@ function POS() {
             <div className="pos-tab-panel" role="tabpanel">
         <details className="pos-section">
           <summary>
-            Hold &amp; quote notes
-            <span className="pos-section-hint">optional</span>
+            {tt("posHoldQuoteTitle")}
+            <span className="pos-section-hint">{tt("posOptional")}</span>
           </summary>
           <div className="pos-section-body">
             <input
-              placeholder="Hold note"
+              placeholder={tt("posHoldNotePh")}
               value={holdNote}
               onChange={(e) => setHoldNote(e.target.value)}
             />
             <input
-              placeholder="Quote note (used by Save quote)"
+              placeholder={tt("posQuoteNotePh")}
               value={quoteNote}
               onChange={(e) => setQuoteNote(e.target.value)}
               style={{ marginTop: 6 }}
@@ -3367,39 +3655,39 @@ function POS() {
 
         <details className="pos-section">
           <summary>
-            Saved cart templates
-            <span className="pos-section-hint">{cartTemplates.length} saved</span>
+            {tt("posTplSection")}
+            <span className="pos-section-hint">{tt("posTplSavedCount", { n: cartTemplates.length })}</span>
           </summary>
           <div className="pos-section-body">
             <div className="pos-discount-row">
               <input
-                placeholder="Template name"
+                placeholder={tt("posTplNamePh")}
                 value={cartTemplateName}
                 onChange={(e) => setCartTemplateName(e.target.value)}
               />
               <button type="button" className="btn-secondary btn-sm" onClick={saveCartTemplate}>
-                Save Current Cart
+                {tt("posSaveCurrentCart")}
               </button>
             </div>
             {cartTemplates.length ? (
               <div style={{ marginTop: 8, maxHeight: 140, overflow: "auto" }}>
-                {cartTemplates.map((t) => (
-                  <div key={t.id} className="pos-action-row" style={{ marginBottom: 6 }}>
+                {cartTemplates.map((tpl) => (
+                  <div key={tpl.id} className="pos-action-row" style={{ marginBottom: 6 }}>
                     <span className="pos-inline-note">
-                      {t.name} ({Array.isArray(t.cart) ? t.cart.length : 0} items)
+                      {tpl.name} ({tt("posTplItemsCount", { n: Array.isArray(tpl.cart) ? tpl.cart.length : 0 })})
                     </span>
-                    <button type="button" className="btn-secondary btn-sm" onClick={() => loadCartTemplate(t)}>
-                      Load
+                    <button type="button" className="btn-secondary btn-sm" onClick={() => loadCartTemplate(tpl)}>
+                      {tt("posBtnLoad")}
                     </button>
-                    <button type="button" className="btn-danger btn-sm" onClick={() => deleteCartTemplate(t.id)}>
-                      Delete
+                    <button type="button" className="btn-danger btn-sm" onClick={() => deleteCartTemplate(tpl.id)}>
+                      {tt("posBtnDelete")}
                     </button>
                   </div>
                 ))}
               </div>
             ) : (
               <p className="pos-inline-note" style={{ marginTop: 8 }}>
-                No saved templates yet.
+                {tt("posTplEmpty")}
               </p>
             )}
           </div>
@@ -3407,17 +3695,17 @@ function POS() {
 
         <details className="pos-section">
           <summary>
-            Receipt &amp; printer
+            {tt("posRcptSection")}
             <span className="pos-section-hint">{paperSize}mm</span>
           </summary>
           <div className="pos-section-body">
             <div className="pos-receipt-row">
               <label>
-                Paper size:
+                {tt("posPaperSizeLbl")}
                 <select
+                  className="form-select-sm pos-receipt-size"
                   value={paperSize}
                   onChange={(e) => setPaperSize(e.target.value)}
-                  className="pos-receipt-size"
                 >
                   <option value="58">58mm</option>
                   <option value="80">80mm</option>
@@ -3426,26 +3714,26 @@ function POS() {
             </div>
             <div className="pos-action-row">
               <button type="button" className="btn-secondary btn-sm" onClick={() => setShowStoreSettings((prev) => !prev)}>
-                {showStoreSettings ? "Hide" : "Show"} invoice settings
+                {showStoreSettings ? tt("posHideInvoiceSettings") : tt("posShowInvoiceSettings")}
               </button>
               <button type="button" className="btn-secondary btn-sm" onClick={handleTestPrint}>
-                Test Print
+                {tt("posTestPrint")}
               </button>
               <button type="button" className="btn-secondary btn-sm" onClick={handleTestPreview}>
-                Preview
+                {tt("posPreview")}
               </button>
             </div>
             {showStoreSettings && (
               <div className="pos-settings-box">
                 <input
-                  placeholder="Store name"
+                  placeholder={tt("posInvStoreName")}
                   value={storeSettings.storeName}
                   onChange={(e) =>
                     setStoreSettings((prev) => ({ ...prev, storeName: e.target.value }))
                   }
                 />
                 <input
-                  placeholder="Store address"
+                  placeholder={tt("posInvStoreAddr")}
                   value={storeSettings.storeAddress}
                   onChange={(e) =>
                     setStoreSettings((prev) => ({ ...prev, storeAddress: e.target.value }))
@@ -3453,7 +3741,7 @@ function POS() {
                   style={{ marginTop: 6 }}
                 />
                 <input
-                  placeholder="Store phone"
+                  placeholder={tt("posInvStorePhone")}
                   value={storeSettings.storePhone}
                   onChange={(e) =>
                     setStoreSettings((prev) => ({ ...prev, storePhone: e.target.value }))
@@ -3461,7 +3749,7 @@ function POS() {
                   style={{ marginTop: 6 }}
                 />
                 <input
-                  placeholder="Footer message"
+                  placeholder={tt("posInvFooter")}
                   value={storeSettings.footerMessage}
                   onChange={(e) =>
                     setStoreSettings((prev) => ({ ...prev, footerMessage: e.target.value }))
@@ -3469,21 +3757,22 @@ function POS() {
                   style={{ marginTop: 6 }}
                 />
                 <select
+                  className="form-select-sm"
                   value={storeSettings.receiptLanguage || "en"}
                   onChange={(e) =>
                     setStoreSettings((prev) => ({ ...prev, receiptLanguage: e.target.value }))
                   }
                   style={{ marginTop: 6 }}
                 >
-                  <option value="en">Receipt language: English</option>
-                  <option value="bn">Receipt language: Bangla</option>
+                  <option value="en">{tt("posRcptLangEn")}</option>
+                  <option value="bn">{tt("posRcptLangBn")}</option>
                 </select>
                 <input type="file" accept="image/*" onChange={handleLogoChange} style={{ marginTop: 6 }} />
                 {storeSettings.logoDataUrl ? (
                   <div className="pos-logo-preview">
                     <img
                       src={storeSettings.logoDataUrl}
-                      alt="Invoice Logo Preview"
+                      alt={tt("posLogoAlt")}
                       className="pos-logo-image"
                     />
                     <button
@@ -3491,7 +3780,7 @@ function POS() {
                       className="btn-secondary btn-sm"
                       onClick={() => setStoreSettings((prev) => ({ ...prev, logoDataUrl: "" }))}
                     >
-                      Remove logo
+                      {tt("posRemoveLogo")}
                     </button>
                   </div>
                 ) : null}
@@ -3505,9 +3794,9 @@ function POS() {
 
           {posCartTab === "activity" ? (
             <div className="pos-tab-panel" role="tabpanel">
-            <h4 style={{ margin: "0 0 8px", fontSize: 14 }}>Recent sales ({recentSales.length} today)</h4>
+            <h4 style={{ margin: "0 0 8px", fontSize: 14 }}>{tt("posActRecentSales", { n: recentSales.length })}</h4>
             {recentSales.length === 0 ? (
-              <p className="pos-inline-note">No sales yet today.</p>
+              <p className="pos-inline-note">{tt("posActNoSales")}</p>
             ) : (
               recentSales.slice(0, 5).map((sale) => (
                 <div key={sale.id} className="pos-recent-sale-row">
@@ -3515,13 +3804,21 @@ function POS() {
                     {sale.invoiceNo} — {formatBDT(sale.total)} ({sale.paymentMethod})
                   </span>
                   <button className="btn-secondary btn-sm" onClick={() => printInvoice(sale.id)}>
-                    Print
+                    {tt("posBtnPrint")}
                   </button>
                   <button type="button" className="btn-secondary btn-sm" onClick={() => openMushakPdf(sale.id)}>
-                    Mushak
+                    {tt("posBtnMushak")}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    title={tt("posXmlDownloadTitle")}
+                    onClick={() => downloadMushak63Xml(sale)}
+                  >
+                    {tt("posBtnXml")}
                   </button>
                   <button className="btn-secondary btn-sm" onClick={() => handleSalePreview(sale.id)}>
-                    Preview
+                    {tt("posPreview")}
                   </button>
                 </div>
               ))
@@ -3529,9 +3826,9 @@ function POS() {
 
             {showHeldPanel ? (
               <>
-                <h4 style={{ margin: "14px 0 6px", fontSize: 14 }}>Held carts ({heldCarts.length})</h4>
+                <h4 style={{ margin: "14px 0 6px", fontSize: 14 }}>{tt("posHeldCartsTitle", { n: heldCarts.length })}</h4>
                 <input
-                  placeholder="Search by customer / phone / note"
+                  placeholder={tt("posHoldSearchPh")}
                   value={holdSearch}
                   onChange={(e) => setHoldSearch(e.target.value)}
                 />
@@ -3544,7 +3841,7 @@ function POS() {
                           .slice(0, 2)
                           .map((it) => {
                             const vMeta = getVariantDisplayMeta(it?.matchedVariant) || getVariantMetaFromLine(it);
-                            return `${it?.name || "Item"}${vMeta ? ` (${vMeta})` : ""}`;
+                            return `${it?.name || tt("receiptItem")}${vMeta ? ` (${vMeta})` : ""}`;
                           })
                           .join(" | ")
                       : "",
@@ -3552,30 +3849,33 @@ function POS() {
                   pageSize={5}
                   allowExport={false}
                   columns={[
-                    { key: "id", label: "ID" },
-                    { key: "heldByName", label: "Held By", render: (v) => v || "-" },
-                    { key: "customerName", label: "Customer", render: (v) => v || "-" },
-                    { key: "customerPhone", label: "Phone", render: (v) => v || "-" },
-                    { key: "cartCount", label: "Items" },
-                    { key: "totalQty", label: "Qty" },
+                    { key: "id", label: tt("posColId") },
+                    { key: "heldByName", label: tt("posColHeldBy"), render: (v) => v || "-" },
+                    { key: "customerName", label: tt("posColCustomer"), render: (v) => v || "-" },
+                    { key: "customerPhone", label: tt("posColPhone"), render: (v) => v || "-" },
+                    { key: "cartCount", label: tt("posColItems") },
+                    { key: "totalQty", label: tt("posColQty") },
                     {
                       key: "itemsPreview",
-                      label: "Item details",
+                      label: tt("posColItemDetails"),
                       render: (v, row) =>
-                        v || (Number(row?.cartCount || 0) > 2 ? `${Number(row?.cartCount || 0)} items` : "-"),
+                        v ||
+                        (Number(row?.cartCount || 0) > 2
+                          ? tt("posTplItemsCount", { n: Number(row?.cartCount || 0) })
+                          : "-"),
                     },
-                    { key: "holdNote", label: "Note", render: (v) => v || "-" },
-                    { key: "createdAtLabel", label: "Held At" },
+                    { key: "holdNote", label: tt("posColNote"), render: (v) => v || "-" },
+                    { key: "createdAtLabel", label: tt("posColHeldAt") },
                     {
                       key: "actions",
-                      label: "Actions",
+                      label: tt("posColActions"),
                       render: (_, row) => (
                         <div style={{ display: "flex", gap: 6 }}>
                           <button type="button" className="btn-secondary btn-sm" onClick={() => resumeHeldCart(row)}>
-                            Resume
+                            {tt("posBtnResume")}
                           </button>
                           <button type="button" className="btn-danger btn-sm" onClick={() => discardHeldCart(row)}>
-                            Discard
+                            {tt("posBtnDiscard")}
                           </button>
                         </div>
                       ),
@@ -3585,55 +3885,55 @@ function POS() {
               </>
             ) : (
               <p className="pos-inline-note" style={{ marginTop: 12 }}>
-                Use <strong>Held</strong> in the products header to list held carts here.
+                {tt("posHeldPanelHint")}
               </p>
             )}
 
-            <h4 style={{ margin: "14px 0 6px", fontSize: 14 }}>Offline queue ({offlineQueueRows.length})</h4>
+            <h4 style={{ margin: "14px 0 6px", fontSize: 14 }}>{tt("posOffQueueHeading", { n: offlineQueueRows.length })}</h4>
             <DataTable
               rows={offlineQueueRows}
               pageSize={5}
               allowExport={false}
               columns={[
-                { key: "rowNo", label: "ID" },
-                { key: "localRef", label: "Local Ref" },
+                { key: "rowNo", label: tt("posColId") },
+                { key: "localRef", label: tt("posColLocalRef") },
                 {
                   key: "status",
-                  label: "Status",
+                  label: tt("posColStatus"),
                   render: (v) => {
                     const s = String(v || "").toUpperCase();
-                    if (s === "FAILED") return <span className="badge badge-danger">FAILED</span>;
-                    if (s === "QUEUED") return <span className="badge badge-warning">QUEUED</span>;
-                    if (s === "REVIEWING") return <span className="badge badge-primary">REVIEWING</span>;
-                    if (s === "RESOLVED") return <span className="badge badge-success">RESOLVED</span>;
+                    if (s === "FAILED") return <span className="badge badge-danger">{tt("posOffStFailed")}</span>;
+                    if (s === "QUEUED") return <span className="badge badge-warning">{tt("posOffStQueued")}</span>;
+                    if (s === "REVIEWING") return <span className="badge badge-primary">{tt("posOffStReviewing")}</span>;
+                    if (s === "RESOLVED") return <span className="badge badge-success">{tt("posOffStResolved")}</span>;
                     return s || "-";
                   },
                 },
-                { key: "conflictType", label: "Conflict", render: (v) => v || "-" },
-                { key: "retryCount", label: "Retries", render: (v) => Number(v || 0) },
-                { key: "lastError", label: "Last Error", render: (v) => v || "-" },
-                { key: "conflictHint", label: "Resolver Hint", render: (v) => v || "-" },
-                { key: "resolverTag", label: "Tag", render: (v) => v || "-" },
-                { key: "createdAtLabel", label: "Queued At" },
+                { key: "conflictType", label: tt("posColConflict"), render: (v) => v || "-" },
+                { key: "retryCount", label: tt("posColRetries"), render: (v) => Number(v || 0) },
+                { key: "lastError", label: tt("posColLastError"), render: (v) => v || "-" },
+                { key: "conflictHint", label: tt("posColResolverHint"), render: (v) => v || "-" },
+                { key: "resolverTag", label: tt("posColTag"), render: (v) => v || "-" },
+                { key: "createdAtLabel", label: tt("posColQueuedAt") },
                 {
                   key: "actions",
-                  label: "Actions",
+                  label: tt("posColActions"),
                   render: (_, row) => (
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                       <button type="button" className="btn-secondary btn-sm" onClick={() => tagQueuedSale(row)}>
-                        Tag
+                        {tt("posBtnTag")}
                       </button>
                       <button type="button" className="btn-secondary btn-sm" onClick={() => loadQueuedSaleToCart(row)}>
-                        Load
+                        {tt("posBtnLoad")}
                       </button>
                       <button type="button" className="btn-secondary btn-sm" onClick={() => markQueuedSaleResolved(row)}>
-                        Resolved
+                        {tt("posBtnResolved")}
                       </button>
                       <button type="button" className="btn-secondary btn-sm" onClick={() => retryQueuedSale(row)}>
-                        Retry
+                        {tt("posBtnRetry")}
                       </button>
                       <button type="button" className="btn-secondary btn-sm" onClick={() => resolveQueuedSaleConflict(row)}>
-                        Resolve
+                        {tt("posBtnResolve")}
                       </button>
                       <button
                         type="button"
@@ -3641,7 +3941,7 @@ function POS() {
                         disabled={!canDiscardOfflineQueue}
                         onClick={() => discardQueuedSale(row)}
                       >
-                        Discard
+                        {tt("posBtnDiscard")}
                       </button>
                     </div>
                   ),
@@ -3649,17 +3949,17 @@ function POS() {
               ]}
             />
 
-            <h4 style={{ margin: "14px 0 6px", fontSize: 14 }}>Offline log ({offlineLog.length})</h4>
+            <h4 style={{ margin: "14px 0 6px", fontSize: 14 }}>{tt("posOffLogHeading", { n: offlineLog.length })}</h4>
             <DataTable
               rows={offlineLog.map((x, idx) => ({ rowNo: idx + 1, ...x, createdAtLabel: new Date(x.createdAt).toLocaleString() }))}
               pageSize={5}
               allowExport={false}
               columns={[
-                { key: "rowNo", label: "ID" },
-                { key: "type", label: "Type" },
-                { key: "localRef", label: "Local Ref", render: (v) => v || "-" },
-                { key: "message", label: "Message" },
-                { key: "createdAtLabel", label: "Time" },
+                { key: "rowNo", label: tt("posColId") },
+                { key: "type", label: tt("posColType") },
+                { key: "localRef", label: tt("posColLocalRef"), render: (v) => v || "-" },
+                { key: "message", label: tt("posColMessage") },
+                { key: "createdAtLabel", label: tt("posColTime") },
               ]}
             />
 
@@ -3667,9 +3967,7 @@ function POS() {
           ) : null}
         </div>
 
-        <p className="pos-shortcut-hint">
-          F2 Checkout · F4 Print last · F6 Hold · F7 Held carts · Alt+1..4 Quick payment
-        </p>
+        <p className="pos-shortcut-hint">{tt("posShortcutHintBar")}</p>
       </div>
       <ManagerPinModal
         open={pinModal.open}
@@ -3684,17 +3982,18 @@ function POS() {
           <div className="pos-preview-modal">
             <div className="pos-preview-actions">
               <button type="button" onClick={() => setShowPreview(false)}>
-                Close Preview
+                {tt("posClosePreview")}
               </button>
             </div>
             <iframe
-              title="Receipt Preview"
+              title={tt("posIframeReceiptPreview")}
               srcDoc={previewHtml}
               className="pos-preview-frame"
             />
           </div>
         </div>
       )}
+    </div>
     </div>
   );
 }

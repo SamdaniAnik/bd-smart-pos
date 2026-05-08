@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import { getLang, t } from "../i18n";
 import {
   consumeGlobalSubmitError,
   notifyActionRequired,
@@ -9,6 +10,18 @@ import {
 } from "../utils/notify";
 
 function Quotations() {
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState("OPEN");
   const [reminder, setReminder] = useState("");
@@ -55,7 +68,7 @@ function Quotations() {
   };
 
   const cancelQuote = async (row) => {
-    if (!window.confirm(`Cancel quote ${row.quoteNo || row.id}?`)) return;
+    if (!window.confirm(tt("quoConfirmCancel", { id: row.quoteNo || row.id }))) return;
     try {
       await api.delete(`/sales/quotes/${row.id}`);
       load();
@@ -73,7 +86,7 @@ function Quotations() {
         openInPos(newId);
         return;
       }
-      notifySuccess("quote duplicated as a new OPEN quotation.");
+      notifySuccess(tt("quoDupSuccess"));
     } catch {
       consumeGlobalSubmitError();
     }
@@ -90,13 +103,13 @@ function Quotations() {
       const url = window.URL.createObjectURL(blob);
       const tab = window.open(url, "_blank", "noopener,noreferrer");
       if (!tab) {
-        notifyActionRequired("popup blocked. Allow popups for preview, or use PDF download.");
+        notifyActionRequired(tt("quoPopupPreviewBlocked"));
         window.URL.revokeObjectURL(url);
         return;
       }
       setTimeout(() => window.URL.revokeObjectURL(url), 60 * 1000);
     } catch (e) {
-      notifyError(e?.response?.data?.error || "could not preview quote PDF");
+      notifyError(e?.response?.data?.error || tt("quoPreviewFailed"));
     }
   };
 
@@ -112,7 +125,7 @@ function Quotations() {
       a.remove();
       window.URL.revokeObjectURL(url);
     } catch (e) {
-      notifyError(e?.response?.data?.error || "could not download quote PDF");
+      notifyError(e?.response?.data?.error || tt("quoDownloadFailed"));
     }
   };
 
@@ -125,7 +138,7 @@ function Quotations() {
       const items = Array.isArray(sale?.items) ? sale.items : [];
       const lines = items
         .map((it) => {
-          const name = it?.product?.name || `Product#${it?.productId || ""}`;
+          const name = it?.product?.name || tt("quoProductNum", { n: it?.productId || "" });
           const qty = Number(it?.qty || 0);
           const price = Number(it?.price || 0);
           const amount = qty * price;
@@ -133,22 +146,22 @@ function Quotations() {
         })
         .join("");
       const html = `<!doctype html>
-<html><head><meta charset="utf-8"/><title>Invoice ${sale?.invoiceNo || saleId}</title></head>
+<html><head><meta charset="utf-8"/><title>${tt("quoInvoiceTitle")} ${sale?.invoiceNo || saleId}</title></head>
 <body style="font-family:Arial,sans-serif;padding:18px;color:#0f172a;">
-  <h2 style="margin:0 0 8px;">Sale Invoice</h2>
-  <p style="margin:4px 0;"><strong>Invoice:</strong> ${sale?.invoiceNo || saleId}</p>
-  <p style="margin:4px 0;"><strong>Date:</strong> ${sale?.createdAt ? new Date(sale.createdAt).toLocaleString() : "-"}</p>
-  <p style="margin:4px 0;"><strong>Customer:</strong> ${sale?.customer?.name || "Walk-in"}</p>
-  <p style="margin:4px 0 12px;"><strong>Phone:</strong> ${sale?.customer?.phone || "-"}</p>
+  <h2 style="margin:0 0 8px;">${tt("quoSaleInvoice")}</h2>
+  <p style="margin:4px 0;"><strong>${tt("receiptInvoice")}:</strong> ${sale?.invoiceNo || saleId}</p>
+  <p style="margin:4px 0;"><strong>${tt("receiptDate")}:</strong> ${sale?.createdAt ? new Date(sale.createdAt).toLocaleString() : "-"}</p>
+  <p style="margin:4px 0;"><strong>${tt("receiptCustomer")}:</strong> ${sale?.customer?.name || tt("receiptWalkIn")}</p>
+  <p style="margin:4px 0 12px;"><strong>${tt("colPhone")}:</strong> ${sale?.customer?.phone || "-"}</p>
   <table style="width:100%;border-collapse:collapse;font-size:13px;">
-    <thead><tr><th style="text-align:left;padding:6px 8px;border-bottom:1px solid #94a3b8;">Item</th><th style="text-align:right;padding:6px 8px;border-bottom:1px solid #94a3b8;">Qty</th><th style="text-align:right;padding:6px 8px;border-bottom:1px solid #94a3b8;">Rate</th><th style="text-align:right;padding:6px 8px;border-bottom:1px solid #94a3b8;">Amount</th></tr></thead>
+    <thead><tr><th style="text-align:left;padding:6px 8px;border-bottom:1px solid #94a3b8;">${tt("receiptItem")}</th><th style="text-align:right;padding:6px 8px;border-bottom:1px solid #94a3b8;">${tt("receiptQty")}</th><th style="text-align:right;padding:6px 8px;border-bottom:1px solid #94a3b8;">${tt("receiptRate")}</th><th style="text-align:right;padding:6px 8px;border-bottom:1px solid #94a3b8;">${tt("receiptAmount")}</th></tr></thead>
     <tbody>${lines}</tbody>
   </table>
   <div style="margin-top:14px;font-size:13px;">
-    <p style="margin:3px 0;text-align:right;"><strong>SubTotal:</strong> ${Number(sale?.subTotal || 0).toFixed(2)}</p>
-    <p style="margin:3px 0;text-align:right;"><strong>VAT:</strong> ${Number(sale?.vatAmount || 0).toFixed(2)}</p>
-    <p style="margin:3px 0;text-align:right;"><strong>Discount:</strong> ${Number(sale?.discount || 0).toFixed(2)}</p>
-    <p style="margin:6px 0;text-align:right;font-size:15px;"><strong>Total:</strong> ${Number(sale?.total || 0).toFixed(2)}</p>
+    <p style="margin:3px 0;text-align:right;"><strong>${tt("receiptSubTotal")}:</strong> ${Number(sale?.subTotal || 0).toFixed(2)}</p>
+    <p style="margin:3px 0;text-align:right;"><strong>${tt("receiptVat")}:</strong> ${Number(sale?.vatAmount || 0).toFixed(2)}</p>
+    <p style="margin:3px 0;text-align:right;"><strong>${tt("receiptDiscount")}:</strong> ${Number(sale?.discount || 0).toFixed(2)}</p>
+    <p style="margin:6px 0;text-align:right;font-size:15px;"><strong>${tt("receiptTotal")}:</strong> ${Number(sale?.total || 0).toFixed(2)}</p>
   </div>
   <script>
     window.addEventListener('load', function () {
@@ -158,40 +171,40 @@ function Quotations() {
 </body></html>`;
       const tab = window.open("", "_blank", "noopener,noreferrer");
       if (!tab) {
-        notifyActionRequired("popup blocked. Please allow popups.");
+        notifyActionRequired(tt("quoPopupBlocked"));
         return;
       }
       tab.document.open();
       tab.document.write(html);
       tab.document.close();
     } catch (e) {
-      notifyError(e?.response?.data?.error || "could not open converted sale invoice");
+      notifyError(e?.response?.data?.error || tt("quoInvoiceOpenFailed"));
     }
   };
 
   const shareQuoteWhatsApp = (row) => {
     const rawPhone = String(row.customerPhone || "").trim();
     if (!rawPhone) {
-      notifyActionRequired("customer phone is missing for this quote.");
+      notifyActionRequired(tt("quoPhoneMissing"));
       return;
     }
     const digits = rawPhone.replace(/\D/g, "");
     if (!digits) {
-      notifyActionRequired("customer phone is invalid for WhatsApp sharing.");
+      notifyActionRequired(tt("quoPhoneInvalid"));
       return;
     }
     let phone = digits;
     if (phone.startsWith("01")) phone = `88${phone}`;
     const msg =
-      `Assalamu alaikum, your quotation is ready.\n` +
-      `Quote: ${row.quoteNo || row.id}\n` +
-      `Valid until: ${row.validUntil ? new Date(row.validUntil).toLocaleDateString() : "N/A"}\n` +
-      `${row.followUpAt ? `Follow-up on: ${new Date(row.followUpAt).toLocaleDateString()}\n` : ""}` +
-      `Thank you.`;
+      `${tt("quoWaGreeting")}\n` +
+      `${tt("quoWaQuote")}: ${row.quoteNo || row.id}\n` +
+      `${tt("quoWaValidUntil")}: ${row.validUntil ? new Date(row.validUntil).toLocaleDateString() : tt("quoNa")}\n` +
+      `${row.followUpAt ? `${tt("quoWaFollowUpOn")}: ${new Date(row.followUpAt).toLocaleDateString()}\n` : ""}` +
+      `${tt("quoWaThanks")}`;
     const url = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
     const tab = window.open(url, "_blank", "noopener,noreferrer");
     if (!tab) {
-      notifyActionRequired("popup blocked. Please allow popups to open WhatsApp.");
+      notifyActionRequired(tt("quoPopupWhatsAppBlocked"));
     }
   };
 
@@ -227,82 +240,88 @@ function Quotations() {
   };
 
   return (
-    <div>
-      <h2>Sales quotations</h2>
-      <p className="pos-inline-note">Proforma quotes do not affect stock until you convert them on the POS at checkout.</p>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">{tt("quoTitle")}</div>
+          <div className="page-subtitle">
+            {tt("quoSubtitle")}
+          </div>
+        </div>
+      </div>
       <div className="metrics-grid" style={{ marginBottom: 10 }}>
         <div className="metric warning">
-          <div className="metric-label">Overdue Follow-ups</div>
+          <div className="metric-label">{tt("quoMetricOverdue")}</div>
           <div className="metric-value">{Number(summary.overdue || 0)}</div>
         </div>
         <div className="metric">
-          <div className="metric-label">Today</div>
+          <div className="metric-label">{tt("quoMetricToday")}</div>
           <div className="metric-value">{Number(summary.today || 0)}</div>
         </div>
         <div className="metric">
-          <div className="metric-label">Tomorrow</div>
+          <div className="metric-label">{tt("quoMetricTomorrow")}</div>
           <div className="metric-value">{Number(summary.tomorrow || 0)}</div>
         </div>
         <div className="metric success">
-          <div className="metric-label">Follow-up Done</div>
+          <div className="metric-label">{tt("quoMetricDone")}</div>
           <div className="metric-value">{Number(summary.done || 0)}</div>
         </div>
       </div>
       <div className="form-grid" style={{ marginBottom: 12, maxWidth: 360 }}>
         <label>
-          Status
-          <select value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">All</option>
-            <option value="OPEN">Open</option>
-            <option value="EXPIRED">Expired</option>
-            <option value="CONVERTED">Converted</option>
-            <option value="CANCELLED">Cancelled</option>
+          {tt("quoFilterStatus")}
+          <select className="form-select-sm" value={status} onChange={(e) => setStatus(e.target.value)}>
+            <option value="">{tt("quoAll")}</option>
+            <option value="OPEN">{tt("quoStatusOpen")}</option>
+            <option value="EXPIRED">{tt("quoStatusExpired")}</option>
+            <option value="CONVERTED">{tt("quoStatusConverted")}</option>
+            <option value="CANCELLED">{tt("quoStatusCancelled")}</option>
           </select>
         </label>
         <button type="button" className="btn-secondary" onClick={load}>
-          Refresh
+          {tt("dashRefresh")}
         </button>
         <label>
-          Reminder
-          <select value={reminder} onChange={(e) => setReminder(e.target.value)}>
-            <option value="">All</option>
-            <option value="OVERDUE">Overdue</option>
-            <option value="TODAY">Today</option>
-            <option value="TOMORROW">Tomorrow</option>
-            <option value="UPCOMING">Upcoming</option>
-            <option value="NONE">No Reminder</option>
-            <option value="DONE">Done</option>
+          {tt("quoFilterReminder")}
+          <select className="form-select-sm" value={reminder} onChange={(e) => setReminder(e.target.value)}>
+            <option value="">{tt("quoAll")}</option>
+            <option value="OVERDUE">{tt("quoRemOverdue")}</option>
+            <option value="TODAY">{tt("quoRemToday")}</option>
+            <option value="TOMORROW">{tt("quoRemTomorrow")}</option>
+            <option value="UPCOMING">{tt("quoRemUpcoming")}</option>
+            <option value="NONE">{tt("quoRemNone")}</option>
+            <option value="DONE">{tt("quoRemDone")}</option>
           </select>
         </label>
       </div>
       <DataTable rows={rows} pageSize={15} allowExport columns={[
-          { key: "id", label: "ID" },
-          { key: "quoteNo", label: "Quote No" },
-          { key: "status", label: "Status" },
+          { key: "id", label: tt("colId") },
+          { key: "quoteNo", label: tt("quoColQuoteNo") },
+          { key: "status", label: tt("colStatus") },
           {
             key: "convertedSaleId",
-            label: "Converted Sale",
+            label: tt("quoColConvertedSale"),
             render: (v, row) =>
-              row.status === "CONVERTED" && v ? `Sale #${v}` : "-",
+              row.status === "CONVERTED" && v ? tt("quoSaleNum", { n: v }) : "-",
           },
           {
             key: "duplicatedFromQuoteId",
-            label: "From Quote",
+            label: tt("quoColFromQuote"),
             render: (v) => (v ? `#${v}` : "-"),
           },
           {
             key: "followUpStatus",
-            label: "Follow-up",
+            label: tt("quoColFollowUp"),
             render: (v, row) => {
               const badgeClass = getFollowUpBadgeClass(v);
               if (v === "DONE") {
-                const who = row.followUpDoneByName || (row.followUpDoneByUserId ? `User#${row.followUpDoneByUserId}` : "");
+                const who = row.followUpDoneByName || (row.followUpDoneByUserId ? tt("quoUserNum", { n: row.followUpDoneByUserId }) : "");
                 const when = row.followUpDoneAt ? new Date(row.followUpDoneAt).toLocaleString() : "";
                 return (
                   <span style={{ display: "inline-flex", flexDirection: "column", gap: 2 }}>
-                    <span className={badgeClass}>DONE</span>
+                    <span className={badgeClass}>{tt("quoRemDone")}</span>
                     <span style={{ fontSize: 11, color: "#64748b" }}>
-                      {who ? `by ${who}` : ""}{who && when ? " · " : ""}{when || ""}
+                      {who ? `${tt("quoBy")} ${who}` : ""}{who && when ? " · " : ""}{when || ""}
                     </span>
                   </span>
                 );
@@ -320,40 +339,40 @@ function Quotations() {
           },
           {
             key: "validUntil",
-            label: "Valid Until",
+            label: tt("quoColValidUntil"),
             render: (v, row) =>
               v
-                ? `${new Date(v).toLocaleDateString()}${row.status === "EXPIRED" ? " (expired)" : ""}`
+                ? `${new Date(v).toLocaleDateString()}${row.status === "EXPIRED" ? ` (${tt("quoExpiredInline")})` : ""}`
                 : "-",
           },
-          { key: "customerName", label: "Customer", render: (v) => v || "-" },
-          { key: "customerPhone", label: "Phone", render: (v) => v || "-" },
-          { key: "lineCount", label: "Lines" },
-          { key: "createdByName", label: "Created By", render: (v) => v || "-" },
+          { key: "customerName", label: tt("receiptCustomer"), render: (v) => v || "-" },
+          { key: "customerPhone", label: tt("colPhone"), render: (v) => v || "-" },
+          { key: "lineCount", label: tt("quoColLines") },
+          { key: "createdByName", label: tt("quoColCreatedBy"), render: (v) => v || "-" },
           {
             key: "createdAt",
-            label: "Created",
+            label: tt("quoColCreatedAt"),
             render: (v) => (v ? new Date(v).toLocaleString() : ""),
           },
           {
             key: "actions",
-            label: "Actions",
+            label: tt("colActions"),
             render: (_, row) => (
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                 <button type="button" className="btn-secondary btn-sm" disabled={row.status !== "OPEN"} onClick={() => openInPos(row.id)}>
-                  Open in POS
+                  {tt("quoBtnOpenPos")}
                 </button>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => duplicateQuote(row)}>
-                  Duplicate + Open
+                  {tt("quoBtnDuplicateOpen")}
                 </button>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => previewQuotePdf(row)}>
-                  Preview
+                  {tt("quoBtnPreview")}
                 </button>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => downloadQuotePdf(row)}>
-                  Download
+                  {tt("quoBtnDownload")}
                 </button>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => shareQuoteWhatsApp(row)}>
-                  WhatsApp
+                  {tt("quoBtnWhatsApp")}
                 </button>
                 <button
                   type="button"
@@ -361,7 +380,7 @@ function Quotations() {
                   disabled={row.status !== "OPEN"}
                   onClick={() => setFollowUp(row, "today")}
                 >
-                  Follow-up Today
+                  {tt("quoBtnFollowUpToday")}
                 </button>
                 <button
                   type="button"
@@ -369,7 +388,7 @@ function Quotations() {
                   disabled={row.status !== "OPEN"}
                   onClick={() => setFollowUp(row, "tomorrow")}
                 >
-                  Tomorrow
+                  {tt("quoBtnTomorrow")}
                 </button>
                 <button
                   type="button"
@@ -377,7 +396,7 @@ function Quotations() {
                   disabled={row.status !== "OPEN"}
                   onClick={() => setFollowUp(row, "clear")}
                 >
-                  Clear Reminder
+                  {tt("quoBtnClearReminder")}
                 </button>
                 <button
                   type="button"
@@ -385,7 +404,7 @@ function Quotations() {
                   disabled={row.status !== "OPEN" || row.followUpStatus === "DONE"}
                   onClick={() => markFollowUpDone(row)}
                 >
-                  Follow-up Done
+                  {tt("quoBtnFollowUpDone")}
                 </button>
                 <button
                   type="button"
@@ -393,10 +412,10 @@ function Quotations() {
                   disabled={row.status !== "CONVERTED" || !row.convertedSaleId}
                   onClick={() => openSaleInvoice(row)}
                 >
-                  Open Sale Invoice
+                  {tt("quoBtnOpenSaleInvoice")}
                 </button>
                 <button type="button" className="btn-danger btn-sm" disabled={row.status !== "OPEN"} onClick={() => cancelQuote(row)}>
-                  Cancel
+                  {tt("quoBtnCancel")}
                 </button>
               </div>
             ),

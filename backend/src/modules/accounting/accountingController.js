@@ -1,5 +1,5 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
 
 function parseDateInput(value) {
@@ -16,6 +16,7 @@ exports.getAccounts = async (req, res) => {
     });
     res.json(accounts);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -70,6 +71,7 @@ exports.createJournal = async (req, res) => {
     });
     res.status(201).json(journal);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -94,25 +96,116 @@ exports.getTrialBalance = async (req, res) => {
     }));
     res.json(result);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
 
+/** COGS: default 5100; also 5101–5109 if you split COGS sub-accounts (4-digit codes). */
+function isCogsAccount(code) {
+  const c = String(code || "");
+  return c.length === 4 && c.startsWith("510");
+}
+
 exports.getProfitAndLoss = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const lines = await prisma.journalLine.findMany({
-      where: { journal: { branchId } },
-      include: { account: true },
-    });
-    let revenue = 0;
-    let expense = 0;
-    for (const line of lines) {
-      if (line.account.type === "Revenue") revenue += Number(line.credit) - Number(line.debit);
-      if (line.account.type === "Expense") expense += Number(line.debit) - Number(line.credit);
+    const from = parseDateInput(req.query.from);
+    const toStart = parseDateInput(req.query.to);
+    let to = null;
+    if (toStart) {
+      to = new Date(toStart.getTime());
+      to.setHours(23, 59, 59, 999);
     }
-    res.json({ revenue, expense, netProfit: revenue - expense });
+
+    const journalWhere = { branchId };
+    if (from || to) {
+      journalWhere.createdAt = {};
+      if (from) journalWhere.createdAt.gte = from;
+      if (to) journalWhere.createdAt.lte = to;
+    }
+
+    const ccRaw = req.query.costCenterId;
+    if (ccRaw != null && String(ccRaw).trim() !== "") {
+      const cc = Number(ccRaw);
+      if (Number.isFinite(cc)) journalWhere.costCenterId = cc;
+    }
+
+    const agg = await prisma.journalLine.groupBy({
+      by: ["accountId"],
+      _sum: { debit: true, credit: true },
+      where: { journal: journalWhere },
+    });
+
+    const accounts = await prisma.account.findMany({ where: { branchId } });
+    const byId = new Map(accounts.map((a) => [a.id, a]));
+
+    let revenue = 0;
+    let cogs = 0;
+    let operatingExpense = 0;
+    const revenueAccounts = [];
+    const cogsAccounts = [];
+    const operatingAccounts = [];
+
+    for (const row of agg) {
+      const acc = byId.get(row.accountId);
+      if (!acc) continue;
+      const d = Number(row._sum.debit || 0);
+      const c = Number(row._sum.credit || 0);
+      const line = {
+        accountId: acc.id,
+        code: acc.code,
+        name: acc.name,
+        debit: d,
+        credit: c,
+      };
+
+      if (acc.type === "Revenue") {
+        const amt = c - d;
+        if (Math.abs(amt) < 1e-9) continue;
+        revenue += amt;
+        revenueAccounts.push({ ...line, amount: amt });
+      } else if (acc.type === "Expense") {
+        const amt = d - c;
+        if (Math.abs(amt) < 1e-9) continue;
+        line.amount = amt;
+        if (isCogsAccount(acc.code)) {
+          cogs += amt;
+          cogsAccounts.push(line);
+        } else {
+          operatingExpense += amt;
+          operatingAccounts.push(line);
+        }
+      }
+    }
+
+    const sortAmt = (a, b) => Math.abs(b.amount) - Math.abs(a.amount);
+    revenueAccounts.sort(sortAmt);
+    cogsAccounts.sort(sortAmt);
+    operatingAccounts.sort(sortAmt);
+
+    const grossProfit = revenue - cogs;
+    const totalExpense = cogs + operatingExpense;
+    const netProfit = revenue - totalExpense;
+
+    res.json({
+      period: {
+        from: from ? from.toISOString() : null,
+        to: to ? to.toISOString() : null,
+      },
+      revenue,
+      cogs,
+      grossProfit,
+      operatingExpense,
+      totalExpense,
+      expense: totalExpense,
+      netProfit,
+      revenueAccounts,
+      cogsAccounts,
+      operatingExpenseAccounts: operatingAccounts,
+    });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -133,6 +226,7 @@ exports.getBalanceSheet = async (req, res) => {
     }
     res.json(totals);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -147,6 +241,7 @@ exports.getFiscalPeriods = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -175,6 +270,7 @@ exports.closeFiscalPeriod = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -203,6 +299,7 @@ exports.reopenFiscalPeriod = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -253,6 +350,7 @@ exports.createFiscalPeriod = async (req, res) => {
     });
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -287,6 +385,7 @@ exports.closeCurrentMonthFiscalPeriod = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

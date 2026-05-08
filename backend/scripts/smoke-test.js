@@ -77,6 +77,18 @@ async function run() {
   });
   if (sale.status !== 200) throw new Error(`Sale failed: ${JSON.stringify(sale.data)}`);
 
+  const invoiceNo = sale.data.sale && sale.data.sale.invoiceNo;
+  if (invoiceNo) {
+    const lookup = await request(
+      `/sales/lookup/by-invoice?invoiceNo=${encodeURIComponent(invoiceNo)}`,
+      { headers: auth }
+    );
+    if (lookup.status !== 200) throw new Error(`Invoice lookup failed: ${JSON.stringify(lookup.data)}`);
+    if (Number(lookup.data.saleId) !== Number(sale.data.sale.id)) {
+      throw new Error("Invoice lookup returned mismatched saleId");
+    }
+  }
+
   const saleReturn = await request(`/sales/${sale.data.sale.id}/return`, {
     method: "POST",
     headers: auth,

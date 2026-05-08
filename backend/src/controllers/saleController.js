@@ -1,8 +1,9 @@
 const prisma = require("../utils/prisma");
 const { dispatchBranchWebhooks } = require("../utils/webhooks");
 const { getSocketInstance } = require("../socket");
-const { ensureOpenFiscalPeriod } = require("../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../utils/fiscal");
 const { writeAuditLog } = require("../utils/audit");
+const { generateMushak63 } = require("../modules/nbr/mushak63");
 const PDFDocument = require("pdfkit");
 const XLSX = require("xlsx");
 
@@ -478,6 +479,9 @@ function buildVatBreakdownSnapshot(cart, productMap, overrideMap, variantMap) {
     rows.push({
       productId: p.id,
       name: displayName,
+      nameBn: p.nameBn || null,
+      hsCode: p.hsCode || null,
+      unit: p.unitOfMeasure || (p.sellByWeight ? "KG" : "PCS"),
       qty: bill,
       sellByWeight: Boolean(p.sellByWeight),
       weightKg: p.sellByWeight ? Number(item.weightKg || bill) : null,
@@ -839,10 +843,17 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
   const start = fromDate;
   const end = toDateExclusive;
   const salesWhere = { branchId };
+  const walletTxnWhere = {
+    customer: { branchId },
+    type: { in: ["WALLET_LOAD", "WALLET_REDEEM"] },
+  };
   if (start || end) {
     salesWhere.createdAt = {};
     if (start) salesWhere.createdAt.gte = start;
     if (end) salesWhere.createdAt.lt = end;
+    walletTxnWhere.createdAt = {};
+    if (start) walletTxnWhere.createdAt.gte = start;
+    if (end) walletTxnWhere.createdAt.lt = end;
   }
 
   const todaySales = await prisma.sale.findMany({
@@ -858,6 +869,24 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
       createdAt: true,
     },
   });
+  const walletTxns = await prisma.storedValueTxn.findMany({
+    where: walletTxnWhere,
+    select: { type: true, amount: true },
+  });
+  const cashOutAuditWhere = {
+    action: { in: ["DIGITAL_CASH_TRANSFER", "DIGITAL_CASH_OUT"] },
+    entity: "Branch",
+    entityId: branchId,
+  };
+  if (start || end) {
+    cashOutAuditWhere.createdAt = {};
+    if (start) cashOutAuditWhere.createdAt.gte = start;
+    if (end) cashOutAuditWhere.createdAt.lt = end;
+  }
+  const digitalCashOutRows = await prisma.auditLog.findMany({
+    where: cashOutAuditWhere,
+    select: { payload: true },
+  });
 
   const methodTotals = new Map();
   const channelTotals = new Map();
@@ -867,6 +896,8 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
   let totalDue = 0;
   let digitalCollectionTotal = 0;
   let digitalMissingRefCount = 0;
+  let walletCashInTotal = 0;
+  let walletCashOutTotal = 0;
 
   const addAmount = (map, key, amount) => {
     const normalizedKey = key || "Unknown";
@@ -905,6 +936,19 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
       if (!String(sale.paymentChannel || "").trim()) digitalMissingRefCount += 1;
     }
   }
+  for (const txn of walletTxns) {
+    const amount = Number(txn.amount || 0);
+    if (txn.type === "WALLET_LOAD") walletCashInTotal += amount;
+    if (txn.type === "WALLET_REDEEM") walletCashOutTotal += amount;
+  }
+  for (const row of digitalCashOutRows) {
+    const fromMethod = String(row?.payload?.fromMethod || "").trim();
+    const toMethod = String(row?.payload?.toMethod || "Cash").trim() || "Cash";
+    const amount = Number(row?.payload?.amount || 0);
+    if (!fromMethod || !toMethod || !(amount > 0)) continue;
+    addAmount(methodTotals, fromMethod, -amount);
+    addAmount(methodTotals, toMethod, amount);
+  }
 
   const methods = Array.from(methodTotals.entries())
     .map(([method, amount]) => ({ method, amount }))
@@ -927,6 +971,11 @@ async function buildSettlement(branchId, fromDate, toDateExclusive) {
     totalDue,
     digitalCollectionTotal,
     digitalMissingRefCount,
+    walletFlow: {
+      cashOut: walletCashOutTotal,
+      cashIn: walletCashInTotal,
+      net: walletCashInTotal - walletCashOutTotal,
+    },
     methods,
     channels,
     digitalRefs,
@@ -1953,8 +2002,27 @@ exports.checkout = async (req, res) => {
     });
     const saleOut = await prisma.sale.findFirst({
       where: { id: resultSale.id, branchId },
-      include: { salePayments: true, items: { include: { product: true } } },
+      include: { salePayments: true, customer: true, items: { include: { product: true } } },
     });
+
+    // Emit Mushak 6.3 XML for this sale and persist alongside the row.
+    // Failures here are non-fatal — the sale is committed and the cashier
+    // workflow must not block on tax-document generation.
+    try {
+      const branchRow = await prisma.branch.findUnique({ where: { id: branchId } });
+      if (branchRow && saleOut) {
+        const { xml, hash } = generateMushak63({ sale: saleOut, branch: branchRow });
+        await prisma.sale.update({
+          where: { id: saleOut.id },
+          data: { nbrXmlPayload: xml, nbrXmlHash: hash, nbrEmittedAt: new Date() },
+        });
+        saleOut.nbrXmlPayload = xml;
+        saleOut.nbrXmlHash = hash;
+      }
+    } catch (mushakErr) {
+      req.log?.warn?.({ err: mushakErr, saleId: resultSale.id }, "Mushak 6.3 emission failed");
+    }
+
     res.json({ message: "Sale completed", sale: saleOut, loyalty: loyaltySnapshot });
     process.nextTick(() => {
       dispatchBranchWebhooks({
@@ -2012,6 +2080,7 @@ exports.checkout = async (req, res) => {
     if (holdCheckoutMsgs.some((m) => err.message.includes(m))) {
       return res.status(400).json({ error: err.message });
     }
+    if (respondFiscalBlocked(res, err)) return;
     res.status(500).json({ error: err.message });
   }
 };
@@ -2972,6 +3041,41 @@ exports.getRecentSales = async (req, res) => {
       take: 20,
     });
     res.json(sales);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.getSaleByInvoiceLookup = async (req, res) => {
+  try {
+    const branchId = getBranchId(req);
+    const invoiceNo = String(req.query.invoiceNo || req.query.q || "").trim();
+    if (!invoiceNo) {
+      return res.status(400).json({ error: "invoiceNo query parameter is required" });
+    }
+    const sale = await prisma.sale.findUnique({
+      where: {
+        branchId_invoiceNo: {
+          branchId,
+          invoiceNo,
+        },
+      },
+      select: {
+        id: true,
+        invoiceNo: true,
+        mushakDocumentNo: true,
+        createdAt: true,
+      },
+    });
+    if (!sale) {
+      return res.status(404).json({ error: "No sale found for this invoice number in this branch" });
+    }
+    return res.json({
+      saleId: sale.id,
+      invoiceNo: sale.invoiceNo,
+      mushakDocumentNo: sale.mushakDocumentNo || null,
+      createdAt: sale.createdAt,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

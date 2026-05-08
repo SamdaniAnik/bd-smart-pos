@@ -301,11 +301,15 @@ export default function FinanceBankImports() {
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Bank CSV / JSON reconciliation</h2>
-      <p className="text-muted">
-        Import statement lines via JSON, then link each CREDIT row to an existing SalePayment row by id for audit trail.
-      </p>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Bank CSV / JSON reconciliation</div>
+          <div className="page-subtitle">
+            Import statement lines via JSON, then link CREDIT rows to sale payments for a clean audit trail.
+          </div>
+        </div>
+      </div>
 
       <form onSubmit={submitImport} className="page-card" style={{ marginTop: 16 }}>
         <h4>New import payload</h4>
@@ -324,6 +328,7 @@ export default function FinanceBankImports() {
         <label>
           Selected batch:&nbsp;
           <select
+            className="form-select-sm"
             value={selectedImportId != null ? String(selectedImportId) : ""}
             onChange={(e) => {
               const v = e.target.value;
@@ -663,7 +668,7 @@ export default function FinanceBankImports() {
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "end" }}>
           <label>
             Status
-            <select value={snapshotFilter.status} onChange={(e) => setSnapshotFilter((s) => ({ ...s, status: e.target.value }))}>
+            <select className="form-select-sm" value={snapshotFilter.status} onChange={(e) => setSnapshotFilter((s) => ({ ...s, status: e.target.value }))}>
               <option value="ALL">All</option>
               <option value="OPEN">Open</option>
               <option value="CLOSED">Closed</option>

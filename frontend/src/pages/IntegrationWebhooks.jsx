@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
-import { consumeGlobalSubmitError, notifySuccess } from "../utils/notify";
+import DataTable from "../components/DataTable";
+import { consumeGlobalSubmitError, notifySuccess, notifyError } from "../utils/notify";
 
 export default function IntegrationWebhooks() {
   const [rows, setRows] = useState([]);
+  const [deliveries, setDeliveries] = useState([]);
+  const [replayBusyId, setReplayBusyId] = useState(null);
   const [form, setForm] = useState({
     url: "",
     secret: "",
@@ -16,8 +19,14 @@ export default function IntegrationWebhooks() {
     setRows(res.data || []);
   };
 
+  const loadDeliveries = async () => {
+    const res = await api.get("/integration/webhooks/deliveries?limit=75");
+    setDeliveries(Array.isArray(res.data) ? res.data : []);
+  };
+
   useEffect(() => {
     load();
+    loadDeliveries();
   }, []);
 
   const create = async (e) => {
@@ -32,6 +41,7 @@ export default function IntegrationWebhooks() {
       });
       setForm({ url: "", secret: "", events: "sale.created" });
       load();
+      loadDeliveries();
       notifySuccess("webhook saved.");
     } catch {
       consumeGlobalSubmitError();
@@ -40,24 +50,61 @@ export default function IntegrationWebhooks() {
     }
   };
 
+  const exportDeliveriesCsv = async () => {
+    try {
+      const res = await api.get("/integration/webhooks/deliveries/export.csv?limit=500", {
+        responseType: "blob",
+      });
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "webhook-deliveries.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      notifyError(err?.response?.data?.error || err?.message || "Export failed");
+    }
+  };
+
+  const replayDelivery = async (row) => {
+    if (!row?.canReplay) return;
+    setReplayBusyId(row.id);
+    try {
+      await api.post(`/integration/webhooks/deliveries/${row.id}/replay`, {}, { skipGlobalErrorToast: true });
+      notifySuccess("Replay webhook dispatched.");
+      loadDeliveries();
+    } catch (err) {
+      notifyError(err?.response?.data?.error || err?.message || "Replay failed");
+    } finally {
+      setReplayBusyId(null);
+    }
+  };
+
   const toggle = async (row) => {
     await api.put(`/integration/webhooks/${row.id}`, { isActive: !row.isActive });
     load();
+    loadDeliveries();
   };
 
   const remove = async (row) => {
     if (!window.confirm("Remove this webhook endpoint?")) return;
     await api.delete(`/integration/webhooks/${row.id}`);
     load();
+    loadDeliveries();
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Outbound webhooks</h2>
-      <p className="text-muted">
-        Registers HTTPS endpoints that receive JSON POST payloads when events occur. Header <code>X-Bdpos-Signature</code> is HMAC-
-        SHA256 of the JSON body using your secret (when secret is non-empty).
-      </p>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Outbound webhooks</div>
+          <div className="page-subtitle">
+            Registers HTTPS endpoints that receive JSON POST payloads when events occur. Header{" "}
+            <code>X-Bdpos-Signature</code> is HMAC-SHA256 of the JSON body using your secret (when secret is
+            non-empty).
+          </div>
+        </div>
+      </div>
 
       <form onSubmit={create} className="form-grid page-card" style={{ maxWidth: 640, marginTop: 16 }}>
         <label>
@@ -117,6 +164,80 @@ export default function IntegrationWebhooks() {
         ) : (
           <p className="text-muted">None yet.</p>
         )}
+      </div>
+
+      <div style={{ marginTop: 28 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
+          <h4 style={{ margin: 0 }}>Recent deliveries</h4>
+          <button type="button" className="btn-secondary btn-sm" onClick={exportDeliveriesCsv}>
+            Export CSV
+          </button>
+          <button type="button" className="btn-secondary btn-sm" onClick={loadDeliveries}>
+            Refresh log
+          </button>
+        </div>
+        <p className="text-muted" style={{ fontSize: 13, marginTop: 0 }}>
+          One row per outbound POST after each eligible event (e.g. <code>sale.created</code>). Failed rows keep the error message from the network or non-2xx response.
+        </p>
+        <DataTable
+          title=""
+          rows={deliveries.map((d) => ({
+            ...d,
+            createdLabel: d.createdAt ? new Date(d.createdAt).toLocaleString() : "—",
+            statusLabel: d.ok ? "OK" : "Fail",
+            subIdLabel: d.webhookSubscriptionId != null ? `#${d.webhookSubscriptionId}` : "—",
+            httpLabel: d.statusCode != null ? String(d.statusCode) : "—",
+            msLabel: d.durationMs != null ? `${d.durationMs} ms` : "—",
+            urlShort: String(d.url || "").length > 72 ? `${String(d.url).slice(0, 72)}…` : String(d.url || ""),
+          }))}
+          pageSize={10}
+          allowExport={false}
+          searchableKeys={["event", "urlShort", "errorMessage", "subIdLabel"]}
+          columns={[
+            { key: "createdLabel", label: "Time" },
+            { key: "event", label: "Event" },
+            { key: "subIdLabel", label: "Hook #" },
+            {
+              key: "statusLabel",
+              label: "Result",
+              render: (v, row) => (
+                <span style={{ color: row.ok ? "#15803d" : "#b42318", fontWeight: 600 }}>{v}</span>
+              ),
+            },
+            { key: "httpLabel", label: "HTTP" },
+            { key: "msLabel", label: "Latency" },
+            {
+              key: "urlShort",
+              label: "URL",
+              render: (v, row) => (
+                <code style={{ fontSize: 11 }} title={row.url}>
+                  {v}
+                </code>
+              ),
+            },
+            {
+              key: "detail-actions",
+              label: "",
+              render: (_, row) => (
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={!row.canReplay || replayBusyId === row.id}
+                  onClick={() => replayDelivery(row)}
+                >
+                  {replayBusyId === row.id ? "…" : "Replay"}
+                </button>
+              ),
+            },
+            {
+              key: "errorMessage",
+              label: "Detail",
+              render: (v) => (
+                <span style={{ fontSize: 12, color: v ? "#b42318" : "#64748b" }}>{v || "—"}</span>
+              ),
+            },
+          ]}
+        />
       </div>
     </div>
   );

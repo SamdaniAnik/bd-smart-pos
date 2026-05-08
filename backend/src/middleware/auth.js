@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const prisma = require("../utils/prisma");
+const config = require("../utils/config");
 
 async function requireAuth(req, res, next) {
   try {
@@ -9,7 +10,7 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "dev_secret");
+    const decoded = jwt.verify(token, config.jwtSecret);
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
       include: {
@@ -43,7 +44,18 @@ function requirePermission(code) {
   };
 }
 
+function requireAnyPermission(codes) {
+  const list = Array.isArray(codes) ? codes : [codes];
+  return (req, res, next) => {
+    if (!req.permissions || !list.some((c) => req.permissions.has(c))) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    next();
+  };
+}
+
 module.exports = {
   requireAuth,
   requirePermission,
+  requireAnyPermission,
 };

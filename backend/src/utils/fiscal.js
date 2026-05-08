@@ -1,6 +1,36 @@
 const prisma = require("./prisma");
 
-async function ensureOpenFiscalPeriod(branchId, date = new Date()) {
+const MSG_NO_PERIOD =
+  "No fiscal period covers today's date. Create or extend an open period under Finance → Fiscal periods.";
+const MSG_CLOSED =
+  "Fiscal period is closed for this date. Finance must reopen the period before sales can post.";
+
+class FiscalPeriodBlockedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "FiscalPeriodBlockedError";
+    /** Business code surfaced to API clients (HTTP 400). */
+    this.code = "FISCAL_PERIOD_BLOCKED";
+    /** For handlers using httpStatus-style branching */
+    this.httpStatus = 400;
+  }
+}
+
+/**
+ * If err is a blocked fiscal period, sends JSON 400 { error, code } and returns true.
+ * If headers were already sent, returns true without sending (prevents double responses).
+ */
+function respondFiscalBlocked(res, err) {
+  if (!(err instanceof FiscalPeriodBlockedError)) return false;
+  if (res.headersSent) return true;
+  res.status(400).json({ error: err.message, code: err.code });
+  return true;
+}
+
+/**
+ * @returns {Promise<{ ok: true, period: object } | { ok: false, code: string, message: string }>}
+ */
+async function getFiscalPeriodGate(branchId, date = new Date()) {
   const period = await prisma.fiscalPeriod.findFirst({
     where: {
       branchId,
@@ -9,12 +39,25 @@ async function ensureOpenFiscalPeriod(branchId, date = new Date()) {
     },
   });
   if (!period) {
-    throw new Error("No fiscal period configured for transaction date");
+    return { ok: false, code: "FISCAL_PERIOD_BLOCKED", message: MSG_NO_PERIOD };
   }
   if (period.isClosed) {
-    throw new Error("Fiscal period is closed");
+    return { ok: false, code: "FISCAL_PERIOD_BLOCKED", message: MSG_CLOSED };
   }
-  return period;
+  return { ok: true, period };
 }
 
-module.exports = { ensureOpenFiscalPeriod };
+async function ensureOpenFiscalPeriod(branchId, date = new Date()) {
+  const gate = await getFiscalPeriodGate(branchId, date);
+  if (!gate.ok) {
+    throw new FiscalPeriodBlockedError(gate.message);
+  }
+  return gate.period;
+}
+
+module.exports = {
+  ensureOpenFiscalPeriod,
+  getFiscalPeriodGate,
+  FiscalPeriodBlockedError,
+  respondFiscalBlocked,
+};

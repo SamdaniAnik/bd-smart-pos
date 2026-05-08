@@ -1,0 +1,18 @@
+-- Purchase financing (supplier credit vs bank loan)
+SET @db := DATABASE();
+
+SET @sql := (SELECT IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'Purchase' AND COLUMN_NAME = 'financingSource') > 0, 'SELECT 1', CONCAT('ALTER TABLE `Purchase` ADD COLUMN `financingSource` VARCHAR(191) NOT NULL DEFAULT ', CHAR(39), 'SUPPLIER_CREDIT', CHAR(39))));
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql := (SELECT IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'Purchase' AND COLUMN_NAME = 'loanReference') > 0, 'SELECT 1', 'ALTER TABLE `Purchase` ADD COLUMN `loanReference` VARCHAR(191) NULL'));
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql := (SELECT IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'Purchase' AND COLUMN_NAME = 'loanNote') > 0, 'SELECT 1', 'ALTER TABLE `Purchase` ADD COLUMN `loanNote` VARCHAR(500) NULL'));
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql := (SELECT IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @db AND TABLE_NAME = 'Purchase' AND COLUMN_NAME = 'loanMaturityDate') > 0, 'SELECT 1', 'ALTER TABLE `Purchase` ADD COLUMN `loanMaturityDate` DATETIME(3) NULL'));
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+INSERT INTO `Account` (`branchId`, `code`, `name`, `type`, `isSystem`, `createdAt`)
+SELECT b.`id`, '2320', 'Bank Loans Payable', 'Liability', 1, NOW(3)
+FROM `Branch` b
+WHERE NOT EXISTS (
+  SELECT 1 FROM `Account` a WHERE a.`branchId` = b.`id` AND a.`code` = '2320'
+);

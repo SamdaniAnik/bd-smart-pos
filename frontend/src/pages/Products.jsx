@@ -3,12 +3,25 @@ import Select from "react-select";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
 import JsBarcode from "jsbarcode";
-import { notifyActionRequired, notifyError } from "../utils/notify";
+import { notifyActionRequired } from "../utils/notify";
 import { createSearchSelectStyles } from "../utils/selectStyles";
+import { getLang, t } from "../i18n";
 
 const SEARCH_SELECT_STYLES = createSearchSelectStyles(38);
 
 function Products() {
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+
   const [products, setProducts] = useState([]);
   const [form, setForm] = useState({
     name: "",
@@ -161,7 +174,7 @@ function Products() {
   };
 
   const handleDelete = async (row) => {
-    if (!window.confirm(`Delete product "${row.name}"?`)) return;
+    if (!window.confirm(tt("prodConfirmDeleteProduct", { name: row.name }))) return;
     await api.delete(`/products/${row.id}`);
     if (selected?.id === row.id) setSelected(null);
     if (editingId === row.id) handleCancelEdit();
@@ -190,7 +203,7 @@ function Products() {
 
   const printLabels = () => {
     if (!selectedLabelProducts.length) {
-      notifyActionRequired("set label quantity for at least one product.");
+      notifyActionRequired(tt("prodNotifyNeedLabelQty"));
       return;
     }
     const [labelW, labelH] = labelSize.split("x").map((x) => Number(x));
@@ -218,7 +231,7 @@ function Products() {
             <div class="barcode">${barcodeSvg}</div>
             <div class="meta">${escapeLabel(metaCode)}</div>
             <div class="price">৳${Number(unitPrice || 0).toFixed(2)}</div>
-            <div class="pack">Unit Label ${idx + 1}/${qty}</div>
+            <div class="pack">${tt("prodLabelUnitPack", { cur: idx + 1, total: qty })}</div>
           </div>
         `
           );
@@ -249,7 +262,7 @@ function Products() {
     const html = `
       <html>
         <head>
-          <title>Product Labels</title>
+          <title>${tt("prodPrintWindowTitle")}</title>
           <style>
             @page { margin: 8mm; }
             body { font-family: Arial, sans-serif; }
@@ -286,7 +299,7 @@ function Products() {
       return categoryOk && lowStockOk;
     });
     if (!matched.length) {
-      notifyActionRequired("no products matched the bulk selection filter.");
+      notifyActionRequired(tt("prodNotifyBulkNoMatch"));
       return;
     }
     setLabelQtyByProduct((prev) => {
@@ -303,16 +316,16 @@ function Products() {
   };
 
   return (
-    <div>
+    <div className="page-stack">
       <div className="page-header">
         <div>
-          <div className="page-title">Products</div>
-          <div className="page-subtitle">Step-by-step product workflow</div>
+          <div className="page-title">{tt("products")}</div>
+          <div className="page-subtitle">{tt("productsPageSubtitle")}</div>
         </div>
       </div>
 
       <div className="pos-tabs">
-        <div className="pos-tablist" role="tablist" aria-label="Products workflow">
+        <div className="pos-tablist" role="tablist" aria-label={tt("productsTabsAria")}>
           <button
             type="button"
             role="tab"
@@ -320,7 +333,7 @@ function Products() {
             className={`pos-tab ${productsTab === "form" ? "pos-tab-active" : ""}`}
             onClick={() => setProductsTab("form")}
           >
-            1. Add / Edit Product
+            {tt("prodTabForm")}
           </button>
           <button
             type="button"
@@ -329,7 +342,7 @@ function Products() {
             className={`pos-tab ${productsTab === "list" ? "pos-tab-active" : ""}`}
             onClick={() => setProductsTab("list")}
           >
-            2. Product List
+            {tt("prodTabList")}
             <span className="pos-tab-badge">{products.length}</span>
           </button>
           <button
@@ -339,39 +352,39 @@ function Products() {
             className={`pos-tab ${productsTab === "labels" ? "pos-tab-active" : ""}`}
             onClick={() => setProductsTab("labels")}
           >
-            3. Labels & Variants
-            {selected ? <span className="pos-tab-badge pos-tab-badge-warn">Selected</span> : null}
+            {tt("prodTabLabels")}
+            {selected ? <span className="pos-tab-badge pos-tab-badge-warn">{tt("prodBadgeSelected")}</span> : null}
           </button>
         </div>
       </div>
 
       {productsTab === "labels" ? (
       <div className="page-card" style={{ marginBottom: 12 }}>
-        <h4 style={{ marginTop: 0 }}>Barcode Label Printing</h4>
+        <h4 style={{ marginTop: 0 }}>{tt("prodLabelsTitle")}</h4>
         <p className="text-muted" style={{ marginTop: -2 }}>
-          Set quantities, print labels, and manage variant barcodes for selected products.
+          {tt("prodLabelsHelp")}
         </p>
         <div className="form-grid">
-          <select value={labelSize} onChange={(e) => setLabelSize(e.target.value)}>
-            <option value="50x30">50x30 mm (shelf label)</option>
-            <option value="40x25">40x25 mm (small sticker)</option>
-            <option value="60x40">60x40 mm (large label)</option>
+          <select className="form-select-sm" value={labelSize} onChange={(e) => setLabelSize(e.target.value)}>
+            <option value="50x30">{tt("prodOpt5030")}</option>
+            <option value="40x25">{tt("prodOpt4025")}</option>
+            <option value="60x40">{tt("prodOpt6040")}</option>
           </select>
-          <select value={sheetTemplate} onChange={(e) => setSheetTemplate(e.target.value)}>
-            <option value="free">Free flow layout</option>
-            <option value="a4_3x8">A4 template 3x8</option>
-            <option value="a4_4x10">A4 template 4x10</option>
+          <select className="form-select-sm" value={sheetTemplate} onChange={(e) => setSheetTemplate(e.target.value)}>
+            <option value="free">{tt("prodOptLayoutFree")}</option>
+            <option value="a4_3x8">{tt("prodOptA4_3x8")}</option>
+            <option value="a4_4x10">{tt("prodOptA4_4x10")}</option>
           </select>
           <button type="button" onClick={printLabels}>
-            Print Selected Labels ({selectedLabelProducts.length})
+            {tt("prodPrintLabels", { n: selectedLabelProducts.length })}
           </button>
           <button type="button" className="btn-secondary" onClick={clearLabelSelection}>
-            Clear Label Selection
+            {tt("prodClearLabels")}
           </button>
           <input
             type="number"
             min={1}
-            placeholder="Bulk Label Quantity"
+            placeholder={tt("prodPhBulkQty")}
             value={bulkLabelQty}
             onChange={(e) => setBulkLabelQty(e.target.value)}
           />
@@ -380,14 +393,14 @@ function Products() {
             value={
               bulkCategory
                 ? { value: bulkCategory, label: bulkCategory }
-                : { value: "", label: "All categories" }
+                : { value: "", label: tt("prodAllCategories") }
             }
             options={[
-              { value: "", label: "All categories" },
+              { value: "", label: tt("prodAllCategories") },
               ...categories.map((c) => ({ value: c, label: c })),
             ]}
             onChange={(opt) => setBulkCategory(opt?.value || "")}
-            placeholder="All categories"
+            placeholder={tt("prodAllCategories")}
             isClearable={false}
             isSearchable
             styles={SEARCH_SELECT_STYLES}
@@ -398,10 +411,10 @@ function Products() {
               checked={bulkLowStockOnly}
               onChange={(e) => setBulkLowStockOnly(e.target.checked)}
             />
-            Low stock only
+            {tt("prodLowStockOnly")}
           </label>
           <button type="button" className="btn-secondary" onClick={applyBulkSelection}>
-            Auto-select labels
+            {tt("prodAutoSelectLabels")}
           </button>
         </div>
       </div>
@@ -410,58 +423,59 @@ function Products() {
       {productsTab === "form" ? (
       <form onSubmit={handleSubmit} className="form-grid">
         <input
-          placeholder="Product name"
+          placeholder={tt("prodPhName")}
           value={form.name}
           onChange={(e) => setForm({ ...form, name: e.target.value })}
         />
 
         <input
-          placeholder="Price"
+          placeholder={tt("prodPhPrice")}
           type="number"
           value={form.price}
           onChange={(e) => setForm({ ...form, price: e.target.value })}
         />
 
         <input
-          placeholder="Stock"
+          placeholder={tt("prodPhStock")}
           type="number"
           value={form.stock}
           onChange={(e) => setForm({ ...form, stock: e.target.value })}
         />
 
         <input
-          placeholder="Category"
+          placeholder={tt("prodPhCategory")}
           value={form.category}
           onChange={(e) => setForm({ ...form, category: e.target.value })}
         />
         <input
-          placeholder="SKU"
+          placeholder={tt("prodPhSku")}
           value={form.sku}
           onChange={(e) => setForm({ ...form, sku: e.target.value })}
         />
         <input
-          placeholder="VAT %"
+          placeholder={tt("prodPhVat")}
           type="number"
           value={form.vatRate}
           onChange={(e) => setForm({ ...form, vatRate: e.target.value })}
         />
         <input
-          placeholder="Reorder level"
+          placeholder={tt("prodPhReorder")}
           type="number"
           min={0}
           value={form.reorderLevel}
           onChange={(e) => setForm({ ...form, reorderLevel: e.target.value })}
         />
         <select
+          className="form-select-sm"
           value={form.defaultDiscountType}
           onChange={(e) => setForm({ ...form, defaultDiscountType: e.target.value })}
         >
-          <option value="">No Default Discount</option>
-          <option value="PERCENT">Default % Discount</option>
-          <option value="AMOUNT">Default Amount Discount</option>
+          <option value="">{tt("prodDiscNone")}</option>
+          <option value="PERCENT">{tt("prodDiscPercent")}</option>
+          <option value="AMOUNT">{tt("prodDiscAmount")}</option>
         </select>
         <input
-          placeholder="Default Discount Value"
+          placeholder={tt("prodPhDiscVal")}
           type="number"
           value={form.defaultDiscountValue}
           onChange={(e) => setForm({ ...form, defaultDiscountValue: e.target.value })}
@@ -473,7 +487,7 @@ function Products() {
             onChange={(e) => setForm({ ...form, batchTracked: e.target.checked })}
             style={{ width: "auto" }}
           />
-          Batch / expiry tracked (FEFO at sale)
+          {tt("prodBatchFefo")}
         </label>
         <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input
@@ -488,10 +502,10 @@ function Products() {
             }
             style={{ width: "auto" }}
           />
-          Sell by weight (price is per kg — use Stock kg field)
+          {tt("prodSellByKg")}
         </label>
         <input
-          placeholder="Stock kg (for sell-by-kg only)"
+          placeholder={tt("prodPhStockKg")}
           type="number"
           min={0}
           step={0.001}
@@ -512,13 +526,13 @@ function Products() {
             }
             style={{ width: "auto" }}
           />
-          Uses size/color variants (add barcodes per variant after save)
+          {tt("prodHasVariants")}
         </label>
 
-        <button type="submit">{editingId ? "Update Product" : "Add Product"}</button>
+        <button type="submit">{editingId ? tt("prodUpdateProduct") : tt("prodAddProduct")}</button>
         {editingId ? (
           <button type="button" className="btn-secondary" onClick={handleCancelEdit}>
-            Cancel
+            {tt("settingsCancel")}
           </button>
         ) : null}
       </form>
@@ -526,13 +540,13 @@ function Products() {
 
       {productsTab === "list" ? (
       <DataTable
-        title="Product List"
+        title={tt("prodListTitle")}
         rows={products}
         searchableKeys={["name", "sku", "category"]}
         filters={[
           {
             key: "category",
-            label: "Category",
+            label: tt("prodFilterCategory"),
             options: [...new Set(products.map((p) => p.category).filter(Boolean))].map((c) => ({
               label: c,
               value: c,
@@ -542,7 +556,7 @@ function Products() {
         columns={[
           {
             key: "labelQty",
-            label: "Label Qty",
+            label: tt("prodColLabelQty"),
             render: (_, row) => (
               <input
                 type="number"
@@ -553,26 +567,26 @@ function Products() {
               />
             ),
           },
-          { key: "name", label: "Name" },
-          { key: "sku", label: "SKU", render: (v) => v || "-" },
-          { key: "category", label: "Category", render: (v) => v || "-" },
-          { key: "price", label: "Price", render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "name", label: tt("prodLblName") },
+          { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
+          { key: "category", label: tt("prodLblCategory"), render: (v) => v || "-" },
+          { key: "price", label: tt("prodLblPrice"), render: (v) => `৳${Number(v).toFixed(2)}` },
           {
             key: "stock",
-            label: "Stock",
+            label: tt("prodLblStock"),
             render: (_, row) =>
               row.sellByWeight
-                ? `${Number(row.stockKg || 0).toFixed(3)} kg`
+                ? `${Number(row.stockKg || 0).toFixed(3)} ${tt("dashKgTag")}`
                 : row.hasVariants
-                  ? `${row.variants?.length || 0} var.`
+                  ? tt("prodVariantCount", { n: row.variants?.length || 0 })
                   : row.stock,
           },
-          { key: "reorderLevel", label: "Reorder Level", render: (v) => Number(v || 0) },
-          { key: "vatRate", label: "VAT %", render: (v) => `${v}%` },
-          { key: "batchTracked", label: "Batch", render: (v) => (v ? "Yes" : "-") },
+          { key: "reorderLevel", label: tt("prodLblReorder"), render: (v) => Number(v || 0) },
+          { key: "vatRate", label: tt("prodLblVat"), render: (v) => `${v}%` },
+          { key: "batchTracked", label: tt("prodColBatch"), render: (v) => (v ? tt("prodYes") : "-") },
           {
             key: "defaultDiscountType",
-            label: "Default Discount",
+            label: tt("prodColDefaultDiscount"),
             render: (v, row) =>
               v
                 ? v === "PERCENT"
@@ -582,15 +596,15 @@ function Products() {
           },
           {
             key: "actions",
-            label: "Actions",
+            label: tt("colActions"),
             render: (_, row) => (
               <div style={{ display: "flex", gap: 6 }}>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => setLabelQty(row.id, Number(labelQtyByProduct[row.id] || 0) + 1)}>
-                  +Label
+                  {tt("prodPlusLabel")}
                 </button>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => handleDetails(row)}>Details</button>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => { handleEdit(row); setProductsTab("form"); }}>Edit</button>
-                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)}>Delete</button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => handleDetails(row)}>{tt("actionDetails")}</button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => { handleEdit(row); setProductsTab("form"); }}>{tt("actionEdit")}</button>
+                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)}>{tt("actionDelete")}</button>
               </div>
             ),
           },
@@ -601,65 +615,67 @@ function Products() {
       {productsTab === "labels" && !selected ? (
         <div className="page-card" style={{ marginTop: 12 }}>
           <p className="text-muted" style={{ margin: 0 }}>
-            Select a product from <strong>Product List</strong> and click <strong>Details</strong> to manage variants here.
+            {tt("prodLabelsPickProduct")}
           </p>
         </div>
       ) : null}
 
       {selected ? (
         <div className="page-card" style={{ marginTop: 12 }}>
-          <h4>Product Details</h4>
-          <p><strong>Name:</strong> {selected.name}</p>
-          <p><strong>SKU:</strong> {selected.sku || "-"}</p>
-          <p><strong>Category:</strong> {selected.category || "-"}</p>
-          <p><strong>Price:</strong> ৳{Number(selected.price || 0).toFixed(2)}</p>
-          <p><strong>Stock:</strong> {selected.stock}</p>
-          <p><strong>Reorder Level:</strong> {Number(selected.reorderLevel || 0)}</p>
-          <p><strong>VAT:</strong> {Number(selected.vatRate || 0)}%</p>
+          <h4>{tt("prodDetailTitle")}</h4>
+          <p><strong>{tt("prodLblName")}:</strong> {selected.name}</p>
+          <p><strong>{tt("prodLblSku")}:</strong> {selected.sku || "-"}</p>
+          <p><strong>{tt("prodLblCategory")}:</strong> {selected.category || "-"}</p>
+          <p><strong>{tt("prodLblPrice")}:</strong> ৳{Number(selected.price || 0).toFixed(2)}</p>
+          <p><strong>{tt("prodLblStock")}:</strong> {selected.stock}</p>
+          <p><strong>{tt("prodLblReorder")}:</strong> {Number(selected.reorderLevel || 0)}</p>
+          <p><strong>{tt("prodLblVat")}:</strong> {Number(selected.vatRate || 0)}%</p>
           <p>
-            <strong>Default Discount:</strong>{" "}
+            <strong>{tt("prodLblDefaultDisc")}:</strong>{" "}
             {selected.defaultDiscountType
               ? `${selected.defaultDiscountType === "PERCENT" ? `${selected.defaultDiscountValue}%` : `৳${Number(selected.defaultDiscountValue || 0).toFixed(2)}`}`
               : "-"}
           </p>
           <p>
-            <strong>Batch tracked:</strong> {selected.batchTracked ? "Yes" : "No"}
+            <strong>{tt("prodLblBatch")}:</strong> {selected.batchTracked ? tt("prodYes") : tt("prodNo")}
           </p>
           <p>
-            <strong>Sell by kg:</strong> {selected.sellByWeight ? "Yes" : "No"}
-            {selected.sellByWeight ? ` — ${Number(selected.stockKg || 0).toFixed(3)} kg on hand` : ""}
+            <strong>{tt("prodLblSellKg")}:</strong> {selected.sellByWeight ? tt("prodYes") : tt("prodNo")}
+            {selected.sellByWeight
+              ? ` — ${tt("prodStockKgOnHand", { n: Number(selected.stockKg || 0).toFixed(3) })}`
+              : ""}
           </p>
           <p>
-            <strong>Variants:</strong> {selected.hasVariants ? "Yes" : "No"}
+            <strong>{tt("prodLblVariants")}:</strong> {selected.hasVariants ? tt("prodYes") : tt("prodNo")}
           </p>
           {selected.hasVariants ? (
             <div style={{ marginTop: 12 }}>
-              <h5 style={{ marginBottom: 8 }}>Variant barcodes</h5>
+              <h5 style={{ marginBottom: 8 }}>{tt("prodVariantBarcodes")}</h5>
               <ul style={{ margin: "0 0 8px 16px", padding: 0 }}>
                 {(selected.variants || []).length === 0 ? (
-                  <li style={{ color: "#64748b" }}>No variants yet — add below.</li>
+                  <li style={{ color: "#64748b" }}>{tt("prodNoVariantsYet")}</li>
                 ) : (
                   (selected.variants || []).map((v) => (
                     <li key={v.id} style={{ marginBottom: 4 }}>
                       <strong>{String(v.label || "").trim() || `#${v.id}`}</strong>
-                      {` — stock ${v.stock} — `}
-                      {v.barcode || v.sku || "no barcode"}
+                      {` — ${tt("prodVariantStockSep", { n: v.stock })} — `}
+                      {v.barcode || v.sku || tt("prodNoBarcode")}
                       {" — "}
                       {v.priceOverride != null && v.priceOverride !== ""
-                        ? `৳${Number(v.priceOverride).toFixed(2)}`
-                        : `base ৳${Number(selected.price || 0).toFixed(2)}`}
+                        ? tt("prodPriceOverride", { n: Number(v.priceOverride).toFixed(2) })
+                        : tt("prodPriceBase", { n: Number(selected.price || 0).toFixed(2) })}
                       <button
                         type="button"
                         className="btn-danger btn-sm"
                         style={{ marginLeft: 8 }}
                         onClick={async () => {
-                          if (!window.confirm(`Delete variant "${v.label}"?`)) return;
+                          if (!window.confirm(tt("prodConfirmDeleteVariant", { name: String(v.label || "").trim() || `#${v.id}` }))) return;
                           await api.delete(`/products/${selected.id}/variants/${v.id}`);
                           await refreshSelectedProduct(selected.id);
                           fetchProducts();
                         }}
                       >
-                        Delete
+                        {tt("actionDelete")}
                       </button>
                     </li>
                   ))
@@ -667,29 +683,29 @@ function Products() {
               </ul>
               <div className="form-grid">
                 <input
-                  placeholder="Label (e.g. M · Navy)"
+                  placeholder={tt("prodPhVarLabel")}
                   value={variantDraft.label}
                   onChange={(e) => setVariantDraft({ ...variantDraft, label: e.target.value })}
                 />
                 <input
-                  placeholder="Variant SKU (optional)"
+                  placeholder={tt("prodPhVarSku")}
                   value={variantDraft.sku}
                   onChange={(e) => setVariantDraft({ ...variantDraft, sku: e.target.value })}
                 />
                 <input
-                  placeholder="Barcode for shelf label (optional)"
+                  placeholder={tt("prodPhVarBarcode")}
                   value={variantDraft.barcode}
                   onChange={(e) => setVariantDraft({ ...variantDraft, barcode: e.target.value })}
                 />
                 <input
-                  placeholder="Stock Quantity"
+                  placeholder={tt("prodPhVarStock")}
                   type="number"
                   min={0}
                   value={variantDraft.stock}
                   onChange={(e) => setVariantDraft({ ...variantDraft, stock: e.target.value })}
                 />
                 <input
-                  placeholder="Price override (optional)"
+                  placeholder={tt("prodPhVarPrice")}
                   type="number"
                   value={variantDraft.priceOverride}
                   onChange={(e) => setVariantDraft({ ...variantDraft, priceOverride: e.target.value })}
@@ -723,7 +739,7 @@ function Products() {
                     }
                   }}
                 >
-                  Add variant
+                  {tt("prodAddVariant")}
                 </button>
               </div>
             </div>

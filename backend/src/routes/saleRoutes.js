@@ -32,12 +32,14 @@ const {
   getSalesQuoteReminderSummary,
   markSalesQuoteFollowUpDone,
   getCustomerRecentSales,
+  getSaleByInvoiceLookup,
 } = require("../controllers/saleController");
 const { requireAuth, requirePermission } = require("../middleware/auth");
 
 router.post("/checkout", requireAuth, requirePermission("sale.create"), checkout);
 router.post("/:id/return", requireAuth, requirePermission("sale.return"), saleReturn);
 router.get("/recent", requireAuth, requirePermission("sale.view"), getRecentSales);
+router.get("/lookup/by-invoice", requireAuth, requirePermission("sale.view"), getSaleByInvoiceLookup);
 router.get("/customer/recent-sales", requireAuth, requirePermission("sale.view"), getCustomerRecentSales);
 router.get("/summary/today", requireAuth, requirePermission("sale.view"), getTodaySummary);
 router.get("/summary/settlement-today", requireAuth, requirePermission("sale.view"), getTodaySettlement);

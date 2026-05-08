@@ -4,6 +4,8 @@ const {
   importSettlement,
   listSettlements,
   listUnmatchedPayments,
+  createDigitalCashOut,
+  listDigitalCashOuts,
 } = require("./settlementController");
 const {
   listBankImports,
@@ -38,6 +40,8 @@ router.get(
   requirePermission("accounting.report"),
   listUnmatchedPayments
 );
+router.post("/settlements/digital-cash-out", requireAuth, requirePermission("accounting.report"), createDigitalCashOut);
+router.get("/settlements/digital-cash-out", requireAuth, requirePermission("accounting.report"), listDigitalCashOuts);
 
 router.get("/bank/imports", requireAuth, requirePermission("accounting.report"), listBankImports);
 router.post("/bank/imports", requireAuth, requirePermission("accounting.report"), createBankImport);

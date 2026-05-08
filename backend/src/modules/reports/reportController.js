@@ -1301,3 +1301,48 @@ exports.exportChequeLedgerPDF = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+exports.getHqBranchSummary = async (req, res) => {
+  try {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const branches = await prisma.branch.findMany({
+      where: { isActive: true },
+      select: { id: true, code: true, name: true },
+      orderBy: { id: "asc" },
+    });
+    const [saleAgg, purchaseAgg] = await Promise.all([
+      prisma.sale.groupBy({
+        by: ["branchId"],
+        where: { createdAt: { gte: start } },
+        _sum: { total: true, paidAmount: true },
+        _count: { id: true },
+      }),
+      prisma.purchase.groupBy({
+        by: ["branchId"],
+        where: { createdAt: { gte: start } },
+        _sum: { total: true },
+        _count: { id: true },
+      }),
+    ]);
+    const saleMap = new Map(saleAgg.map((x) => [x.branchId, x]));
+    const purchaseMap = new Map(purchaseAgg.map((x) => [x.branchId, x]));
+    const rows = branches.map((b) => {
+      const s = saleMap.get(b.id);
+      const p = purchaseMap.get(b.id);
+      return {
+        branchId: b.id,
+        code: b.code,
+        name: b.name,
+        salesToday: Number(s?._sum?.total || 0),
+        collectionsToday: Number(s?._sum?.paidAmount || 0),
+        saleCountToday: Number(s?._count?.id || 0),
+        purchasesToday: Number(p?._sum?.total || 0),
+        purchaseCountToday: Number(p?._count?.id || 0),
+      };
+    });
+    res.json({ asOf: start.toISOString(), branches: rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};

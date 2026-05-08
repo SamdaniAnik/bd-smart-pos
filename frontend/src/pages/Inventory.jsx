@@ -4,6 +4,7 @@ import api from "../services/api";
 import DataTable from "../components/DataTable";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
 import { createSearchSelectStyles } from "../utils/selectStyles";
+import { getLang, t } from "../i18n";
 import {
   notifyActionRequired,
   notifyError,
@@ -20,6 +21,18 @@ function Inventory() {
   const canAdjustInventory = hasPermission("inventory.adjust", permissions);
   const canTransferInventory = hasPermission("inventory.transfer", permissions);
   const canExportReports = hasPermission("accounting.report", permissions);
+
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
 
   const [ledger, setLedger] = useState([]);
   const [adjustments, setAdjustments] = useState([]);
@@ -172,7 +185,7 @@ function Inventory() {
   const submitAdjustment = async (e) => {
     e.preventDefault();
     if (!canAdjustInventory) {
-      notifyPermissionRequired("inventory.adjust.");
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
       return;
     }
     const payload = {
@@ -190,7 +203,7 @@ function Inventory() {
       }
     } catch (error) {
       if (error?.response?.status === 403) {
-        const pin = window.prompt("Manager PIN required for this high-value write-off:");
+        const pin = window.prompt(tt("invPinHighValueWriteoff"));
         if (!pin) return;
         const retryPayload = { ...payload, managerApprovalPin: pin };
         if (editingAdjustmentId) {
@@ -220,10 +233,10 @@ function Inventory() {
 
   const deleteAdjustment = async (row) => {
     if (!canAdjustInventory) {
-      notifyPermissionRequired("inventory.adjust.");
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
       return;
     }
-    if (!window.confirm("Delete this ledger adjustment?")) return;
+    if (!window.confirm(tt("invConfirmDeleteAdjustment"))) return;
     await api.delete(`/inventory/adjustments/${row.id}`);
     if (editingAdjustmentId === row.id) {
       setEditingAdjustmentId(null);
@@ -288,9 +301,9 @@ function Inventory() {
     () =>
       batchRows.map((b) => ({
         value: String(b.id),
-        label: `${b.productName} - ${b.batchCode} (Qty ${b.qtyOnHand})`,
+        label: `${b.productName} - ${b.batchCode} (${tt("invBatchQtyLabel")} ${b.qtyOnHand})`,
       })),
-    [batchRows]
+    [batchRows, tt]
   );
   const destinationBranchOptions = useMemo(
     () =>
@@ -314,12 +327,12 @@ function Inventory() {
   const submitTransfer = async (e) => {
     e.preventDefault();
     if (!canTransferInventory) {
-      notifyPermissionRequired("inventory.transfer.");
+      notifyPermissionRequired(tt("invNeedPermTransfer"));
       return;
     }
     const toBranchId = Number(transferForm.toBranchId);
     if (!toBranchId) {
-      notifyActionRequired("select a destination branch.");
+      notifyActionRequired(tt("invSelectDestinationBranch"));
       return;
     }
     const items = transferForm.items
@@ -330,7 +343,7 @@ function Inventory() {
       }))
       .filter((x) => x.fromProductId && x.toProductId && Number.isInteger(x.qty) && x.qty > 0);
     if (!items.length) {
-      notifyActionRequired("add at least one valid transfer line.");
+      notifyActionRequired(tt("invAddValidTransferLine"));
       return;
     }
     await api.post("/inventory/transfers", { toBranchId, items });
@@ -345,7 +358,7 @@ function Inventory() {
   const submitBatch = async (e) => {
     e.preventDefault();
     if (!canAdjustInventory) {
-      notifyPermissionRequired("inventory.adjust.");
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
       return;
     }
     await api.post("/inventory/batches", {
@@ -372,11 +385,11 @@ function Inventory() {
   const submitReasonMaster = async (e) => {
     e.preventDefault();
     if (!canAdjustInventory) {
-      notifyPermissionRequired("inventory.adjust.");
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
       return;
     }
     if (!reasonForm.code.trim() || !reasonForm.label.trim()) {
-      notifyActionRequired("reason code and label are required.");
+      notifyActionRequired(tt("invReasonCodeAndLabelRequired"));
       return;
     }
     const payload = {
@@ -401,17 +414,17 @@ function Inventory() {
       isActive: true,
     });
     setEditingReasonId(null);
-    notifySuccess(editingReasonId ? "adjustment reason updated." : "adjustment reason saved.");
+    notifySuccess(editingReasonId ? tt("invReasonUpdated") : tt("invReasonSaved"));
     load();
   };
 
   const toggleReasonActive = async (row) => {
     if (!canAdjustInventory) {
-      notifyPermissionRequired("inventory.adjust.");
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
       return;
     }
     await api.patch(`/inventory/adjust-reasons/${row.id}`, { isActive: !row.isActive });
-    notifySuccess("reason status updated.");
+    notifySuccess(tt("invReasonStatusUpdated"));
     load();
   };
 
@@ -442,7 +455,7 @@ function Inventory() {
   const submitBatchAdjustment = async (e) => {
     e.preventDefault();
     if (!canAdjustInventory) {
-      notifyPermissionRequired("inventory.adjust.");
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
       return;
     }
     await api.post(`/inventory/batches/${Number(batchAdjustForm.batchId)}/qty`, {
@@ -455,17 +468,17 @@ function Inventory() {
 
   const createExpiryMarkdownCampaign = async () => {
     if (!canAdjustInventory) {
-      notifyPermissionRequired("inventory.adjust.");
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
       return;
     }
-    const ok = window.confirm("Create auto markdown promotions from near-expiry batches?");
+    const ok = window.confirm(tt("invConfirmMarkdownCampaign"));
     if (!ok) return;
     const res = await api.post("/inventory/batches/markdown-campaign", {
       days: Number(batchExpiryWindowDays || 30),
       validDays: 7,
       maxProducts: 100,
     });
-    notifySuccess(res.data?.message || "markdown campaign created.");
+    notifySuccess(res.data?.message || tt("invMarkdownCampaignCreated"));
   };
 
   const appendLowStockToPurchaseDraft = (items) => {
@@ -517,40 +530,40 @@ function Inventory() {
         toBranchName: row.toBranch?.name || `#${row.toBranchId}`,
         directionLabel:
           row.fromBranchId === Number(localStorage.getItem("bd_pos_branch_id") || "1")
-            ? "Outbound"
-            : "Inbound",
+            ? tt("invDirectionOutbound")
+            : tt("invDirectionInbound"),
         itemCount: row.items?.length || 0,
         qtyTotal: (row.items || []).reduce((sum, x) => sum + Number(x.qty || 0), 0),
       })),
-    [transfers]
+    [transfers, tt]
   );
 
   const approveTransfer = async (row) => {
     if (!canTransferInventory) {
-      notifyPermissionRequired("inventory.transfer.");
+      notifyPermissionRequired(tt("invNeedPermTransfer"));
       return;
     }
-    const pin = window.prompt("Enter manager PIN to approve transfer:");
+    const pin = window.prompt(tt("invPinApproveTransfer"));
     if (!pin) return;
     await api.post(`/inventory/transfers/${Number(row.id)}/approve`, { managerApprovalPin: pin });
-    notifySuccess("transfer approved and posted to stock.");
+    notifySuccess(tt("invTransferApproved"));
     await load();
   };
 
   const rejectTransfer = async (row) => {
     if (!canTransferInventory) {
-      notifyPermissionRequired("inventory.transfer.");
+      notifyPermissionRequired(tt("invNeedPermTransfer"));
       return;
     }
-    const reason = (window.prompt("Rejection reason (optional):") || "").trim();
+    const reason = (window.prompt(tt("invPromptRejectReason")) || "").trim();
     await api.post(`/inventory/transfers/${Number(row.id)}/reject`, { reason });
-    notifySuccess("transfer rejected.");
+    notifySuccess(tt("invTransferRejected"));
     await load();
   };
 
   const downloadReorderCsv = async () => {
     if (!canExportReports) {
-      notifyPermissionRequired("accounting.report to export reorder CSV.");
+      notifyPermissionRequired(tt("invNeedPermExportReorder"));
       return;
     }
     try {
@@ -562,34 +575,58 @@ function Inventory() {
       a.click();
       URL.revokeObjectURL(blobUrl);
     } catch {
-      notifyError("could not export reorder CSV.");
+      notifyError(tt("invExportReorderFailed"));
     }
   };
 
   return (
-    <div>
+    <div className="page-stack">
       <div className="page-header">
         <div>
-          <div className="page-title">Inventory</div>
-          <div className="page-subtitle">Step-by-step inventory workflow</div>
+          <div className="page-title">{tt("inventory")}</div>
+          <div className="page-subtitle">{tt("inventoryPageSubtitle")}</div>
         </div>
       </div>
       <div className="quick-stats">
-        <div className="stat-chip">Tracked reorder products: {lowStockSummary.totalTracked}</div>
-        <div className="stat-chip">Out of Stock: {lowStockSummary.outOfStock}</div>
-        <div className="stat-chip">Low Stock: {lowStockSummary.lowStock}</div>
-        <div className="stat-chip">Fast Moving: {intelligenceSummary.fastMovingCount}</div>
-        <div className="stat-chip">Slow Moving: {intelligenceSummary.slowMovingCount}</div>
-        <div className="stat-chip">Dead Stock: {intelligenceSummary.deadStockCount}</div>
-        <div className="stat-chip">Reorder Suggestions: {intelligenceSummary.suggestedReorderCount}</div>
-        <div className="stat-chip">Seasonality Adjusted: {intelligenceSummary.seasonalityAdjustedCount}</div>
-        <div className="stat-chip">Batch Tracked: {batchAlertSummary.tracked}</div>
-        <div className="stat-chip">Near Expiry: {batchAlertSummary.nearExpiryCount}</div>
-        <div className="stat-chip">Expired: {batchAlertSummary.expiredCount}</div>
-        <div className="stat-chip">Transfer Suggestions: {transferSuggestionSummary.suggestions}</div>
+        <div className="stat-chip">
+          {tt("invStatTrackedReorder")}: {lowStockSummary.totalTracked}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatOutOfStock")}: {lowStockSummary.outOfStock}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatLowStock")}: {lowStockSummary.lowStock}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatFastMoving")}: {intelligenceSummary.fastMovingCount}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatSlowMoving")}: {intelligenceSummary.slowMovingCount}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatDeadStock")}: {intelligenceSummary.deadStockCount}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatReorderSuggestions")}: {intelligenceSummary.suggestedReorderCount}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatSeasonalityAdjusted")}: {intelligenceSummary.seasonalityAdjustedCount}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatBatchTracked")}: {batchAlertSummary.tracked}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatNearExpiry")}: {batchAlertSummary.nearExpiryCount}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatExpired")}: {batchAlertSummary.expiredCount}
+        </div>
+        <div className="stat-chip">
+          {tt("invStatTransferSuggestions")}: {transferSuggestionSummary.suggestions}
+        </div>
       </div>
       <div className="pos-tabs">
-        <div className="pos-tablist" role="tablist" aria-label="Inventory workflow">
+        <div className="pos-tablist" role="tablist" aria-label={tt("inventoryTabsAria")}>
           <button
             type="button"
             role="tab"
@@ -597,7 +634,7 @@ function Inventory() {
             className={`pos-tab ${inventoryTab === "overview" ? "pos-tab-active" : ""}`}
             onClick={() => setInventoryTab("overview")}
           >
-            1. Overview
+            {tt("invTabOverview")}
           </button>
           <button
             type="button"
@@ -606,7 +643,7 @@ function Inventory() {
             className={`pos-tab ${inventoryTab === "batches" ? "pos-tab-active" : ""}`}
             onClick={() => setInventoryTab("batches")}
           >
-            2. Batches & Expiry
+            {tt("invTabBatches")}
           </button>
           <button
             type="button"
@@ -615,7 +652,7 @@ function Inventory() {
             className={`pos-tab ${inventoryTab === "ops" ? "pos-tab-active" : ""}`}
             onClick={() => setInventoryTab("ops")}
           >
-            3. Stock Ops
+            {tt("invTabOps")}
           </button>
           <button
             type="button"
@@ -624,30 +661,30 @@ function Inventory() {
             className={`pos-tab ${inventoryTab === "transfers" ? "pos-tab-active" : ""}`}
             onClick={() => setInventoryTab("transfers")}
           >
-            4. Transfers
+            {tt("invTabTransfers")}
           </button>
         </div>
       </div>
       {!canAdjustInventory && (inventoryTab === "batches" || inventoryTab === "ops") ? (
         <div className="page-card" style={{ marginBottom: 10 }}>
-          <strong>Permission required:</strong> <code>inventory.adjust</code> to add batches, adjust batch quantities, and edit/delete stock adjustments.
+          <p style={{ margin: 0, fontSize: 13 }}>{tt("invPermBannerAdjust")}</p>
         </div>
       ) : null}
       {!canTransferInventory && inventoryTab === "transfers" ? (
         <div className="page-card" style={{ marginBottom: 10 }}>
-          <strong>Permission required:</strong> <code>inventory.transfer</code> to submit, approve, or reject stock transfers.
+          <p style={{ margin: 0, fontSize: 13 }}>{tt("invPermBannerTransfer")}</p>
         </div>
       ) : null}
       {!canExportReports && inventoryTab === "overview" ? (
         <div className="page-card" style={{ marginBottom: 10 }}>
-          <strong>Permission required:</strong> <code>accounting.report</code> to export reorder CSV files.
+          <p style={{ margin: 0, fontSize: 13 }}>{tt("invPermBannerExport")}</p>
         </div>
       ) : null}
       {inventoryTab === "overview" ? (
         <div className="pos-tab-panel">
       <div style={{ margin: "10px 0", display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <button type="button" className="btn-secondary btn-sm" onClick={downloadReorderCsv} disabled={!canExportReports}>
-          Download reorder CSV (at/below reorder level)
+          {tt("invDownloadReorderCsv")}
         </button>
       </div>
       <div className="form-grid" style={{ margin: "8px 0" }}>
@@ -656,35 +693,35 @@ function Inventory() {
           min={7}
           value={intelligenceRangeDays}
           onChange={(e) => setIntelligenceRangeDays(e.target.value)}
-          placeholder="Sales Lookback Days"
+          placeholder={tt("invPhSalesLookback")}
         />
         <input
           type="number"
           min={15}
           value={deadStockDays}
           onChange={(e) => setDeadStockDays(e.target.value)}
-          placeholder="Dead Stock Days"
+          placeholder={tt("invPhDeadStock")}
         />
         <input
           type="number"
           min={1}
           value={leadDays}
           onChange={(e) => setLeadDays(e.target.value)}
-          placeholder="Lead Days"
+          placeholder={tt("invPhLead")}
         />
         <input
           type="number"
           min={1}
           value={forecastDays}
           onChange={(e) => setForecastDays(e.target.value)}
-          placeholder="Forecast Days"
+          placeholder={tt("invPhForecast")}
         />
         <input
           type="number"
           min={1}
           value={batchExpiryWindowDays}
           onChange={(e) => setBatchExpiryWindowDays(e.target.value)}
-          placeholder="Near-Expiry Window Days"
+          placeholder={tt("invPhNearExpiryWindow")}
         />
       </div>
       <label style={{ display: "inline-flex", alignItems: "center", gap: 6, margin: "8px 0 4px" }}>
@@ -693,44 +730,44 @@ function Inventory() {
           checked={showOnlyCriticalLowStock}
           onChange={(e) => setShowOnlyCriticalLowStock(e.target.checked)}
         />
-        Show only low/out of stock
+        {tt("invLowStockOnly")}
       </label>
       <DataTable
-        title="Inventory Intelligence (Fast/Slow/Dead + Reorder)"
+        title={tt("invDtIntelligence")}
         rows={intelligenceRows.map((row) => ({
           ...row,
           lastSoldAtLabel: row.lastSoldAt ? new Date(row.lastSoldAt).toLocaleDateString() : "-",
         }))}
         searchableKeys={["name", "sku", "category", "movementClass"]}
         columns={[
-          { key: "name", label: "Product" },
-          { key: "sku", label: "SKU", render: (v) => v || "-" },
-          { key: "category", label: "Category", render: (v) => v || "-" },
-          { key: "stock", label: "Stock" },
-          { key: "soldQty", label: "Sold Qty" },
-          { key: "avgDailySold", label: "Avg/Day", render: (v) => Number(v || 0).toFixed(2) },
-          { key: "forecastNeed", label: "Forecast Need", render: (v) => Number(v || 0).toFixed(2) },
-          { key: "seasonalityMultiplier", label: "Seasonality", render: (v) => `${Number(v || 1).toFixed(2)}x` },
-          { key: "lastSoldAtLabel", label: "Last Sold" },
-          { key: "daysSinceLastSale", label: "Days Since Last Sale", render: (v) => (v == null ? "-" : v) },
+          { key: "name", label: tt("invColProduct") },
+          { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
+          { key: "category", label: tt("prodLblCategory"), render: (v) => v || "-" },
+          { key: "stock", label: tt("prodLblStock") },
+          { key: "soldQty", label: tt("invColSoldQty") },
+          { key: "avgDailySold", label: tt("invColAvgDay"), render: (v) => Number(v || 0).toFixed(2) },
+          { key: "forecastNeed", label: tt("invColForecastNeed"), render: (v) => Number(v || 0).toFixed(2) },
+          { key: "seasonalityMultiplier", label: tt("invColSeasonality"), render: (v) => `${Number(v || 1).toFixed(2)}x` },
+          { key: "lastSoldAtLabel", label: tt("invColLastSold") },
+          { key: "daysSinceLastSale", label: tt("invColDaysSinceSale"), render: (v) => (v == null ? "-" : v) },
           {
             key: "movementClass",
-            label: "Movement",
+            label: tt("invColMovement"),
             render: (v) =>
               v === "DEAD" ? (
-                <span className="badge badge-danger">DEAD</span>
+                <span className="badge badge-danger">{tt("invMovementDEAD")}</span>
               ) : v === "SLOW" ? (
-                <span className="badge badge-warning">SLOW</span>
+                <span className="badge badge-warning">{tt("invMovementSLOW")}</span>
               ) : v === "FAST" ? (
-                <span className="badge badge-success">FAST</span>
+                <span className="badge badge-success">{tt("invMovementFAST")}</span>
               ) : (
-                <span className="badge">MEDIUM</span>
+                <span className="badge">{tt("invMovementMEDIUM")}</span>
               ),
           },
-          { key: "reorderSuggestionQty", label: "Suggested Reorder Qty" },
+          { key: "reorderSuggestionQty", label: tt("invColSuggestedReorderQty") },
           {
             key: "actions",
-            label: "Actions",
+            label: tt("colActions"),
             render: (_, row) => (
               <button
                 type="button"
@@ -747,38 +784,38 @@ function Inventory() {
                 }
                 disabled={Number(row.reorderSuggestionQty || 0) <= 0}
               >
-                Add Suggestion to Draft
+                {tt("invBtnAddSuggestionDraft")}
               </button>
             ),
           },
         ]}
       />
       <DataTable
-        title="Low Stock Alerts"
+        title={tt("invDtLowStock")}
         rows={lowStockRows}
         searchableKeys={["name", "sku", "category"]}
         columns={[
-          { key: "name", label: "Product" },
-          { key: "sku", label: "SKU", render: (v) => v || "-" },
-          { key: "category", label: "Category", render: (v) => v || "-" },
-          { key: "stock", label: "Stock" },
-          { key: "reorderLevel", label: "Reorder Level" },
-          { key: "shortageQty", label: "Shortage" },
+          { key: "name", label: tt("invColProduct") },
+          { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
+          { key: "category", label: tt("prodLblCategory"), render: (v) => v || "-" },
+          { key: "stock", label: tt("prodLblStock") },
+          { key: "reorderLevel", label: tt("prodLblReorder") },
+          { key: "shortageQty", label: tt("dashShortQty") },
           {
             key: "status",
-            label: "Status",
+            label: tt("colStatus"),
             render: (v) =>
               v === "OUT" ? (
-                <span className="badge badge-danger">OUT</span>
+                <span className="badge badge-danger">{tt("invBadgeOut")}</span>
               ) : v === "LOW" ? (
-                <span className="badge badge-warning">LOW</span>
+                <span className="badge badge-warning">{tt("invBadgeLow")}</span>
               ) : (
-                <span className="badge badge-success">OK</span>
+                <span className="badge badge-success">{tt("invBadgeStockOk")}</span>
               ),
           },
           {
             key: "actions",
-            label: "Actions",
+            label: tt("colActions"),
             render: (_, row) => (
               <button
                 type="button"
@@ -795,7 +832,7 @@ function Inventory() {
                   ])
                 }
               >
-                Create Purchase Draft
+                {tt("invBtnCreatePurchaseDraft")}
               </button>
             ),
           },
@@ -819,7 +856,7 @@ function Inventory() {
               )
             }
           >
-            Create Draft for All Low/Out Items
+            {tt("invBtnCreateDraftAllLow")}
           </button>
         </div>
       ) : null}
@@ -828,20 +865,20 @@ function Inventory() {
       {inventoryTab === "batches" ? (
         <div className="pos-tab-panel">
       <div className="page-card" style={{ marginBottom: 12 }}>
-        <h3>Batch & Expiry Tracking (FEFO Ready)</h3>
+        <h3>{tt("invBatchSectionTitle")}</h3>
         <form onSubmit={submitBatch} className="form-grid" style={{ marginBottom: 8 }}>
           <Select
             className="form-select-sm"
             value={productOptions.find((opt) => opt.value === String(batchForm.productId)) || null}
             options={productOptions}
             onChange={(opt) => setBatchForm((p) => ({ ...p, productId: opt?.value || "" }))}
-            placeholder="Select Product"
+            placeholder={tt("invPhSelectProduct")}
             isClearable
             isSearchable
             styles={SEARCH_SELECT_STYLES}
           />
           <input
-            placeholder="Batch Code"
+            placeholder={tt("invPhBatchCode")}
             value={batchForm.batchCode}
             onChange={(e) => setBatchForm((p) => ({ ...p, batchCode: e.target.value }))}
           />
@@ -851,7 +888,7 @@ function Inventory() {
             type="number"
             min={0}
             step={1}
-            placeholder="Quantity"
+            placeholder={tt("invPhQuantity")}
             value={batchForm.qtyOnHand}
             onChange={(e) => setBatchForm((p) => ({ ...p, qtyOnHand: e.target.value }))}
           />
@@ -859,12 +896,12 @@ function Inventory() {
             type="number"
             min={0}
             step="0.01"
-            placeholder="Unit Cost"
+            placeholder={tt("invPhUnitCost")}
             value={batchForm.unitCost}
             onChange={(e) => setBatchForm((p) => ({ ...p, unitCost: e.target.value }))}
           />
-          <input placeholder="Note (Optional)" value={batchForm.note} onChange={(e) => setBatchForm((p) => ({ ...p, note: e.target.value }))} />
-          <button type="submit" disabled={!canAdjustInventory}>Add Batch</button>
+          <input placeholder={tt("invPhNoteOptional")} value={batchForm.note} onChange={(e) => setBatchForm((p) => ({ ...p, note: e.target.value }))} />
+          <button type="submit" disabled={!canAdjustInventory}>{tt("invAddBatch")}</button>
         </form>
         <form onSubmit={submitBatchAdjustment} className="form-grid">
           <Select
@@ -872,7 +909,7 @@ function Inventory() {
             value={batchOptions.find((opt) => opt.value === String(batchAdjustForm.batchId)) || null}
             options={batchOptions}
             onChange={(opt) => setBatchAdjustForm((p) => ({ ...p, batchId: opt?.value || "" }))}
-            placeholder="Select Batch"
+            placeholder={tt("invPhSelectBatch")}
             isClearable
             isSearchable
             styles={SEARCH_SELECT_STYLES}
@@ -880,20 +917,20 @@ function Inventory() {
           <input
             type="number"
             step={1}
-            placeholder="Quantity Change (+/-)"
+            placeholder={tt("invPhQtyChange")}
             value={batchAdjustForm.qtyChange}
             onChange={(e) => setBatchAdjustForm((p) => ({ ...p, qtyChange: e.target.value }))}
           />
           <input
-            placeholder="Reason (Required)"
+            placeholder={tt("invPhReasonRequired")}
             value={batchAdjustForm.reason}
             onChange={(e) => setBatchAdjustForm((p) => ({ ...p, reason: e.target.value }))}
           />
-          <button type="submit" disabled={!canAdjustInventory}>Update Batch Quantity</button>
+          <button type="submit" disabled={!canAdjustInventory}>{tt("invUpdateBatchQty")}</button>
         </form>
       </div>
       <DataTable
-        title="Near Expiry / Expired Batch Alerts"
+        title={tt("invDtNearExpiry")}
         rows={batchAlertRows.map((row) => ({
           ...row,
           expiryDateLabel: row.expiryDate ? new Date(row.expiryDate).toLocaleDateString() : "-",
@@ -901,33 +938,33 @@ function Inventory() {
         }))}
         searchableKeys={["productName", "batchCode", "note"]}
         columns={[
-          { key: "productName", label: "Product" },
-          { key: "batchCode", label: "Batch" },
-          { key: "qtyOnHand", label: "Qty" },
-          { key: "expiryDateLabel", label: "Expiry Date" },
-          { key: "daysToExpiry", label: "Days Left" },
-          { key: "markdownLabel", label: "Suggested Markdown" },
+          { key: "productName", label: tt("invColProduct") },
+          { key: "batchCode", label: tt("invColBatch") },
+          { key: "qtyOnHand", label: tt("invBatchQtyLabel") },
+          { key: "expiryDateLabel", label: tt("invColExpiryDate") },
+          { key: "daysToExpiry", label: tt("invColDaysLeft") },
+          { key: "markdownLabel", label: tt("invColSuggestedMarkdown") },
           {
             key: "isExpired",
-            label: "Status",
+            label: tt("colStatus"),
             render: (v, row) =>
               v ? (
-                <span className="badge badge-danger">EXPIRED</span>
+                <span className="badge badge-danger">{tt("invBadgeExpired")}</span>
               ) : row.isNear ? (
-                <span className="badge badge-warning">NEAR EXPIRY</span>
+                <span className="badge badge-warning">{tt("invBadgeNearExpiry")}</span>
               ) : (
-                <span className="badge badge-success">OK</span>
+                <span className="badge badge-success">{tt("invBadgeOk")}</span>
               ),
           },
         ]}
       />
       <div style={{ marginBottom: 10 }}>
         <button type="button" className="btn-secondary btn-sm" onClick={createExpiryMarkdownCampaign} disabled={!canAdjustInventory}>
-          Create Auto Markdown Campaign
+          {tt("invBtnMarkdownCampaign")}
         </button>
       </div>
       <DataTable
-        title="Batch Register"
+        title={tt("invDtBatchRegister")}
         rows={batchRows.map((row) => ({
           ...row,
           expiryDateLabel: row.expiryDate ? new Date(row.expiryDate).toLocaleDateString() : "-",
@@ -935,22 +972,22 @@ function Inventory() {
         }))}
         searchableKeys={["productName", "batchCode", "status", "note"]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "productName", label: "Product" },
-          { key: "batchCode", label: "Batch" },
-          { key: "qtyOnHand", label: "Qty On Hand" },
-          { key: "unitCost", label: "Unit Cost", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "receivedAtLabel", label: "Received" },
-          { key: "expiryDateLabel", label: "Expiry" },
-          { key: "daysToExpiry", label: "Days Left", render: (v) => (v == null ? "-" : v) },
+          { key: "id", label: tt("colId") },
+          { key: "productName", label: tt("invColProduct") },
+          { key: "batchCode", label: tt("invColBatch") },
+          { key: "qtyOnHand", label: tt("invColQtyOnHand") },
+          { key: "unitCost", label: tt("invPhUnitCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "receivedAtLabel", label: tt("invColReceived") },
+          { key: "expiryDateLabel", label: tt("invColExpiry") },
+          { key: "daysToExpiry", label: tt("invColDaysLeft"), render: (v) => (v == null ? "-" : v) },
           {
             key: "status",
-            label: "Status",
+            label: tt("colStatus"),
             render: (v) => {
               const status = String(v || "").toLowerCase();
-              if (status === "completed") return <span className="badge badge-success">COMPLETED</span>;
-              if (status === "rejected") return <span className="badge badge-danger">REJECTED</span>;
-              if (status === "pending") return <span className="badge badge-warning">PENDING</span>;
+              if (status === "completed") return <span className="badge badge-success">{tt("invLedgerStatusCompleted")}</span>;
+              if (status === "rejected") return <span className="badge badge-danger">{tt("invLedgerStatusRejected")}</span>;
+              if (status === "pending") return <span className="badge badge-warning">{tt("invLedgerStatusPending")}</span>;
               return <span className="badge">{String(v || "-").toUpperCase()}</span>;
             },
           },
@@ -961,33 +998,34 @@ function Inventory() {
       {inventoryTab === "ops" ? (
         <div className="pos-tab-panel">
       <div className="page-card" style={{ marginBottom: 12 }}>
-        <h3>Adjustment Reason Master</h3>
+        <h3>{tt("invReasonMasterTitle")}</h3>
         <form onSubmit={submitReasonMaster} className="form-grid" style={{ marginBottom: 8 }}>
           <input
-            placeholder="Code (e.g., DAMAGE)"
+            placeholder={tt("invPhReasonCode")}
             value={reasonForm.code}
             onChange={(e) => setReasonForm((p) => ({ ...p, code: e.target.value }))}
           />
           <input
-            placeholder="Label"
+            placeholder={tt("invPhLabel")}
             value={reasonForm.label}
             onChange={(e) => setReasonForm((p) => ({ ...p, label: e.target.value }))}
           />
-          <select value={reasonForm.direction} onChange={(e) => setReasonForm((p) => ({ ...p, direction: e.target.value }))}>
-            <option value="BOTH">Both</option>
-            <option value="IN">IN only</option>
-            <option value="OUT">OUT only</option>
+          <select className="form-select-sm" value={reasonForm.direction} onChange={(e) => setReasonForm((p) => ({ ...p, direction: e.target.value }))}>
+            <option value="BOTH">{tt("invDirBoth")}</option>
+            <option value="IN">{tt("invDirInOnly")}</option>
+            <option value="OUT">{tt("invDirOutOnly")}</option>
           </select>
           <select
+            className="form-select-sm"
             value={reasonForm.accountingImpact}
             onChange={(e) => setReasonForm((p) => ({ ...p, accountingImpact: e.target.value }))}
           >
-            <option value="NONE">No accounting impact</option>
-            <option value="WRITE_OFF">Write-off</option>
-            <option value="GAIN">Gain</option>
+            <option value="NONE">{tt("invAccNone")}</option>
+            <option value="WRITE_OFF">{tt("invAccWriteOff")}</option>
+            <option value="GAIN">{tt("invAccGain")}</option>
           </select>
           <input
-            placeholder="Account code (optional)"
+            placeholder={tt("invPhAccountCodeOpt")}
             value={reasonForm.accountCode}
             onChange={(e) => setReasonForm((p) => ({ ...p, accountCode: e.target.value }))}
           />
@@ -997,36 +1035,36 @@ function Inventory() {
               checked={Boolean(reasonForm.isActive)}
               onChange={(e) => setReasonForm((p) => ({ ...p, isActive: e.target.checked }))}
             />
-            Active
+            {tt("invActive")}
           </label>
-          <button type="submit" disabled={!canAdjustInventory}>{editingReasonId ? "Update Reason" : "Save Reason"}</button>
+          <button type="submit" disabled={!canAdjustInventory}>{editingReasonId ? tt("invUpdateReason") : tt("invSaveReason")}</button>
           {editingReasonId ? (
             <button type="button" className="btn-secondary" onClick={cancelEditReason}>
-              Cancel Edit
+              {tt("invCancelEdit")}
             </button>
           ) : null}
         </form>
         <DataTable
-          title="Reason Codes"
+          title={tt("invDtReasonCodes")}
           rows={allAdjustReasons}
           searchableKeys={["code", "label", "direction", "accountingImpact", "accountCode"]}
           columns={[
-            { key: "code", label: "Code" },
-            { key: "label", label: "Label" },
-            { key: "direction", label: "Direction" },
-            { key: "accountingImpact", label: "Impact" },
-            { key: "accountCode", label: "Account", render: (v) => v || "-" },
-            { key: "isActive", label: "Status", render: (v) => (v ? "Active" : "Inactive") },
+            { key: "code", label: tt("colCode") },
+            { key: "label", label: tt("invPhLabel") },
+            { key: "direction", label: tt("invColDirection") },
+            { key: "accountingImpact", label: tt("invColImpact") },
+            { key: "accountCode", label: tt("invColAccount"), render: (v) => v || "-" },
+            { key: "isActive", label: tt("colStatus"), render: (v) => (v ? tt("statusActive") : tt("statusInactive")) },
             {
               key: "actions",
-              label: "Action",
+              label: tt("invColAction"),
               render: (_, row) => (
                 <div style={{ display: "flex", gap: 6 }}>
                   <button type="button" className="btn-secondary btn-sm" onClick={() => startEditReason(row)} disabled={!canAdjustInventory}>
-                    Edit
+                    {tt("actionEdit")}
                   </button>
                   <button type="button" className="btn-secondary btn-sm" onClick={() => toggleReasonActive(row)} disabled={!canAdjustInventory}>
-                    {row.isActive ? "Deactivate" : "Activate"}
+                    {row.isActive ? tt("invDeactivate") : tt("invActivate")}
                   </button>
                 </div>
               ),
@@ -1040,7 +1078,7 @@ function Inventory() {
           value={productOptions.find((opt) => opt.value === String(adjustment.productId)) || null}
           options={productOptions}
           onChange={(opt) => setAdjustment({ ...adjustment, productId: opt?.value || "" })}
-          placeholder="Select Product"
+          placeholder={tt("invPhSelectProduct")}
           isClearable
           isSearchable
           styles={SEARCH_SELECT_STYLES}
@@ -1050,18 +1088,18 @@ function Inventory() {
           value={warehouseOptions.find((opt) => opt.value === String(adjustment.warehouseId)) || null}
           options={warehouseOptions}
           onChange={(opt) => setAdjustment({ ...adjustment, warehouseId: opt?.value || "" })}
-          placeholder="Select Warehouse (Optional)"
+          placeholder={tt("invPhSelectWarehouseOpt")}
           isClearable
           isSearchable
           styles={SEARCH_SELECT_STYLES}
         />
         <input
-          placeholder="Quantity Change (+/-)"
+          placeholder={tt("invPhQtyChange")}
           value={adjustment.qtyChange}
           onChange={(e) => setAdjustment({ ...adjustment, qtyChange: e.target.value })}
         />
         <input
-          placeholder="Reason (Required)"
+          placeholder={tt("invPhReasonRequired")}
           value={adjustment.reason}
           onChange={(e) => setAdjustment({ ...adjustment, reason: e.target.value })}
         />
@@ -1070,12 +1108,12 @@ function Inventory() {
           value={adjustReasonOptions.find((opt) => opt.value === String(adjustment.reasonCode)) || null}
           options={adjustReasonOptions}
           onChange={(opt) => setAdjustment({ ...adjustment, reasonCode: opt?.value || "" })}
-          placeholder="Reason Code (Optional)"
+          placeholder={tt("invPhReasonCodeOpt")}
           isClearable
           isSearchable
           styles={SEARCH_SELECT_STYLES}
         />
-        <button type="submit" disabled={!canAdjustInventory}>{editingAdjustmentId ? "Update Adjustment" : "Add Adjustment"}</button>
+        <button type="submit" disabled={!canAdjustInventory}>{editingAdjustmentId ? tt("invUpdateAdjustment") : tt("invAddAdjustment")}</button>
         {editingAdjustmentId ? (
           <button
             type="button"
@@ -1085,32 +1123,32 @@ function Inventory() {
               setAdjustment({ productId: "", warehouseId: "", qtyChange: "", reason: "", reasonCode: "" });
             }}
           >
-            Cancel
+            {tt("settingsCancel")}
           </button>
         ) : null}
       </form>
       <DataTable
-        title="Ledger Master (Add/Edit/Delete)"
+        title={tt("invDtLedgerMaster")}
         rows={adjustments.map((r) => ({
           ...r,
           createdAtLabel: new Date(r.createdAt).toLocaleString(),
         }))}
         searchableKeys={["productName", "reason", "createdAtLabel"]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "createdAtLabel", label: "Date" },
-          { key: "productName", label: "Product" },
-          { key: "warehouseName", label: "Warehouse" },
-          { key: "qtyChange", label: "Qty Change" },
+          { key: "id", label: tt("colId") },
+          { key: "createdAtLabel", label: tt("invColDate") },
+          { key: "productName", label: tt("invColProduct") },
+          { key: "warehouseName", label: tt("invColWarehouse") },
+          { key: "qtyChange", label: tt("invColQtyChange") },
           {
             key: "approvalStatus",
-            label: "Approval",
+            label: tt("invColApproval"),
             render: (v, row) => {
               const status = String(v || "").toUpperCase();
               let badge = "-";
-              if (status === "PENDING") badge = <span className="badge badge-warning">PENDING</span>;
-              else if (status === "APPROVED") badge = <span className="badge badge-success">APPROVED</span>;
-              else if (status === "REJECTED") badge = <span className="badge badge-danger">REJECTED</span>;
+              if (status === "PENDING") badge = <span className="badge badge-warning">{tt("invApprovalPending")}</span>;
+              else if (status === "APPROVED") badge = <span className="badge badge-success">{tt("invApprovalApproved")}</span>;
+              else if (status === "REJECTED") badge = <span className="badge badge-danger">{tt("invApprovalRejected")}</span>;
               else if (status) badge = <span className="badge">{status}</span>;
               if (!row.approvalEventId) return badge;
               return (
@@ -1124,7 +1162,7 @@ function Inventory() {
                       window.dispatchEvent(new CustomEvent("bd_pos_navigate", { detail: { view: "approvals" } }));
                     }}
                   >
-                    Open
+                    {tt("invOpen")}
                   </button>
                 </div>
               );
@@ -1132,23 +1170,23 @@ function Inventory() {
           },
           {
             key: "reason",
-            label: "Reason",
+            label: tt("invColReason"),
             render: (_, row) => (row.reasonCode ? `${row.reasonCode} - ${row.reasonLabel || row.reason || "-"}` : row.reason || "-"),
           },
           {
             key: "actions",
-            label: "Actions",
+            label: tt("colActions"),
             render: (_, row) => (
               <div style={{ display: "flex", gap: 6 }}>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => editAdjustment(row)} disabled={!canAdjustInventory}>Edit</button>
-                <button type="button" className="btn-danger btn-sm" onClick={() => deleteAdjustment(row)} disabled={!canAdjustInventory}>Delete</button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => editAdjustment(row)} disabled={!canAdjustInventory}>{tt("actionEdit")}</button>
+                <button type="button" className="btn-danger btn-sm" onClick={() => deleteAdjustment(row)} disabled={!canAdjustInventory}>{tt("actionDelete")}</button>
               </div>
             ),
           },
         ]}
       />
       <DataTable
-        title="Stock Ledger"
+        title={tt("invDtStockLedger")}
         rows={ledger.map((r) => ({
           ...r,
           productName: r.product?.name || `#${r.productId}`,
@@ -1159,18 +1197,18 @@ function Inventory() {
         filters={[
           {
             key: "refType",
-            label: "Ref Type",
+            label: tt("invFilterRefType"),
             options: [...new Set(ledger.map((r) => r.refType))].map((x) => ({ label: x, value: x })),
           },
         ]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "createdAtLabel", label: "Date" },
-          { key: "refType", label: "Ref Type" },
-          { key: "productName", label: "Product" },
-          { key: "warehouseName", label: "Warehouse" },
-          { key: "inQty", label: "In" },
-          { key: "outQty", label: "Out" },
+          { key: "id", label: tt("colId") },
+          { key: "createdAtLabel", label: tt("invColDate") },
+          { key: "refType", label: tt("invColRefType") },
+          { key: "productName", label: tt("invColProduct") },
+          { key: "warehouseName", label: tt("invColWarehouse") },
+          { key: "inQty", label: tt("invColIn") },
+          { key: "outQty", label: tt("invColOut") },
         ]}
       />
         </div>
@@ -1178,7 +1216,7 @@ function Inventory() {
       {inventoryTab === "transfers" ? (
         <div className="pos-tab-panel">
       <div className="page-card" style={{ marginTop: 14 }}>
-        <h3>Branch Stock Transfer</h3>
+        <h3>{tt("invTransferBranchTitle")}</h3>
         <form onSubmit={submitTransfer}>
           <div className="form-grid">
             <Select
@@ -1191,7 +1229,7 @@ function Inventory() {
                   items: [{ fromProductId: "", toProductId: "", qty: "" }],
                 })
               }
-              placeholder="Destination Branch"
+              placeholder={tt("invPhDestinationBranch")}
               isClearable
               isSearchable
               styles={SEARCH_SELECT_STYLES}
@@ -1206,7 +1244,7 @@ function Inventory() {
                   const p = fromProductMap.get(Number(opt.value));
                   return {
                     value: opt.value,
-                    label: `${opt.label} - Stock ${p?.stock ?? 0}`,
+                    label: `${opt.label} — ${tt("invStockInLabel")} ${p?.stock ?? 0}`,
                   };
                 })}
                 onChange={(opt) => {
@@ -1223,7 +1261,7 @@ function Inventory() {
                     toProductId: autoMatch ? String(autoMatch.id) : line.toProductId,
                   });
                 }}
-                placeholder="From Product (Current Branch)"
+                placeholder={tt("invPhFromProduct")}
                 isClearable
                 isSearchable
                 styles={SEARCH_SELECT_STYLES}
@@ -1233,7 +1271,7 @@ function Inventory() {
                 value={targetBranchProductOptions.find((opt) => opt.value === String(line.toProductId)) || null}
                 options={targetBranchProductOptions}
                 onChange={(opt) => upsertTransferItem(idx, { toProductId: opt?.value || "" })}
-                placeholder="To Product (Destination Branch)"
+                placeholder={tt("invPhToProduct")}
                 isClearable
                 isSearchable
                 styles={SEARCH_SELECT_STYLES}
@@ -1242,13 +1280,13 @@ function Inventory() {
                 type="number"
                 min={1}
                 step={1}
-                placeholder="Quantity"
+                placeholder={tt("invPhQuantity")}
                 value={line.qty}
                 onChange={(e) => upsertTransferItem(idx, { qty: e.target.value })}
               />
               <div style={{ display: "flex", gap: 6 }}>
                 <button type="button" className="btn-secondary btn-sm" onClick={addTransferLine} disabled={!canTransferInventory}>
-                  + Line
+                  {tt("invAddLine")}
                 </button>
                 {transferForm.items.length > 1 ? (
                   <button
@@ -1257,41 +1295,41 @@ function Inventory() {
                     onClick={() => removeTransferLine(idx)}
                     disabled={!canTransferInventory}
                   >
-                    Remove
+                    {tt("invRemoveLine")}
                   </button>
                 ) : null}
               </div>
             </div>
           ))}
           <button type="submit" style={{ marginTop: 8 }} disabled={!canTransferInventory}>
-            Submit Transfer For Approval
+            {tt("invSubmitTransferApproval")}
           </button>
         </form>
       </div>
       <DataTable
-        title="Stock Transfers"
+        title={tt("invDtStockTransfers")}
         rows={transferRows}
         searchableKeys={["createdAtLabel", "status", "directionLabel", "fromBranchName", "toBranchName"]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "createdAtLabel", label: "Date" },
-          { key: "directionLabel", label: "Direction" },
-          { key: "status", label: "Status" },
-          { key: "fromBranchName", label: "From" },
-          { key: "toBranchName", label: "To" },
-          { key: "itemCount", label: "Lines" },
-          { key: "qtyTotal", label: "Total Qty" },
+          { key: "id", label: tt("colId") },
+          { key: "createdAtLabel", label: tt("invColDate") },
+          { key: "directionLabel", label: tt("invColDirection") },
+          { key: "status", label: tt("colStatus") },
+          { key: "fromBranchName", label: tt("invColFrom") },
+          { key: "toBranchName", label: tt("invColTo") },
+          { key: "itemCount", label: tt("invColLines") },
+          { key: "qtyTotal", label: tt("invColTotalQty") },
           {
             key: "action",
-            label: "Approval",
+            label: tt("invColApprovalCol"),
             render: (_, row) =>
               String(row.status || "").toLowerCase() === "pending" ? (
                 <div style={{ display: "flex", gap: 6 }}>
                   <button type="button" className="btn-secondary btn-sm" onClick={() => approveTransfer(row)} disabled={!canTransferInventory}>
-                    Approve
+                    {tt("invApprove")}
                   </button>
                   <button type="button" className="btn-secondary btn-sm" onClick={() => rejectTransfer(row)} disabled={!canTransferInventory}>
-                    Reject
+                    {tt("invReject")}
                   </button>
                 </div>
               ) : (
@@ -1300,7 +1338,7 @@ function Inventory() {
           },
           {
             key: "items",
-            label: "Items",
+            label: tt("invColItemsDetail"),
             render: (_, row) =>
               (row.items || [])
                 .map((x) => `${x.fromProduct?.name || x.fromProductId} -> ${x.toProduct?.name || x.toProductId} (${x.qty})`)
@@ -1309,21 +1347,21 @@ function Inventory() {
         ]}
       />
       <DataTable
-        title="Auto Transfer Suggestions (Cross-Branch Balancing)"
+        title={tt("invDtTransferSuggestions")}
         rows={transferSuggestionRows}
         searchableKeys={["fromProductName", "fromSku", "toBranchName", "toProductName"]}
         columns={[
-          { key: "fromProductName", label: "From Product" },
-          { key: "fromSku", label: "SKU", render: (v) => v || "-" },
-          { key: "fromStock", label: "From Stock" },
-          { key: "toBranchName", label: "To Branch" },
-          { key: "toProductName", label: "To Product" },
-          { key: "toStock", label: "To Stock" },
-          { key: "shortageQty", label: "Shortage" },
-          { key: "suggestedQty", label: "Suggested Transfer" },
+          { key: "fromProductName", label: tt("invColFromProductFull") },
+          { key: "fromSku", label: tt("prodLblSku"), render: (v) => v || "-" },
+          { key: "fromStock", label: tt("invColFromStock") },
+          { key: "toBranchName", label: tt("invColToBranch") },
+          { key: "toProductName", label: tt("invColToProduct") },
+          { key: "toStock", label: tt("invColToStock") },
+          { key: "shortageQty", label: tt("dashShortQty") },
+          { key: "suggestedQty", label: tt("invColSuggestedTransferQty") },
           {
             key: "actions",
-            label: "Actions",
+            label: tt("colActions"),
             render: (_, row) => (
               <button
                 type="button"
@@ -1341,7 +1379,7 @@ function Inventory() {
                   })
                 }
               >
-                Use Suggestion
+                {tt("invUseSuggestion")}
               </button>
             ),
           },

@@ -13,11 +13,14 @@ model Product {
   categoryId           Int?
   taxProfileId         Int?
   name                 String
+  nameBn               String?
   price                Float
   stock                Int                 @default(0)
   reorderLevel         Int                 @default(0)
   category             String?
   sku                  String?
+  hsCode               String?
+  unitOfMeasure        String?             @default("PCS")
   vatRate              Float               @default(0)
   defaultDiscountType  String?
   defaultDiscountValue Float               @default(0)
@@ -41,6 +44,7 @@ model Product {
   inventoryBatches     InventoryBatch[]
 
   @@unique([branchId, sku])
+  @@index([branchId, hsCode])
 }
 
 model ProductVariant {
@@ -82,6 +86,9 @@ model Sale {
   buyerBinOrNidNote    String?
   mushakDocumentNo     String?
   vatBreakdownSnapshot Json?
+  nbrXmlPayload        String?  @db.MediumText
+  nbrXmlHash           String?
+  nbrEmittedAt         DateTime?
   couponCodeId         Int?
   couponDiscount       Float    @default(0)
   createdAt            DateTime @default(now())
@@ -97,6 +104,7 @@ model Sale {
   storedValueTxns StoredValueTxn[]
 
   @@unique([branchId, invoiceNo])
+  @@index([branchId, nbrEmittedAt])
 }
 
 model SaleItem {
@@ -141,6 +149,8 @@ model Branch {
   address                String?
   phone                  String?
   isActive               Boolean                 @default(true)
+  bootstrapped           Boolean                 @default(false)
+  bootstrappedAt         DateTime?
   sellerBin              String?
   tradeLicenseNo         String?
   vatRegistrationLabel   String?
@@ -170,6 +180,7 @@ model Branch {
   couponCodes            CouponCode[]
   bankStatementImports   BankStatementImport[]
   webhookSubscriptions   WebhookSubscription[]
+  webhookDeliveryLogs    WebhookDeliveryLog[]
   cheques                Cheque[]
   assets                 Asset[]
   costCenters            CostCenter[]
@@ -276,9 +287,29 @@ model WebhookSubscription {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  branch     Branch               @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  deliveries WebhookDeliveryLog[]
 
   @@index([branchId])
+}
+
+model WebhookDeliveryLog {
+  id                    Int                  @id @default(autoincrement())
+  branchId              Int
+  webhookSubscriptionId Int?
+  event                 String               @db.VarChar(160)
+  url                   String               @db.Text
+  requestBody           String?              @db.MediumText
+  ok                    Boolean
+  statusCode            Int?
+  errorMessage          String?              @db.Text
+  durationMs            Int?
+  createdAt             DateTime             @default(now())
+
+  branch              Branch               @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  webhookSubscription WebhookSubscription? @relation(fields: [webhookSubscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([branchId, createdAt])
 }
 
 model BranchDocumentSeq {
@@ -541,9 +572,10 @@ model Shift {
   registerId      Int
   openedAt        DateTime         @default(now())
   closedAt        DateTime?
-  openingCash     Float            @default(0)
-  closingCash     Float?
-  varianceReason  String?
+  openingCash           Float            @default(0)
+  closingCash           Float?
+  closingDenomination   Json?
+  varianceReason        String?
   user            User             @relation(fields: [userId], references: [id])
   register        CashRegister     @relation(fields: [registerId], references: [id])
   drawerMovements DrawerMovement[]
@@ -649,33 +681,45 @@ model InventoryAdjustReason {
 }
 
 model Supplier {
-  id             Int              @id @default(autoincrement())
-  branchId       Int
-  name           String
-  phone          String?
-  address        String?
-  payableBalance Float            @default(0)
-  createdAt      DateTime         @default(now())
-  branch         Branch           @relation(fields: [branchId], references: [id])
-  purchases      Purchase[]
-  payments       PaymentVoucher[]
-  cheques        Cheque[]
+  id                Int              @id @default(autoincrement())
+  branchId          Int
+  name              String
+  phone             String?
+  address           String?
+  payableBalance    Float            @default(0)
+  tinNumber         String?
+  binNumber         String?
+  taxCategory       String?
+  withholdingExempt Boolean          @default(false)
+  withholdingNote   String?
+  createdAt         DateTime         @default(now())
+  branch            Branch           @relation(fields: [branchId], references: [id])
+  purchases         Purchase[]
+  payments          PaymentVoucher[]
+  cheques           Cheque[]
+
+  @@index([branchId, taxCategory])
 }
 
 model Purchase {
-  id         Int              @id @default(autoincrement())
-  branchId   Int
-  supplierId Int
-  invoiceNo  String?
-  total      Float
-  paidAmount Float            @default(0)
-  dueAmount  Float            @default(0)
-  createdAt  DateTime         @default(now())
-  branch     Branch           @relation(fields: [branchId], references: [id])
-  supplier   Supplier         @relation(fields: [supplierId], references: [id])
-  items      PurchaseItem[]
-  journals   Journal[]
-  returns    PurchaseReturn[]
+  id                  Int              @id @default(autoincrement())
+  branchId            Int
+  supplierId          Int
+  invoiceNo           String?
+  total               Float
+  paidAmount          Float            @default(0)
+  dueAmount           Float            @default(0)
+  /// SUPPLIER_CREDIT — unpaid amount increases supplier AP (2100). BANK_LOAN — unpaid amount posts to Bank Loans Payable (2320); supplier balance not increased for financed portion.
+  financingSource     String           @default("SUPPLIER_CREDIT")
+  loanReference       String?
+  loanNote            String?
+  loanMaturityDate    DateTime?
+  createdAt           DateTime         @default(now())
+  branch              Branch           @relation(fields: [branchId], references: [id])
+  supplier            Supplier         @relation(fields: [supplierId], references: [id])
+  items               PurchaseItem[]
+  journals            Journal[]
+  returns             PurchaseReturn[]
 
   @@unique([branchId, invoiceNo])
 }
@@ -809,14 +853,29 @@ model JournalLine {
 }
 
 model PaymentVoucher {
-  id         Int       @id @default(autoincrement())
-  branchId   Int
-  supplierId Int?
-  amount     Float
-  method     String
-  note       String?
-  createdAt  DateTime  @default(now())
-  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+  id                  Int       @id @default(autoincrement())
+  branchId            Int
+  supplierId          Int?
+  amount              Float
+  method              String
+  note                String?
+  // Withholding tax (Bangladesh): seller's gross invoice = `amount`. Buyer
+  // deducts `aitAmount` (Income Tax / Source Tax) and `vdsAmount` (VAT Deducted
+  // at Source) on behalf of NBR; only `netPaid` actually leaves the buyer's
+  // cash. Both retentions become liabilities owed to NBR (separate accounts).
+  aitRate             Float     @default(0)
+  aitAmount           Float     @default(0)
+  vdsRate             Float     @default(0)
+  vdsAmount           Float     @default(0)
+  netPaid             Float?
+  taxCategory         String?
+  withholdingNote     String?
+  mushak66DocumentNo  String?
+  createdAt           DateTime  @default(now())
+  supplier            Supplier? @relation(fields: [supplierId], references: [id])
+
+  @@index([branchId, createdAt])
+  @@index([branchId, supplierId])
 }
 
 model ReceiptVoucher {

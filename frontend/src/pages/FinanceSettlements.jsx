@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
+import SubmitButton from "../components/SubmitButton";
 import { notifySuccess } from "../utils/notify";
 
 export default function FinanceSettlements() {
   const [settlements, setSettlements] = useState([]);
   const [unmatched, setUnmatched] = useState([]);
+  const [submitting, setSubmitting] = useState(false);
   const [form, setForm] = useState({
     provider: "BKASH_SETTLEMENT",
     periodStart: "",
@@ -49,29 +51,39 @@ export default function FinanceSettlements() {
     const feeAmount = Number(form.feeAmount || 0);
     const netAmount = form.netAmount !== "" ? Number(form.netAmount) : grossAmount - feeAmount;
     const transactions = parseTransactions(form.transactionsRaw);
-    await api.post("/finance/settlements/import", {
-      provider: form.provider,
-      periodStart: form.periodStart || new Date().toISOString(),
-      periodEnd: form.periodEnd || new Date().toISOString(),
-      grossAmount,
-      feeAmount,
-      netAmount,
-      externalRef: form.externalRef || null,
-      transactions,
-    });
-    setForm((f) => ({ ...f, transactionsRaw: "", externalRef: "" }));
-    load();
-    notifySuccess("settlement imported and payments matched where channel equals transaction ID.");
+    setSubmitting(true);
+    try {
+      await api.post("/finance/settlements/import", {
+        provider: form.provider,
+        periodStart: form.periodStart || new Date().toISOString(),
+        periodEnd: form.periodEnd || new Date().toISOString(),
+        grossAmount,
+        feeAmount,
+        netAmount,
+        externalRef: form.externalRef || null,
+        transactions,
+      });
+      setForm((f) => ({ ...f, transactionsRaw: "", externalRef: "" }));
+      await load();
+      notifySuccess("Settlement imported — matched payments updated where channel equals transaction ID.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>MFS / card settlement reconciliation</h2>
-      <p className="text-muted">
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">MFS / card settlement reconciliation</div>
+          <div className="page-subtitle">Import provider batches and reconcile sale payment channels</div>
+        </div>
+      </div>
+      <p className="page-intro">
         Paste transaction reference IDs (one per line) to mark matching <code>SalePayment.channel</code> rows as reconciled.
       </p>
 
-      <form onSubmit={submit} className="form-grid" style={{ maxWidth: 640, marginTop: 16 }}>
+      <form onSubmit={submit} className="form-grid page-card section-card" style={{ maxWidth: 880 }}>
         <label>
           Provider key
           <input value={form.provider} onChange={(e) => setForm({ ...form, provider: e.target.value })} />
@@ -109,56 +121,68 @@ export default function FinanceSettlements() {
             placeholder={"TRX987654321\nABC123,500"}
           />
         </label>
-        <button type="submit">Import settlement &amp; match</button>
+        <SubmitButton loading={submitting} loadingLabel="Importing…">
+          Import settlement &amp; match
+        </SubmitButton>
       </form>
 
-      <h3 style={{ marginTop: 28 }}>Unmatched digital payments (has channel, not in a settlement)</h3>
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>Sale</th>
-            <th>Method</th>
-            <th>Channel</th>
-            <th>Amount</th>
-            <th>Date</th>
-          </tr>
-        </thead>
-        <tbody>
-          {unmatched.slice(0, 100).map((p) => (
-            <tr key={p.id}>
-              <td>{p.sale?.invoiceNo || p.saleId}</td>
-              <td>{p.method}</td>
-              <td>{p.channel}</td>
-              <td>{Number(p.amount || 0).toFixed(2)}</td>
-              <td>{p.sale?.createdAt ? new Date(p.sale.createdAt).toLocaleString() : "—"}</td>
+      <div className="transfer-history-head" style={{ marginTop: 28 }}>
+        <h3 style={{ margin: 0 }}>Unmatched digital payments</h3>
+        <span className="badge badge-warning">Has channel · not in a settlement</span>
+      </div>
+      <div className="data-table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Sale</th>
+              <th>Method</th>
+              <th>Channel</th>
+              <th>Amount</th>
+              <th>Date</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {unmatched.slice(0, 100).map((p) => (
+              <tr key={p.id}>
+                <td>{p.sale?.invoiceNo || p.saleId}</td>
+                <td>{p.method}</td>
+                <td style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{p.channel}</td>
+                <td style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>{Number(p.amount || 0).toFixed(2)}</td>
+                <td>{p.sale?.createdAt ? new Date(p.sale.createdAt).toLocaleString() : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
-      <h3 style={{ marginTop: 28 }}>Settlement batches</h3>
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Provider</th>
-            <th>Net</th>
-            <th>Payments</th>
-            <th>Imported</th>
-          </tr>
-        </thead>
-        <tbody>
-          {settlements.map((s) => (
-            <tr key={s.id}>
-              <td>{s.id}</td>
-              <td>{s.provider}</td>
-              <td>{Number(s.netAmount || 0).toFixed(2)}</td>
-              <td>{s._count?.payments ?? "—"}</td>
-              <td>{new Date(s.importedAt).toLocaleString()}</td>
+      <div className="transfer-history-head" style={{ marginTop: 28 }}>
+        <h3 style={{ margin: 0 }}>Settlement batches</h3>
+        <span className="badge badge-primary">{settlements.length} batches</span>
+      </div>
+      <div className="data-table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Provider</th>
+              <th>Net</th>
+              <th>Payments</th>
+              <th>Imported</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {settlements.map((s) => (
+              <tr key={s.id}>
+                <td>{s.id}</td>
+                <td>{s.provider}</td>
+                <td style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>{Number(s.netAmount || 0).toFixed(2)}</td>
+                <td>{s._count?.payments ?? "—"}</td>
+                <td>{new Date(s.importedAt).toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

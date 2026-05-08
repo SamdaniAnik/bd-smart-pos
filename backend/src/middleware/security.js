@@ -1,0 +1,58 @@
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const config = require("../utils/config");
+
+const helmetMiddleware = helmet({
+  // The frontend is served separately by Vite; we only emit JSON & PDFs here,
+  // so a strict default CSP is fine. Tweak via env later if needed.
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+});
+
+function buildOriginChecker() {
+  // If allow-list is empty in non-prod, mirror the request origin (open).
+  // In prod, an empty allow-list means deny all browsers — safest default.
+  const list = config.allowedOrigins;
+  return function originChecker(origin, callback) {
+    if (!origin) {
+      // Same-origin / curl / mobile / server-to-server requests have no Origin header.
+      return callback(null, true);
+    }
+    if (list.length === 0) {
+      if (!config.isProd) return callback(null, true);
+      return callback(new Error(`CORS: origin "${origin}" is not allowed`));
+    }
+    if (list.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: origin "${origin}" is not allowed`));
+  };
+}
+
+const corsOptions = {
+  origin: buildOriginChecker(),
+  credentials: true,
+  exposedHeaders: ["Content-Disposition"],
+};
+
+const loginRateLimiter = rateLimit({
+  windowMs: config.rateLimit.loginWindowMs,
+  max: config.rateLimit.loginMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Try again later." },
+  skipSuccessfulRequests: true,
+});
+
+const bootstrapRateLimiter = rateLimit({
+  windowMs: config.rateLimit.bootstrapWindowMs,
+  max: config.rateLimit.bootstrapMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many seed attempts. Try again later." },
+});
+
+module.exports = {
+  helmetMiddleware,
+  corsOptions,
+  loginRateLimiter,
+  bootstrapRateLimiter,
+};

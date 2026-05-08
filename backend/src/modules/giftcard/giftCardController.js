@@ -1,5 +1,6 @@
 const prisma = require("../../utils/prisma");
 const { writeAuditLog } = require("../../utils/audit");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 
 function generateGiftCode() {
   return `GC-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`.toUpperCase();
@@ -135,6 +136,193 @@ exports.loadCustomerWallet = async (req, res) => {
       payload: { branchId, amount },
     });
     res.json({ customer: updated });
+  } catch (err) {
+    if (respondFiscalBlocked(res, err)) return;
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.listWalletBalances = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const rows = await prisma.customer.findMany({
+      where: { branchId, storedValueBalance: { gt: 0 } },
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        storedValueBalance: true,
+      },
+      orderBy: [{ storedValueBalance: "desc" }, { id: "asc" }],
+      take: 1000,
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.cashOutCustomerWallet = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const customerId = Number(req.body?.customerId);
+    const amount = Number(req.body?.amount || 0);
+    const note = String(req.body?.note || "Wallet cash out to cash in hand").slice(0, 200);
+    if (!customerId || Number.isNaN(customerId)) {
+      return res.status(400).json({ error: "customerId required" });
+    }
+    if (!(amount > 0)) {
+      return res.status(400).json({ error: "amount must be positive" });
+    }
+
+    await ensureOpenFiscalPeriod(branchId);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const customer = await tx.customer.findFirst({ where: { id: customerId, branchId } });
+      if (!customer) throw new Error("Customer not found");
+      if (Number(customer.storedValueBalance || 0) < amount) {
+        throw new Error("Cash out amount exceeds wallet balance");
+      }
+
+      const accounts = await tx.account.findMany({ where: { branchId } });
+      const map = new Map(accounts.map((a) => [a.code, a]));
+      const cash = map.get("1100");
+      const walletLiability = map.get("2130") || map.get("2100");
+      if (!cash || !walletLiability) {
+        throw new Error("Required accounts missing (1100 cash, 2130/2100 wallet liability)");
+      }
+
+      const updated = await tx.customer.update({
+        where: { id: customerId },
+        data: { storedValueBalance: { decrement: amount } },
+      });
+      await tx.storedValueTxn.create({
+        data: {
+          customerId,
+          type: "WALLET_CASH_OUT",
+          amount,
+          note,
+        },
+      });
+      await tx.journal.create({
+        data: {
+          branchId,
+          createdBy: req.user?.id || null,
+          refType: "WALLET_CASH_OUT",
+          refId: customerId,
+          narration: `Wallet cash out: ${customer.name}`,
+          lines: {
+            create: [
+              { accountId: cash.id, debit: amount, credit: 0 },
+              { accountId: walletLiability.id, debit: 0, credit: amount },
+            ],
+          },
+        },
+      });
+
+      return updated;
+    });
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "WALLET_CASH_OUT",
+      entity: "Customer",
+      entityId: customerId,
+      payload: { branchId, amount, note },
+    });
+
+    res.json({ customer: result });
+  } catch (err) {
+    if (respondFiscalBlocked(res, err)) return;
+    const msg = String(err?.message || "");
+    if (msg.includes("exceeds wallet balance")) return res.status(400).json({ error: msg });
+    if (msg.includes("Customer not found")) return res.status(404).json({ error: msg });
+    res.status(500).json({ error: msg || "Cash out failed" });
+  }
+};
+
+exports.listWalletTransactions = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const fromRaw = String(req.query?.from || "").trim();
+    const toRaw = String(req.query?.to || "").trim();
+    const typeRaw = String(req.query?.type || "").trim().toUpperCase();
+    const where = {
+      customer: { branchId },
+    };
+    if (typeRaw && typeRaw !== "ALL") where.type = typeRaw;
+    if (fromRaw || toRaw) {
+      where.createdAt = {};
+      if (fromRaw) where.createdAt.gte = new Date(`${fromRaw}T00:00:00.000Z`);
+      if (toRaw) where.createdAt.lt = new Date(new Date(`${toRaw}T00:00:00.000Z`).getTime() + 24 * 60 * 60 * 1000);
+    }
+    const rows = await prisma.storedValueTxn.findMany({
+      where,
+      include: {
+        customer: { select: { id: true, name: true, phone: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 1000,
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.exportWalletTransactionsCsv = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const fromRaw = String(req.query?.from || "").trim();
+    const toRaw = String(req.query?.to || "").trim();
+    const typeRaw = String(req.query?.type || "").trim().toUpperCase();
+    const where = {
+      customer: { branchId },
+    };
+    if (typeRaw && typeRaw !== "ALL") where.type = typeRaw;
+    if (fromRaw || toRaw) {
+      where.createdAt = {};
+      if (fromRaw) where.createdAt.gte = new Date(`${fromRaw}T00:00:00.000Z`);
+      if (toRaw) where.createdAt.lt = new Date(new Date(`${toRaw}T00:00:00.000Z`).getTime() + 24 * 60 * 60 * 1000);
+    }
+    const rows = await prisma.storedValueTxn.findMany({
+      where,
+      include: {
+        customer: { select: { id: true, name: true, phone: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 5000,
+    });
+    const csvRows = rows.map((r) => ({
+      id: r.id,
+      created_at: r.createdAt ? new Date(r.createdAt).toISOString() : "",
+      customer_id: r.customer?.id || "",
+      customer_name: r.customer?.name || "",
+      customer_phone: r.customer?.phone || "",
+      type: r.type || "",
+      amount: Number(r.amount || 0).toFixed(2),
+      note: r.note || "",
+    }));
+    const headers = Object.keys(csvRows[0] || {
+      id: "",
+      created_at: "",
+      customer_id: "",
+      customer_name: "",
+      customer_phone: "",
+      type: "",
+      amount: "",
+      note: "",
+    });
+    const csv = [headers.join(",")]
+      .concat(
+        csvRows.map((row) =>
+          headers.map((h) => `"${String(row[h] ?? "").replaceAll('"', '""')}"`).join(",")
+        )
+      )
+      .join("\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="wallet-transactions.csv"');
+    res.send(csv);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

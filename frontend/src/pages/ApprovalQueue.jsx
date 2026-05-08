@@ -76,8 +76,13 @@ function ApprovalQueue() {
   };
 
   return (
-    <div>
-      <h2>Approval Queue & Exceptions</h2>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Approval queue &amp; exceptions</div>
+          <div className="page-subtitle">Review discounts, returns, stock counts, and other gated actions</div>
+        </div>
+      </div>
       <div className="form-grid" style={{ marginBottom: 12 }}>
         <input
           placeholder="Approval Event ID"
@@ -86,7 +91,7 @@ function ApprovalQueue() {
         />
         <input type="date" value={filters.from} onChange={(e) => setFilters((p) => ({ ...p, from: e.target.value }))} />
         <input type="date" value={filters.to} onChange={(e) => setFilters((p) => ({ ...p, to: e.target.value }))} />
-        <select value={filters.action} onChange={(e) => setFilters((p) => ({ ...p, action: e.target.value }))}>
+        <select className="form-select-sm" value={filters.action} onChange={(e) => setFilters((p) => ({ ...p, action: e.target.value }))}>
           <option value="">All Actions</option>
           <option value="APPROVAL_DISCOUNT">Discount Approval</option>
           <option value="APPROVAL_REDEMPTION">Redemption Approval</option>
@@ -98,7 +103,7 @@ function ApprovalQueue() {
           <option value="APPROVAL_HOLD_RESUME">Held Cart Resume (other cashier)</option>
           <option value="APPROVAL_CREDIT_LIMIT">Credit limit override</option>
         </select>
-        <select value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
+        <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
           <option value="">All Status</option>
           <option value="APPROVED">Approved</option>
           <option value="REJECTED">Rejected</option>

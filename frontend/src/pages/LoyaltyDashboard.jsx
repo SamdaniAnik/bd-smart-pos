@@ -116,8 +116,13 @@ function LoyaltyDashboard() {
   }, [ranking]);
 
   return (
-    <div>
-      <h2>Loyalty Dashboard</h2>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Loyalty dashboard</div>
+          <div className="page-subtitle">Points activity, tiers, and redemption trends</div>
+        </div>
+      </div>
       <div className="form-grid" style={{ marginBottom: 12 }}>
         <input
           type="date"

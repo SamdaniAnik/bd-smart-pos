@@ -21,6 +21,7 @@ import Quotations from "./pages/Quotations";
 import Promotions from "./pages/Promotions";
 import GiftCards from "./pages/GiftCards";
 import FinanceSettlements from "./pages/FinanceSettlements";
+import FinanceDigitalCashout from "./pages/FinanceDigitalCashout";
 import FinanceBankImports from "./pages/FinanceBankImports";
 import Cheques from "./pages/Cheques";
 import FiscalPeriods from "./pages/FiscalPeriods";
@@ -28,12 +29,17 @@ import Assets from "./pages/Assets";
 import CostCenters from "./pages/CostCenters";
 import PettyCash from "./pages/PettyCash";
 import IntegrationWebhooks from "./pages/IntegrationWebhooks";
+import SalesLookup from "./pages/SalesLookup";
+import CustomerDisplay from "./pages/CustomerDisplay";
+import { isCustomerDisplayRoute } from "./services/customerDisplay";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "./services/api";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import ToastHost from "./components/ToastHost";
 import { t } from "./i18n";
 import { getStoredPermissions, hasPermission } from "./utils/permissions";
+import SubmitButton from "./components/SubmitButton";
+import { notifyError } from "./utils/notify";
 
 const readNavPins = () => {
   try {
@@ -46,11 +52,24 @@ const readNavPins = () => {
   }
 };
 
-function App() {
+function useHashRoute() {
+  const read = () =>
+    typeof window === "undefined" ? "" : String(window.location.hash || "");
+  const [hash, setHash] = useState(read);
+  useEffect(() => {
+    const onChange = () => setHash(read());
+    window.addEventListener("hashchange", onChange);
+    return () => window.removeEventListener("hashchange", onChange);
+  }, []);
+  return hash;
+}
+
+function MainApp() {
   const [view, setView] = useState(localStorage.getItem("bd_pos_last_view") || "dashboard");
   const [menuQuery, setMenuQuery] = useState("");
   const [lang, setLang] = useState(localStorage.getItem("bd_pos_lang") || "en");
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
+  const [loginSubmitting, setLoginSubmitting] = useState(false);
   const token = localStorage.getItem("bd_pos_token");
   const permissions = getStoredPermissions();
   const userJson = localStorage.getItem("bd_pos_user");
@@ -64,53 +83,55 @@ function App() {
     const canSeePos = hasPermission("sale.create", permissions) || hasPermission("sale.view", permissions);
     const baseSections = [
       {
-        title: "Daily Operations",
+        title: t(lang, "navGroupDaily"),
         items: [
-          { key: "dashboard", label: t(lang, "dashboard"), hint: "Quick overview", icon: "📊", perm: "report.view" },
-          { key: "pos", label: t(lang, "pos"), hint: "Sell products", icon: "🛒", perm: canSeePos },
-          { key: "returns", label: t(lang, "salesReturns"), hint: "Handle returns", icon: "↩️", perm: "sale.return" },
-          { key: "quotations", label: t(lang, "quotations"), hint: "Quotes & proforma", icon: "📄", perm: canSeePos },
-          { key: "shifts", label: "Shifts", hint: "Open/close cash shift", icon: "🧮", perm: canSeePos },
+          { key: "dashboard", label: t(lang, "dashboard"), hint: t(lang, "hintDashboard"), icon: "📊", perm: "report.view" },
+          { key: "pos", label: t(lang, "pos"), hint: t(lang, "hintPos"), icon: "🛒", perm: canSeePos },
+          { key: "returns", label: t(lang, "salesReturns"), hint: t(lang, "hintReturns"), icon: "↩️", perm: "sale.return" },
+          { key: "quotations", label: t(lang, "quotations"), hint: t(lang, "hintQuotations"), icon: "📄", perm: canSeePos },
+          { key: "shifts", label: t(lang, "shifts"), hint: t(lang, "hintShifts"), icon: "🧮", perm: canSeePos },
         ],
       },
       {
-        title: "Inventory & Master Data",
+        title: t(lang, "navGroupInventory"),
         items: [
-          { key: "products", label: t(lang, "products"), hint: "Product master", icon: "🧷", perm: "product.view" },
-          { key: "inventory", label: t(lang, "inventory"), hint: "Stock ledger", icon: "📦", perm: "inventory.view" },
-          { key: "stockCount", label: t(lang, "stockCount"), hint: "Physical inventory count", icon: "🧾", perm: "inventory.adjust" },
-          { key: "warehouses", label: t(lang, "warehouses"), hint: "Warehouse master", icon: "🏬", perm: "inventory.view" },
-          { key: "purchases", label: t(lang, "purchases"), hint: "Purchase bills", icon: "🧾", perm: "purchase.view" },
-          { key: "promotions", label: "Promotions", hint: "BOGO/category/cart offers", icon: "🏷️", perm: "product.create" },
-          { key: "suppliers", label: t(lang, "suppliers"), hint: "Supplier master", icon: "🚚", perm: "supplier.view" },
-          { key: "customers", label: t(lang, "customers"), hint: "Customer master", icon: "👥", perm: "customer.view" },
-          { key: "giftCards", label: "Gift cards", hint: "Issuing & wallet load", icon: "🎫", perm: "customer.view" },
+          { key: "products", label: t(lang, "products"), hint: t(lang, "hintProducts"), icon: "🧷", perm: "product.view" },
+          { key: "inventory", label: t(lang, "inventory"), hint: t(lang, "hintInventory"), icon: "📦", perm: "inventory.view" },
+          { key: "stockCount", label: t(lang, "stockCount"), hint: t(lang, "hintStockCount"), icon: "🧾", perm: "inventory.adjust" },
+          { key: "warehouses", label: t(lang, "warehouses"), hint: t(lang, "hintWarehouses"), icon: "🏬", perm: "inventory.view" },
+          { key: "purchases", label: t(lang, "purchases"), hint: t(lang, "hintPurchases"), icon: "🧾", perm: "purchase.view" },
+          { key: "promotions", label: t(lang, "promotions"), hint: t(lang, "hintPromotions"), icon: "🏷️", perm: "product.create" },
+          { key: "suppliers", label: t(lang, "suppliers"), hint: t(lang, "hintSuppliers"), icon: "🚚", perm: "supplier.view" },
+          { key: "customers", label: t(lang, "customers"), hint: t(lang, "hintCustomers"), icon: "👥", perm: "customer.view" },
+          { key: "giftCards", label: t(lang, "giftCards"), hint: t(lang, "hintGiftCards"), icon: "🎫", perm: "customer.view" },
         ],
       },
       {
-        title: "Finance",
+        title: t(lang, "navGroupFinance"),
         items: [
-          { key: "expenses", label: t(lang, "expenses"), hint: "Operating expenses", icon: "💸", perm: "expense.view" },
-          { key: "dueCollection", label: t(lang, "dueCollection"), hint: "Collect and settle dues", icon: "💳", perm: "report.view" },
-          { key: "loyalty", label: t(lang, "loyalty"), hint: "Points, tiers, redemption", icon: "🎁", perm: "customer.view" },
-          { key: "approvals", label: t(lang, "approvals"), hint: "Approval queue & exceptions", icon: "✅", perm: "report.view" },
-          { key: "accounting", label: t(lang, "accounting"), hint: "COA & trial balance", icon: "💰", perm: "accounting.view" },
-          { key: "financeSettlements", label: "Settlements", hint: "MFS reconciliation", icon: "🏦", perm: "accounting.report" },
-          { key: "financeBankCsv", label: "Bank import", hint: "Statement lines & matching", icon: "📥", perm: "accounting.report" },
-          { key: "fiscalPeriods", label: t(lang, "fiscalPeriods"), hint: "Close/reopen fiscal period", icon: "🗓️", perm: "accounting.report" },
-          { key: "costCenters", label: t(lang, "costCenters"), hint: "Department/project finance tags", icon: "🏷️", perm: "costcenter.view" },
-          { key: "pettyCash", label: t(lang, "pettyCash"), hint: "Imprest funds and replenishment", icon: "👛", perm: "pettycash.view" },
-          { key: "assets", label: t(lang, "assets"), hint: "Asset register & depreciation", icon: "🏢", perm: "asset.view" },
-          { key: "cheques", label: t(lang, "cheques"), hint: "Issued/received cheque tracking", icon: "🧾", perm: "cheque.view" },
-          { key: "reports", label: t(lang, "reports"), hint: "Aging & valuation", icon: "📈", perm: "report.view" },
+          { key: "expenses", label: t(lang, "expenses"), hint: t(lang, "hintExpenses"), icon: "💸", perm: "expense.view" },
+          { key: "dueCollection", label: t(lang, "dueCollection"), hint: t(lang, "hintDueCollection"), icon: "💳", perm: "report.view" },
+          { key: "salesLookup", label: t(lang, "salesLookup"), hint: t(lang, "hintSalesLookup"), icon: "🔎", perm: "sale.view" },
+          { key: "loyalty", label: t(lang, "loyalty"), hint: t(lang, "hintLoyalty"), icon: "🎁", perm: "customer.view" },
+          { key: "approvals", label: t(lang, "approvals"), hint: t(lang, "hintApprovals"), icon: "✅", perm: "report.view" },
+          { key: "accounting", label: t(lang, "accounting"), hint: t(lang, "hintAccounting"), icon: "💰", perm: "accounting.view" },
+          { key: "financeSettlements", label: t(lang, "settlements"), hint: t(lang, "hintSettlements"), icon: "🏦", perm: "accounting.report" },
+          { key: "financeDigitalCashout", label: t(lang, "digitalTransfer"), hint: t(lang, "hintDigitalTransfer"), icon: "💵", perm: "accounting.report" },
+          { key: "financeBankCsv", label: t(lang, "bankImport"), hint: t(lang, "hintBankImport"), icon: "📥", perm: "accounting.report" },
+          { key: "fiscalPeriods", label: t(lang, "fiscalPeriods"), hint: t(lang, "hintFiscalPeriods"), icon: "🗓️", perm: "accounting.report" },
+          { key: "costCenters", label: t(lang, "costCenters"), hint: t(lang, "hintCostCenters"), icon: "🏷️", perm: "costcenter.view" },
+          { key: "pettyCash", label: t(lang, "pettyCash"), hint: t(lang, "hintPettyCash"), icon: "👛", perm: "pettycash.view" },
+          { key: "assets", label: t(lang, "assets"), hint: t(lang, "hintAssets"), icon: "🏢", perm: "asset.view" },
+          { key: "cheques", label: t(lang, "cheques"), hint: t(lang, "hintCheques"), icon: "🧾", perm: "cheque.view" },
+          { key: "reports", label: t(lang, "reports"), hint: t(lang, "hintReports"), icon: "📈", perm: "report.view" },
         ],
       },
       {
-        title: "Administration",
+        title: t(lang, "navGroupAdmin"),
         items: [
-          { key: "roles", label: t(lang, "roleManagement"), hint: "Roles & users", icon: "🛡️", perm: "rbac.manage" },
-          { key: "integrationWebhooks", label: "Webhooks", hint: "sale.created integrations", icon: "🔗", perm: "rbac.manage" },
-          { key: "settings", label: t(lang, "settings"), hint: "Branch settings", icon: "⚙️", perm: "branch.manage" },
+          { key: "roles", label: t(lang, "roleManagement"), hint: t(lang, "hintRoles"), icon: "🛡️", perm: "rbac.manage" },
+          { key: "integrationWebhooks", label: t(lang, "webhooks"), hint: t(lang, "hintWebhooks"), icon: "🔗", perm: "rbac.manage" },
+          { key: "settings", label: t(lang, "settings"), hint: t(lang, "hintSettings"), icon: "⚙️", perm: "branch.manage" },
         ],
       },
     ];
@@ -171,26 +192,53 @@ function App() {
 
   const handleLogin = async (e) => {
     e.preventDefault();
-    const res = await api.post("/auth/login", loginForm);
-    localStorage.setItem("bd_pos_token", res.data.token);
-    localStorage.setItem("bd_pos_branch_id", String(res.data.user.branchId));
-    localStorage.setItem("bd_pos_permissions", JSON.stringify(res.data.permissions || []));
-    localStorage.setItem(
-      "bd_pos_user",
-      JSON.stringify({
-        id: res.data.user.id,
-        name: res.data.user.name,
-        email: res.data.user.email,
-        roleName: res.data.user.role?.name,
-      })
-    );
-    window.location.reload();
+    if (loginSubmitting) return;
+    setLoginSubmitting(true);
+    try {
+      const res = await api.post("/auth/login", loginForm);
+      localStorage.setItem("bd_pos_token", res.data.token);
+      localStorage.setItem("bd_pos_branch_id", String(res.data.user.branchId));
+      localStorage.setItem("bd_pos_permissions", JSON.stringify(res.data.permissions || []));
+      localStorage.setItem(
+        "bd_pos_user",
+        JSON.stringify({
+          id: res.data.user.id,
+          name: res.data.user.name,
+          email: res.data.user.email,
+          roleName: res.data.user.role?.name,
+        })
+      );
+      window.location.reload();
+    } catch (err) {
+      const msg =
+        err?.response?.data?.error ||
+        err?.response?.data?.message ||
+        err?.message ||
+        t(lang, "loginFailed");
+      notifyError(String(msg));
+      setLoginSubmitting(false);
+    }
   };
 
   const changeLang = (nextLang) => {
-    setLang(nextLang);
-    localStorage.setItem("bd_pos_lang", nextLang);
+    const v = nextLang === "bn" ? "bn" : "en";
+    setLang(v);
+    localStorage.setItem("bd_pos_lang", v);
+    window.dispatchEvent(new CustomEvent("bd_pos_lang_changed", { detail: { lang: v } }));
   };
+
+  useEffect(() => {
+    const sync = () => {
+      const next = localStorage.getItem("bd_pos_lang") === "bn" ? "bn" : "en";
+      setLang((prev) => (prev !== next ? next : prev));
+    };
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
 
   const openView = useCallback((nextView) => {
     setView(nextView);
@@ -199,7 +247,16 @@ function App() {
 
   useEffect(() => {
     const onNavigate = (event) => {
-      const next = event?.detail?.view;
+      const detail = event?.detail || {};
+      const prefill = detail.salesLookupPrefill;
+      if (prefill && typeof prefill === "object") {
+        try {
+          sessionStorage.setItem("bd_pos_sales_lookup_prefill", JSON.stringify(prefill));
+        } catch {
+          /* ignore */
+        }
+      }
+      const next = detail.view;
       if (!next || typeof next !== "string") return;
       setView(next);
       localStorage.setItem("bd_pos_last_view", next);
@@ -251,33 +308,40 @@ function App() {
     return (
       <>
       <div className="login-shell">
-        <div className="login-card">
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-            <div className="logo-mark" style={{ width: 36, height: 36, borderRadius: 10, background: "linear-gradient(135deg,#3b82f6,#8b5cf6)", color: "#fff", display: "grid", placeItems: "center", fontWeight: 700 }}>BD</div>
-            <h2 style={{ margin: 0 }}>{t(lang, "appTitle")}</h2>
-          </div>
-          <p className="login-sub">Sign in to access your branch POS modules.</p>
-          <form onSubmit={handleLogin}>
+        <div className="login-card login-card-elevated">
+          <div className="login-brand-row">
+            <div className="logo-mark login-logo-mark">BD</div>
             <div>
-              <label>Email</label>
+              <h2 className="login-title">{t(lang, "appTitle")}</h2>
+              <p className="login-tagline">{t(lang, "loginTagline")}</p>
+            </div>
+          </div>
+          <p className="login-sub">{t(lang, "loginSub")}</p>
+          <form className="login-form" onSubmit={handleLogin}>
+            <div className="login-field">
+              <label>{t(lang, "email")}</label>
               <input
-                placeholder="you@example.com"
+                placeholder={t(lang, "loginEmailPlaceholder")}
+                autoComplete="username"
                 value={loginForm.email}
                 onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
+                required
               />
             </div>
-            <div>
-              <label>Password</label>
+            <div className="login-field">
+              <label>{t(lang, "password")}</label>
               <input
                 type="password"
-                placeholder="••••••"
+                autoComplete="current-password"
+                placeholder={t(lang, "loginPasswordPlaceholder")}
                 value={loginForm.password}
                 onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                required
               />
             </div>
-            <button type="submit" style={{ width: "100%", justifyContent: "center", marginTop: 6 }}>
-              Sign In
-            </button>
+            <SubmitButton loading={loginSubmitting} loadingLabel={t(lang, "signingIn")} className="login-submit-btn">
+              {t(lang, "signIn")}
+            </SubmitButton>
           </form>
           <div className="login-actions">
             <button
@@ -290,7 +354,7 @@ function App() {
             <span className="text-muted" style={{ fontSize: 12 }}>v1.0</span>
           </div>
           <div className="login-tip">
-            Default admin: <strong>admin@bdpos.local</strong> / <strong>123456</strong>
+            {t(lang, "defaultCredentialsHint")} <strong>admin@bdpos.local</strong> / <strong>123456</strong>
           </div>
         </div>
       </div>
@@ -328,6 +392,8 @@ function App() {
         return <Accounting />;
       case "financeSettlements":
         return <FinanceSettlements />;
+      case "financeDigitalCashout":
+        return <FinanceDigitalCashout />;
       case "financeBankCsv":
         return <FinanceBankImports />;
       case "fiscalPeriods":
@@ -344,6 +410,8 @@ function App() {
         return <Expenses />;
       case "dueCollection":
         return <DueCollection />;
+      case "salesLookup":
+        return <SalesLookup />;
       case "reports":
         return <Reports />;
       case "loyalty":
@@ -392,13 +460,13 @@ function App() {
           <div style={{ padding: "6px 10px 10px" }}>
             <input
               ref={menuSearchRef}
-              placeholder={lang === "bn" ? "মেনু খুঁজুন..." : "Search menu..."}
+              className="nav-menu-search"
+              placeholder={t(lang, "searchMenu")}
               value={menuQuery}
               onChange={(e) => setMenuQuery(e.target.value)}
-              style={{ background: "rgba(255,255,255,0.08)", color: "#e2e8f0", borderColor: "rgba(255,255,255,0.15)" }}
             />
             <div style={{ color: "#94a3b8", fontSize: 11, marginTop: 4 }}>
-              Ctrl/Cmd + K · ?
+              {t(lang, "navSidebarKeyHints")}
             </div>
           </div>
           {sections.map((section) => (
@@ -431,21 +499,13 @@ function App() {
                     className={`nav-pin-btn ${navPins.includes(item.key) ? "pinned" : ""}`}
                     title={
                       navPins.includes(item.key)
-                        ? lang === "bn"
-                          ? "আনপিন"
-                          : "Unpin"
-                        : lang === "bn"
-                          ? "উপরে পিন করুন"
-                          : "Pin to top"
+                        ? t(lang, "pinUnpin")
+                        : t(lang, "pinToTop")
                     }
                     aria-label={
                       navPins.includes(item.key)
-                        ? lang === "bn"
-                          ? "আনপিন"
-                          : "Unpin"
-                        : lang === "bn"
-                          ? "পিন"
-                          : "Pin"
+                        ? t(lang, "pinUnpin")
+                        : t(lang, "pinToTop")
                     }
                     onClick={(e) => {
                       e.preventDefault();
@@ -464,7 +524,7 @@ function App() {
             <div className="user-avatar">{initials}</div>
             <div className="user-meta">
               <div className="user-name">{user?.name || user?.email || "User"}</div>
-              <div className="user-role">{user?.roleName || "Member"}</div>
+              <div className="user-role">{user?.roleName || t(lang, "member")}</div>
             </div>
           </div>
           <button
@@ -477,7 +537,7 @@ function App() {
               window.location.reload();
             }}
           >
-            Logout
+            {t(lang, "logout")}
           </button>
         </div>
       </aside>
@@ -494,20 +554,20 @@ function App() {
             )}
           </div>
           <div className="topbar-actions">
-            <span className="branch-pill">Branch #{branchId}</span>
+            <span className="branch-pill">{t(lang, "branchPill", { n: branchId })}</span>
             <button
               type="button"
               className="btn-secondary btn-sm"
               onClick={() => setShortcutsOpen(true)}
             >
-              {lang === "bn" ? "শর্টকাট" : "Shortcuts"}
+              {t(lang, "shortcuts")}
             </button>
             <button className="btn-secondary btn-sm" onClick={() => changeLang(lang === "en" ? "bn" : "en")}>
               {lang === "en" ? "বাংলা" : "English"}
             </button>
           </div>
         </div>
-        <div className="app-content">{renderPage()}</div>
+        <div className="app-content view-root">{renderPage()}</div>
       </main>
       <KeyboardShortcutsModal
         open={shortcutsOpen}
@@ -517,6 +577,14 @@ function App() {
       <ToastHost />
     </div>
   );
+}
+
+function App() {
+  const hash = useHashRoute();
+  if (isCustomerDisplayRoute(hash)) {
+    return <CustomerDisplay />;
+  }
+  return <MainApp />;
 }
 
 export default App;

@@ -1,7 +1,40 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
+import {
+  downloadMushak63XmlWithCompletenessHint,
+  resolveSaleIdForMushak63Lookup,
+  runMushak63CompletenessCheck,
+} from "../services/nbrMushak63";
 import DataTable from "../components/DataTable";
+import { notifyError } from "../utils/notify";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
+import { formatBDT, formatBdNumber, toBanglaDigits } from "../utils/currency";
+import { getLang, t } from "../i18n";
+
+function mapWithholdingVoucherRow(r, bdtFn) {
+  const net =
+    r.netPaid != null
+      ? Number(r.netPaid)
+      : Number(r.amount || 0) - Number(r.aitAmount || 0) - Number(r.vdsAmount || 0);
+  return {
+    voucherId: r.id,
+    dateLabel: new Date(r.createdAt).toISOString().slice(0, 10),
+    supplierName: r.supplier?.name || "—",
+    tin: r.supplier?.tinNumber || "—",
+    bin: r.supplier?.binNumber || "—",
+    taxCategory: r.taxCategory || r.supplier?.taxCategory || "—",
+    method: r.method || "—",
+    grossLabel: bdtFn(r.amount),
+    aitRateLabel: `${Number(r.aitRate || 0).toFixed(2)}%`,
+    aitLabel: bdtFn(r.aitAmount),
+    vdsRateLabel: `${Number(r.vdsRate || 0).toFixed(2)}%`,
+    vdsLabel: bdtFn(r.vdsAmount),
+    netLabel: bdtFn(net),
+    mushak66: r.mushak66DocumentNo || "—",
+    mushak66Eligible: Number(r.aitAmount || 0) > 0 || Number(r.vdsAmount || 0) > 0,
+    note: r.withholdingNote || r.note || "—",
+  };
+}
 
 const toInputDate = (date) => {
   const y = date.getFullYear();
@@ -12,13 +45,27 @@ const toInputDate = (date) => {
 
 const getRiskBand = (score) => {
   const value = Number(score || 0);
-  if (value >= 10) return { label: "Critical", color: "#b42318", bg: "#fee4e2" };
-  if (value >= 7) return { label: "High", color: "#b54708", bg: "#ffead5" };
-  if (value >= 4) return { label: "Medium", color: "#1d4ed8", bg: "#dbeafe" };
-  return { label: "Low", color: "#166534", bg: "#dcfce7" };
+  if (value >= 10) return { labelKey: "repRiskCritical", color: "#b42318", bg: "#fee4e2" };
+  if (value >= 7) return { labelKey: "repRiskHigh", color: "#b54708", bg: "#ffead5" };
+  if (value >= 4) return { labelKey: "repRiskMedium", color: "#1d4ed8", bg: "#dbeafe" };
+  return { labelKey: "repRiskLow", color: "#166534", bg: "#dcfce7" };
 };
 
 function Reports() {
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const bdt = (v) => formatBDT(v, { lang: uiLang, decimals: 2 });
+  const bdt0 = (v) => formatBDT(v, { lang: uiLang, decimals: 0 });
+
   const permissions = getStoredPermissions();
   const canExportAdvanced = hasPermission("accounting.report", permissions);
   const [aging, setAging] = useState({ customers: [], suppliers: [] });
@@ -38,6 +85,7 @@ function Reports() {
     totalDue: 0,
     digitalCollectionTotal: 0,
     digitalMissingRefCount: 0,
+    walletFlow: { cashIn: 0, cashOut: 0, net: 0 },
     methods: [],
     channels: [],
     digitalRefs: [],
@@ -88,6 +136,181 @@ function Reports() {
     onlyMismatched: false,
   });
   const [reportsTab, setReportsTab] = useState("overview");
+  const todayPeriodKey = (() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  })();
+  const [mushak91Period, setMushak91Period] = useState(todayPeriodKey);
+  const [mushak91Summary, setMushak91Summary] = useState(null);
+  const [mushak91Loading, setMushak91Loading] = useState(false);
+  const [mushak91Error, setMushak91Error] = useState("");
+  const [withholdingRegistersPreview, setWithholdingRegistersPreview] = useState(null);
+  const [withholdingRegistersPreviewLoading, setWithholdingRegistersPreviewLoading] = useState(false);
+  const [withholdingRegistersPreviewError, setWithholdingRegistersPreviewError] = useState("");
+  const [mushak63ManualSaleId, setMushak63ManualSaleId] = useState("");
+  const [mushak63LookupMode, setMushak63LookupMode] = useState("auto");
+  const [mushak63BusyId, setMushak63BusyId] = useState(null);
+
+  const manualMushak63Check = async () => {
+    setMushak63BusyId(-1);
+    try {
+      const target = await resolveSaleIdForMushak63Lookup(mushak63ManualSaleId, mushak63LookupMode);
+      if (!target) {
+        notifyError(
+          mushak63LookupMode === "saleId"
+            ? tt("repEnterNumericSaleId")
+            : mushak63LookupMode === "invoice"
+              ? tt("repEnterInvoice")
+              : tt("repEnterSaleOrInvoice")
+        );
+        return;
+      }
+      setMushak63BusyId(target.saleId);
+      await runMushak63CompletenessCheck(target.saleId);
+    } catch (err) {
+      notifyError(err.response?.data?.error || tt("repCompletenessFailed"));
+    } finally {
+      setMushak63BusyId(null);
+    }
+  };
+
+  const manualMushak63Xml = async () => {
+    setMushak63BusyId(-1);
+    try {
+      const target = await resolveSaleIdForMushak63Lookup(mushak63ManualSaleId, mushak63LookupMode);
+      if (!target) {
+        notifyError(
+          mushak63LookupMode === "saleId"
+            ? tt("repEnterNumericSaleId")
+            : mushak63LookupMode === "invoice"
+              ? tt("repEnterInvoice")
+              : tt("repEnterSaleOrInvoice")
+        );
+        return;
+      }
+      setMushak63BusyId(target.saleId);
+      await downloadMushak63XmlWithCompletenessHint(target.saleId, target.mushakDocumentNo);
+    } catch (err) {
+      notifyError(err.response?.data?.error || tt("repMushak63DownloadFailed"));
+    } finally {
+      setMushak63BusyId(null);
+    }
+  };
+
+  const previewMushak91 = async () => {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mushak91Period)) {
+      setMushak91Error(tt("repPeriodMustYYYYMM"));
+      return;
+    }
+    setMushak91Error("");
+    setMushak91Loading(true);
+    try {
+      const res = await api.get(`/nbr/reports/mushak91/summary?period=${mushak91Period}`);
+      setMushak91Summary(res.data);
+    } catch (err) {
+      setMushak91Error(err?.response?.data?.error || err?.message || tt("repFailedToLoad"));
+      setMushak91Summary(null);
+    } finally {
+      setMushak91Loading(false);
+    }
+  };
+
+  const downloadMushak91Xml = async () => {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mushak91Period)) {
+      setMushak91Error(tt("repPeriodMustYYYYMM"));
+      return;
+    }
+    setMushak91Error("");
+    try {
+      const res = await api.get(`/nbr/reports/mushak91.xml?period=${mushak91Period}`, {
+        responseType: "blob",
+      });
+      const blob = new Blob([res.data], { type: "application/xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `mushak-9.1-${mushak91Period}.xml`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setMushak91Error(err?.response?.data?.error || err?.message || tt("repDownloadFailed"));
+    }
+  };
+
+  const downloadWithholdingRegisterCsv = async (kind) => {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mushak91Period)) {
+      setMushak91Error(tt("repPeriodMustYYYYMM"));
+      return;
+    }
+    try {
+      const res = await api.get(
+        `/withholding/registers/${kind}/export.csv?period=${mushak91Period}`,
+        { responseType: "blob" }
+      );
+      const blob = new Blob([res.data], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${kind}-register-${mushak91Period}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setMushak91Error(err?.response?.data?.error || err?.message || tt("repDownloadFailed"));
+    }
+  };
+
+  const previewWithholdingRegisters = async () => {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mushak91Period)) {
+      setWithholdingRegistersPreviewError(tt("repPeriodPreviewHint"));
+      return;
+    }
+    setWithholdingRegistersPreviewError("");
+    setWithholdingRegistersPreviewLoading(true);
+    try {
+      const period = encodeURIComponent(mushak91Period);
+      const [aitRes, vdsRes] = await Promise.all([
+        api.get(`/withholding/registers/ait?period=${period}`),
+        api.get(`/withholding/registers/vds?period=${period}`),
+      ]);
+      setWithholdingRegistersPreview({ ait: aitRes.data, vds: vdsRes.data });
+    } catch (err) {
+      setWithholdingRegistersPreview(null);
+      setWithholdingRegistersPreviewError(
+        err?.response?.data?.error || err?.message || tt("repWithholdingLoadFailed")
+      );
+    } finally {
+      setWithholdingRegistersPreviewLoading(false);
+    }
+  };
+
+  const downloadWithholdingMushak66Pdf = async (voucherId) => {
+    try {
+      const res = await api.get(`/withholding/vouchers/${voucherId}/mushak66.pdf`, {
+        responseType: "blob",
+      });
+      const blob = new Blob([res.data], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `mushak-6.6-${voucherId}.pdf`;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      notifyError(err?.response?.data?.error || err?.message || tt("repMushak66DownloadFailed"));
+    }
+  };
+
+  useEffect(() => {
+    setWithholdingRegistersPreview(null);
+    setWithholdingRegistersPreviewError("");
+  }, [mushak91Period]);
 
   useEffect(() => {
     const load = async () => {
@@ -222,6 +445,21 @@ function Reports() {
     await exportCSV(`${url}${suffix}`, filename);
   };
 
+  const openSaleLookupDeepLink = (invoiceNo, saleId) => {
+    const queryVal = invoiceNo ? String(invoiceNo).trim() : String(saleId ?? "").trim();
+    if (!queryVal) return;
+    const mode = invoiceNo ? "invoice" : "saleId";
+    try {
+      sessionStorage.setItem(
+        "bd_pos_sales_lookup_prefill",
+        JSON.stringify({ query: queryVal, mode, autoSearch: true })
+      );
+    } catch {
+      /* ignore */
+    }
+    window.dispatchEvent(new CustomEvent("bd_pos_navigate", { detail: { view: "salesLookup" } }));
+  };
+
   const exportShrinkageControl = async (type) => {
     const query = new URLSearchParams();
     if (settlementRange.from) query.set("from", settlementRange.from);
@@ -290,15 +528,15 @@ function Reports() {
   };
 
   return (
-    <div>
+    <div className="page-stack">
       <div className="page-header">
         <div>
-          <div className="page-title">Reports Center</div>
-          <div className="page-subtitle">Step-by-step reporting workflow</div>
+          <div className="page-title">{tt("repTitle")}</div>
+          <div className="page-subtitle">{tt("repSubtitle")}</div>
         </div>
       </div>
       <div className="pos-tabs">
-        <div className="pos-tablist" role="tablist" aria-label="Reports tabs">
+        <div className="pos-tablist" role="tablist" aria-label={tt("repTabsAria")}>
           <button
             type="button"
             role="tab"
@@ -306,7 +544,7 @@ function Reports() {
             className={`pos-tab ${reportsTab === "overview" ? "pos-tab-active" : ""}`}
             onClick={() => setReportsTab("overview")}
           >
-            1. Overview
+            {tt("repTabOverview")}
           </button>
           <button
             type="button"
@@ -315,7 +553,7 @@ function Reports() {
             className={`pos-tab ${reportsTab === "tax" ? "pos-tab-active" : ""}`}
             onClick={() => setReportsTab("tax")}
           >
-            2. VAT & Loyalty
+            {tt("repTabTax")}
           </button>
           <button
             type="button"
@@ -324,7 +562,7 @@ function Reports() {
             className={`pos-tab ${reportsTab === "risk" ? "pos-tab-active" : ""}`}
             onClick={() => setReportsTab("risk")}
           >
-            3. Risk Control
+            {tt("repTabRisk")}
           </button>
           <button
             type="button"
@@ -333,35 +571,33 @@ function Reports() {
             className={`pos-tab ${reportsTab === "finance" ? "pos-tab-active" : ""}`}
             onClick={() => setReportsTab("finance")}
           >
-            4. Aging & Stock
+            {tt("repTabFinance")}
           </button>
         </div>
       </div>
       <details className="page-card" style={{ marginBottom: 12 }}>
-        <summary style={{ cursor: "pointer", fontWeight: 600 }}>Advanced Exports</summary>
+        <summary style={{ cursor: "pointer", fontWeight: 600 }}>{tt("repAdvancedExports")}</summary>
         {canExportAdvanced ? (
           <div className="pos-action-row" style={{ marginTop: 10 }}>
-            <button onClick={() => exportCSV("/reports/aging/export.csv", "aging-report.csv")}>Aging CSV</button>
-            <button onClick={() => exportCSV("/reports/aging/export.pdf", "aging-report.pdf")}>Aging PDF</button>
-            <button onClick={() => exportStockValuation("csv")}>Stock CSV</button>
-            <button onClick={() => exportStockValuation("pdf")}>Stock PDF</button>
-            <button onClick={() => exportSettlement("methodCsv")}>Settlement Method CSV</button>
-            <button onClick={() => exportSettlement("channelCsv")}>Settlement Channel CSV</button>
-            <button onClick={() => exportSettlement("methodPdf")}>Settlement Method PDF</button>
-            <button onClick={() => exportSettlement("channelPdf")}>Settlement Channel PDF</button>
-            <button onClick={() => exportLoyaltyRedemption("csv")}>Loyalty CSV</button>
-            <button onClick={() => exportLoyaltyRedemption("pdf")}>Loyalty PDF</button>
-            <button onClick={() => exportVatSalesRegister("csv")}>VAT Register CSV</button>
-            <button onClick={() => exportVatSalesRegister("pdf")}>VAT Register PDF</button>
-            <button onClick={() => exportShrinkageControl("csv")}>Shrinkage CSV</button>
-            <button onClick={() => exportShrinkageControl("pdf")}>Shrinkage PDF</button>
-            <button onClick={() => exportChequeLedger("csv")}>Cheque Ledger CSV</button>
-            <button onClick={() => exportChequeLedger("pdf")}>Cheque Ledger PDF</button>
+            <button onClick={() => exportCSV("/reports/aging/export.csv", "aging-report.csv")}>{tt("repBtnAgingCsv")}</button>
+            <button onClick={() => exportCSV("/reports/aging/export.pdf", "aging-report.pdf")}>{tt("repBtnAgingPdf")}</button>
+            <button onClick={() => exportStockValuation("csv")}>{tt("repBtnStockCsv")}</button>
+            <button onClick={() => exportStockValuation("pdf")}>{tt("repBtnStockPdf")}</button>
+            <button onClick={() => exportSettlement("methodCsv")}>{tt("repBtnSettlementMethodCsv")}</button>
+            <button onClick={() => exportSettlement("channelCsv")}>{tt("repBtnSettlementChannelCsv")}</button>
+            <button onClick={() => exportSettlement("methodPdf")}>{tt("repBtnSettlementMethodPdf")}</button>
+            <button onClick={() => exportSettlement("channelPdf")}>{tt("repBtnSettlementChannelPdf")}</button>
+            <button onClick={() => exportLoyaltyRedemption("csv")}>{tt("repBtnLoyaltyCsv")}</button>
+            <button onClick={() => exportLoyaltyRedemption("pdf")}>{tt("repBtnLoyaltyPdf")}</button>
+            <button onClick={() => exportVatSalesRegister("csv")}>{tt("repBtnVatRegisterCsv")}</button>
+            <button onClick={() => exportVatSalesRegister("pdf")}>{tt("repBtnVatRegisterPdf")}</button>
+            <button onClick={() => exportShrinkageControl("csv")}>{tt("repBtnShrinkageCsv")}</button>
+            <button onClick={() => exportShrinkageControl("pdf")}>{tt("repBtnShrinkagePdf")}</button>
+            <button onClick={() => exportChequeLedger("csv")}>{tt("repBtnChequeCsv")}</button>
+            <button onClick={() => exportChequeLedger("pdf")}>{tt("repBtnChequePdf")}</button>
           </div>
         ) : (
-          <div className="text-muted" style={{ marginTop: 10 }}>
-            Permission required: <code>accounting.report</code> to export advanced reports.
-          </div>
+          <div className="text-muted" style={{ marginTop: 10 }}>{tt("repPermExportAdvanced")}</div>
         )}
       </details>
       <div className="form-grid" style={{ marginBottom: "12px" }}>
@@ -376,16 +612,16 @@ function Reports() {
           onChange={(e) => setSettlementRange((prev) => ({ ...prev, to: e.target.value }))}
         />
         <button type="button" className="btn-secondary" onClick={() => setSettlementRange({ from: "", to: "" })}>
-          Clear Date Filter
+          {tt("repClearDateFilter")}
         </button>
         <button type="button" className="btn-secondary" onClick={() => setSettlementPresetRange("today")}>
-          Today
+          {tt("repToday")}
         </button>
         <button type="button" className="btn-secondary" onClick={() => setSettlementPresetRange("last7")}>
-          Last 7 Days
+          {tt("repLast7Days")}
         </button>
         <button type="button" className="btn-secondary" onClick={() => setSettlementPresetRange("month")}>
-          This Month
+          {tt("repThisMonth")}
         </button>
         <input
           type="number"
@@ -398,7 +634,7 @@ function Reports() {
               discountAlertMin: Number(e.target.value || 0),
             }))
           }
-          placeholder="High Discount Threshold"
+          placeholder={tt("repPhHighDiscountThreshold")}
         />
         <input
           type="number"
@@ -411,7 +647,7 @@ function Reports() {
               returnAlertMin: Number(e.target.value || 0),
             }))
           }
-          placeholder="High Return Threshold"
+          placeholder={tt("repPhHighReturnThreshold")}
         />
         <input
           type="number"
@@ -424,92 +660,407 @@ function Reports() {
               criticalAmount: Number(e.target.value || 0),
             }))
           }
-          placeholder="Critical Amount Threshold"
+          placeholder={tt("repPhCriticalAmountThreshold")}
         />
       </div>
       {reportsTab === "overview" ? (
         <div className="pos-tab-panel">
       <DataTable
-        title="Today Payment Settlement (By Method)"
+        title={tt("repSettleByMethodTitle")}
         rows={settlement.methods.map((row, idx) => ({ rowNo: idx + 1, ...row }))}
         searchableKeys={["method"]}
         columns={[
-          { key: "rowNo", label: "ID" },
-          { key: "method", label: "Payment Method" },
-          { key: "amount", label: "Collected", render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "rowNo", label: tt("colId") },
+          { key: "method", label: tt("repPaymentMethod") },
+          { key: "amount", label: tt("repCollected"), render: (v) => `৳${Number(v).toFixed(2)}` },
         ]}
       />
       <DataTable
-        title="Today Payment Settlement (By Channel/Ref)"
+        title={tt("repSettleByChannelTitle")}
         rows={settlement.channels.map((row, idx) => ({ rowNo: idx + 1, ...row }))}
         searchableKeys={["channel"]}
         columns={[
-          { key: "rowNo", label: "ID" },
-          { key: "channel", label: "Channel" },
-          { key: "amount", label: "Collected", render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "rowNo", label: tt("colId") },
+          { key: "channel", label: tt("repChannel") },
+          { key: "amount", label: tt("repCollected"), render: (v) => `৳${Number(v).toFixed(2)}` },
         ]}
       />
       <DataTable
-        title="Digital Transaction Reference Usage"
+        title={tt("repDigitalRefUsageTitle")}
         rows={(settlement.digitalRefs || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
         searchableKeys={["channel"]}
         columns={[
-          { key: "rowNo", label: "ID" },
-          { key: "channel", label: "Transaction Ref" },
-          { key: "count", label: "Usage Count" },
+          { key: "rowNo", label: tt("colId") },
+          { key: "channel", label: tt("repTxnRef") },
+          { key: "count", label: tt("repUsageCount") },
         ]}
       />
       <DataTable
-        title="Settlement Paid Trend (By Date)"
+        title={tt("repSettlementTrendTitle")}
         rows={settlement.days.map((row, idx) => ({ rowNo: idx + 1, ...row }))}
         searchableKeys={["date"]}
         columns={[
-          { key: "rowNo", label: "ID" },
-          { key: "date", label: "Date" },
-          { key: "paid", label: "Paid", render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "rowNo", label: tt("colId") },
+          { key: "date", label: tt("receiptDate") },
+          { key: "paid", label: tt("dashPaid"), render: (v) => `৳${Number(v).toFixed(2)}` },
         ]}
       />
       <div className="quick-stats" style={{ marginBottom: "12px" }}>
-        <div className="stat">Bills: {settlement.billCount}</div>
-        <div className="stat">Paid: ৳{Number(settlement.totalPaid || 0).toFixed(2)}</div>
-        <div className="stat">Due: ৳{Number(settlement.totalDue || 0).toFixed(2)}</div>
-        <div className="stat">Digital Paid: ৳{Number(settlement.digitalCollectionTotal || 0).toFixed(2)}</div>
-        <div className="stat">Missing Digital Refs: {Number(settlement.digitalMissingRefCount || 0)}</div>
+        <div className="stat">{tt("dashPillBills")}: {settlement.billCount}</div>
+        <div className="stat">{tt("dashPaid")}: {bdt(settlement.totalPaid)}</div>
+        <div className="stat">{tt("dashDue")}: {bdt(settlement.totalDue)}</div>
+        <div className="stat">{tt("repDigitalPaid")}: {bdt(settlement.digitalCollectionTotal)}</div>
+        <div className="stat">{tt("repMissingDigitalRefs")}: {Number(settlement.digitalMissingRefCount || 0)}</div>
+        <div className="stat">{tt("dashWalletCashOut")}: {bdt(settlement.walletFlow?.cashOut || 0)}</div>
+        <div className="stat">{tt("dashWalletCashIn")}: {bdt(settlement.walletFlow?.cashIn || 0)}</div>
+        <div className="stat">{tt("dashWalletNet")}: {bdt(settlement.walletFlow?.net || 0)}</div>
       </div>
         </div>
       ) : null}
       {reportsTab === "tax" ? (
         <div className="pos-tab-panel">
       <div className="quick-stats" style={{ marginBottom: "12px" }}>
-        <div className="stat">Loyalty Entries: {Number(loyaltyRedemptions.summary?.count || 0)}</div>
-        <div className="stat">Redeemed Points: {Number(loyaltyRedemptions.summary?.redeemedPoints || 0).toFixed(0)}</div>
-        <div className="stat">Redeemed Amount: ৳{Number(loyaltyRedemptions.summary?.redeemedAmount || 0).toFixed(2)}</div>
-        <div className="stat">Tier Discount: ৳{Number(loyaltyRedemptions.summary?.tierDiscountAmount || 0).toFixed(2)}</div>
+        <div className="stat">{tt("repLoyaltyEntries")}: {Number(loyaltyRedemptions.summary?.count || 0)}</div>
+        <div className="stat">{tt("repRedeemedPoints")}: {Number(loyaltyRedemptions.summary?.redeemedPoints || 0).toFixed(0)}</div>
+        <div className="stat">{tt("repRedeemedAmount")}: {bdt(loyaltyRedemptions.summary?.redeemedAmount)}</div>
+        <div className="stat">{tt("repTierDiscount")}: {bdt(loyaltyRedemptions.summary?.tierDiscountAmount)}</div>
       </div>
       <div className="quick-stats" style={{ marginBottom: "12px" }}>
-        <div className="stat">VAT Sales Count: {Number(vatSummary.salesCount || 0)}</div>
-        <div className="stat">Taxable Sales: ৳{Number(vatSummary.taxableSales || 0).toFixed(2)}</div>
-        <div className="stat">Output VAT: ৳{Number(vatSummary.outputVat || 0).toFixed(2)}</div>
-        <div className="stat">Input VAT Tracked: ৳{Number(vatSummary.inputVatTracked || 0).toFixed(2)}</div>
-        <div className="stat">Net VAT Payable: ৳{Number(vatSummary.netVatPayable || 0).toFixed(2)}</div>
+        <div className="stat">{tt("repVatSalesCount")}: {Number(vatSummary.salesCount || 0)}</div>
+        <div className="stat">{tt("repTaxableSales")}: {bdt(vatSummary.taxableSales)}</div>
+        <div className="stat">{tt("repOutputVat")}: {bdt(vatSummary.outputVat)}</div>
+        <div className="stat">{tt("repInputVatTracked")}: {bdt(vatSummary.inputVatTracked)}</div>
+        <div className="stat">{tt("repNetVatPayable")}: {bdt(vatSummary.netVatPayable)}</div>
       </div>
+
+      <div className="page-card" style={{ marginBottom: "12px" }}>
+        <h4 style={{ marginTop: 0 }}>{tt("repMushak63Title")}</h4>
+        <p className="text-muted" style={{ marginTop: 0, fontSize: 12 }}>
+          {tt("repMushak63HelpA")} <strong>{tt("repInvoiceNumber")}</strong> {tt("repMushak63HelpB")}
+        </p>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+            {tt("repMatchBy")}
+            <select
+              className="form-select-sm"
+              value={mushak63LookupMode}
+              onChange={(e) => setMushak63LookupMode(e.target.value)}
+              style={{ minWidth: 140 }}
+            >
+              <option value="auto">{tt("repAuto")}</option>
+              <option value="saleId">{tt("repSaleId")}</option>
+              <option value="invoice">{tt("repInvoiceNumber")}</option>
+            </select>
+          </label>
+          <input
+            type="text"
+            placeholder={
+              mushak63LookupMode === "saleId"
+                ? "Sale ID"
+                : mushak63LookupMode === "invoice"
+                  ? tt("repInvoiceNumber")
+                  : tt("repSaleOrInvoice")
+            }
+            value={mushak63ManualSaleId}
+            onChange={(e) => setMushak63ManualSaleId(e.target.value)}
+            style={{ width: 200 }}
+          />
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            onClick={manualMushak63Check}
+            disabled={mushak63BusyId !== null}
+          >
+            {tt("repCheckCompleteness")}
+          </button>
+          <button
+            type="button"
+            className="btn-primary btn-sm"
+            onClick={manualMushak63Xml}
+            disabled={mushak63BusyId !== null}
+          >
+            {tt("repDownloadMushak63Xml")}
+          </button>
+        </div>
+      </div>
+
+      <div className="page-card" style={{ marginBottom: "12px" }}>
+        <h4 style={{ marginTop: 0 }}>{tt("repMushak91Title")}</h4>
+        <p className="text-muted" style={{ marginTop: 0, fontSize: 12 }}>
+          {tt("repMushak91Help")}
+        </p>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 13 }}>{tt("repPeriodYYYYMM")}</label>
+          <input
+            type="month"
+            value={mushak91Period}
+            onChange={(e) => setMushak91Period(e.target.value)}
+            style={{ width: 160 }}
+          />
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            onClick={previewMushak91}
+            disabled={mushak91Loading}
+          >
+            {mushak91Loading ? tt("repLoading") : tt("repPreview")}
+          </button>
+          <button
+            type="button"
+            className="btn-primary btn-sm"
+            onClick={downloadMushak91Xml}
+            disabled={mushak91Loading}
+            title={tt("repDownloadMushak91Title")}
+          >
+            {tt("repDownloadMushak91Xml")}
+          </button>
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            onClick={() => downloadWithholdingRegisterCsv("ait")}
+            title={tt("repAitRegisterTitle")}
+          >
+            {tt("repAitRegisterCsv")}
+          </button>
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            onClick={() => downloadWithholdingRegisterCsv("vds")}
+            title={tt("repVdsRegisterTitle")}
+          >
+            {tt("repVdsRegisterCsv")}
+          </button>
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            onClick={previewWithholdingRegisters}
+            disabled={withholdingRegistersPreviewLoading || mushak91Loading}
+            title={tt("repPreviewWithholdingTitle")}
+          >
+            {withholdingRegistersPreviewLoading ? tt("repLoadingRegisters") : tt("repPreviewWithholding")}
+          </button>
+        </div>
+        {mushak91Error ? (
+          <p style={{ color: "#b42318", marginTop: 8, fontSize: 13 }}>{mushak91Error}</p>
+        ) : null}
+        {mushak91Summary ? (
+          <div style={{ marginTop: 10 }}>
+            <div className="quick-stats">
+              <div className="stat">{tt("repSales")}: {Number(mushak91Summary.summary.counts.salesCount)}</div>
+              <div className="stat">{tt("repPurchases")}: {Number(mushak91Summary.summary.counts.purchaseCount)}</div>
+              <div className="stat">{tt("repOutputVat")}: {bdt(mushak91Summary.summary.output.totalVat)}</div>
+              <div className="stat">{tt("repInputVat")}: {bdt(mushak91Summary.summary.input.totalVat)}</div>
+              <div className="stat" style={{ background: "#dcfce7" }}>
+                {tt("repNetVatPayable")}: {bdt(mushak91Summary.summary.netVatPayable)}
+              </div>
+            </div>
+            {mushak91Summary.warnings && mushak91Summary.warnings.length > 0 ? (
+              <div
+                style={{
+                  marginTop: 10,
+                  padding: 10,
+                  background: "#fff7ed",
+                  border: "1px solid #fdba74",
+                  borderRadius: 6,
+                }}
+              >
+                <strong style={{ color: "#9a3412" }}>{tt("repCompletenessWarnings")}</strong>
+                <ul style={{ margin: "6px 0 0 18px", padding: 0 }}>
+                  {mushak91Summary.warnings.map((w, idx) => (
+                    <li key={idx} style={{ color: "#9a3412", fontSize: 13 }}>
+                      {w}
+                    </li>
+                  ))}
+                </ul>
+                <p style={{ margin: "6px 0 0", fontSize: 12, color: "#9a3412" }}>{tt("repCompletenessWarnHelp")}</p>
+              </div>
+            ) : (
+              <p style={{ marginTop: 8, color: "#15803d", fontSize: 13 }}>
+                {tt("repNoCompletenessWarnings")}
+              </p>
+            )}
+            {mushak91Summary.summary.output.buckets.length > 0 ? (
+              <div style={{ marginTop: 10 }}>
+                <strong style={{ fontSize: 13 }}>{tt("repOutputVatByHs")}</strong>
+                <table style={{ width: "100%", marginTop: 6, fontSize: 13, borderCollapse: "collapse" }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: "left", padding: 4, borderBottom: "1px solid #e5e7eb" }}>{tt("repHsCode")}</th>
+                      <th style={{ textAlign: "right", padding: 4, borderBottom: "1px solid #e5e7eb" }}>{tt("repRate")}</th>
+                      <th style={{ textAlign: "right", padding: 4, borderBottom: "1px solid #e5e7eb" }}>{tt("repLines")}</th>
+                      <th style={{ textAlign: "right", padding: 4, borderBottom: "1px solid #e5e7eb" }}>Net</th>
+                      <th style={{ textAlign: "right", padding: 4, borderBottom: "1px solid #e5e7eb" }}>VAT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {mushak91Summary.summary.output.buckets.map((b, idx) => (
+                      <tr key={idx}>
+                        <td style={{ padding: 4 }}>{b.hsCode}</td>
+                        <td style={{ padding: 4, textAlign: "right" }}>{Number(b.rate).toFixed(2)}%</td>
+                        <td style={{ padding: 4, textAlign: "right" }}>{Number(b.lineCount)}</td>
+                        <td style={{ padding: 4, textAlign: "right" }}>{bdt(b.net)}</td>
+                        <td style={{ padding: 4, textAlign: "right" }}>{bdt(b.vat)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+            <p className="text-muted" style={{ marginTop: 8, fontSize: 11 }}>
+              {tt("repXmlHash")}: <code>{mushak91Summary.hash}</code>
+            </p>
+          </div>
+        ) : null}
+      </div>
+
+      {withholdingRegistersPreview ? (
+        <div className="page-card" style={{ marginBottom: "12px" }}>
+          <h4 style={{ marginTop: 0 }}>Withholding registers ({mushak91Period})</h4>
+          <p className="text-muted" style={{ marginTop: 0, fontSize: 12 }}>
+            Supplier payments with AIT / VDS for the same month as Mushak 9.1. CSV exports match these rows.
+          </p>
+
+          <div style={{ marginBottom: 16 }}>
+            <strong style={{ fontSize: 13 }}>AIT register</strong>
+            <div className="quick-stats" style={{ marginTop: 6 }}>
+              <div className="stat">Vouchers: {Number(withholdingRegistersPreview.ait?.summary?.voucherCount || 0)}</div>
+              <div className="stat">Gross: {bdt(withholdingRegistersPreview.ait?.summary?.totalGross)}</div>
+              <div className="stat">AIT: {bdt(withholdingRegistersPreview.ait?.summary?.totalAit)}</div>
+              <div className="stat">Net paid: {bdt(withholdingRegistersPreview.ait?.summary?.totalNet)}</div>
+            </div>
+            <DataTable
+              title=""
+              rows={(withholdingRegistersPreview.ait?.rows || []).map((r) => mapWithholdingVoucherRow(r, bdt))}
+              pageSize={8}
+              allowExport={false}
+              searchableKeys={[
+                "supplierName",
+                "tin",
+                "bin",
+                "taxCategory",
+                "method",
+                "mushak66",
+                "note",
+                "voucherId",
+              ]}
+              columns={[
+                { key: "voucherId", label: "Voucher" },
+                { key: "dateLabel", label: "Date" },
+                { key: "supplierName", label: "Supplier" },
+                { key: "tin", label: "TIN" },
+                { key: "bin", label: "BIN" },
+                { key: "taxCategory", label: "Tax cat." },
+                { key: "method", label: "Method" },
+                { key: "grossLabel", label: "Gross" },
+                { key: "aitRateLabel", label: "AIT %" },
+                { key: "aitLabel", label: "AIT" },
+                { key: "netLabel", label: "Net paid" },
+                { key: "mushak66", label: "Mushak 6.6" },
+                {
+                  key: "mushak66pdf",
+                  label: "6.6 PDF",
+                  render: (_, row) =>
+                    row.mushak66Eligible ? (
+                      <button
+                        type="button"
+                        className="btn-secondary btn-sm"
+                        onClick={() => downloadWithholdingMushak66Pdf(row.voucherId)}
+                      >
+                        PDF
+                      </button>
+                    ) : (
+                      <span style={{ color: "#94a3b8" }}>—</span>
+                    ),
+                },
+                { key: "note", label: "Note", render: (v) => <span title={v}>{v}</span> },
+              ]}
+            />
+          </div>
+
+          <div>
+            <strong style={{ fontSize: 13 }}>VDS register</strong>
+            <div className="quick-stats" style={{ marginTop: 6 }}>
+              <div className="stat">Vouchers: {Number(withholdingRegistersPreview.vds?.summary?.voucherCount || 0)}</div>
+              <div className="stat">Gross: {bdt(withholdingRegistersPreview.vds?.summary?.totalGross)}</div>
+              <div className="stat">VDS: {bdt(withholdingRegistersPreview.vds?.summary?.totalVds)}</div>
+              <div className="stat">Net paid: {bdt(withholdingRegistersPreview.vds?.summary?.totalNet)}</div>
+            </div>
+            <DataTable
+              title=""
+              rows={(withholdingRegistersPreview.vds?.rows || []).map((r) => mapWithholdingVoucherRow(r, bdt))}
+              pageSize={8}
+              allowExport={false}
+              searchableKeys={[
+                "supplierName",
+                "tin",
+                "bin",
+                "taxCategory",
+                "method",
+                "mushak66",
+                "note",
+                "voucherId",
+              ]}
+              columns={[
+                { key: "voucherId", label: "Voucher" },
+                { key: "dateLabel", label: "Date" },
+                { key: "supplierName", label: "Supplier" },
+                { key: "tin", label: "TIN" },
+                { key: "bin", label: "BIN" },
+                { key: "taxCategory", label: "Tax cat." },
+                { key: "method", label: "Method" },
+                { key: "grossLabel", label: "Gross" },
+                { key: "vdsRateLabel", label: "VDS %" },
+                { key: "vdsLabel", label: "VDS" },
+                { key: "netLabel", label: "Net paid" },
+                { key: "mushak66", label: "Mushak 6.6" },
+                {
+                  key: "mushak66pdf",
+                  label: "6.6 PDF",
+                  render: (_, row) =>
+                    row.mushak66Eligible ? (
+                      <button
+                        type="button"
+                        className="btn-secondary btn-sm"
+                        onClick={() => downloadWithholdingMushak66Pdf(row.voucherId)}
+                      >
+                        PDF
+                      </button>
+                    ) : (
+                      <span style={{ color: "#94a3b8" }}>—</span>
+                    ),
+                },
+                { key: "note", label: "Note", render: (v) => <span title={v}>{v}</span> },
+              ]}
+            />
+          </div>
+        </div>
+      ) : withholdingRegistersPreviewError ? (
+        <div className="page-card" style={{ marginBottom: "12px" }}>
+          <h4 style={{ marginTop: 0 }}>Withholding registers</h4>
+          <p style={{ color: "#b42318", marginTop: 0, fontSize: 13 }}>{withholdingRegistersPreviewError}</p>
+          <button type="button" className="btn-secondary btn-sm" onClick={previewWithholdingRegisters}>
+            Retry preview
+          </button>
+        </div>
+      ) : null}
+
       <div className="quick-stats" style={{ marginBottom: "12px" }}>
         <div className="stat">Cashiers Tracked: {Number(shrinkageControl.totals?.totalCashiers || 0)}</div>
-        <div className="stat">Sales in Scope: ৳{Number(shrinkageControl.totals?.totalSales || 0).toFixed(2)}</div>
-        <div className="stat">Discount Exposure: ৳{Number(shrinkageControl.totals?.totalDiscount || 0).toFixed(2)}</div>
-        <div className="stat">Return Exposure: ৳{Number(shrinkageControl.totals?.totalReturns || 0).toFixed(2)}</div>
+        <div className="stat">Sales in Scope: {bdt(shrinkageControl.totals?.totalSales)}</div>
+        <div className="stat">Discount Exposure: {bdt(shrinkageControl.totals?.totalDiscount)}</div>
+        <div className="stat">Return Exposure: {bdt(shrinkageControl.totals?.totalReturns)}</div>
         <div className="stat">Override Actions: {Number(shrinkageControl.totals?.totalOverrides || 0)}</div>
       </div>
       <div className="quick-stats" style={{ marginBottom: "12px" }}>
         <div className="stat">Staff Tracked: {Number(staffKpi.summary?.staffCount || 0)}</div>
-        <div className="stat">Staff Sales: ৳{Number(staffKpi.summary?.totalSales || 0).toFixed(2)}</div>
+        <div className="stat">Staff Sales: {bdt(staffKpi.summary?.totalSales)}</div>
         <div className="stat">Invoices: {Number(staffKpi.summary?.totalInvoices || 0)}</div>
       </div>
       <div className="page-card" style={{ marginBottom: "12px" }}>
         <strong>Shrinkage Risk Guide:</strong>{" "}
-        High discount events are flagged at ৳{Number(shrinkageThresholds.discountAlertMin || 0).toFixed(0)}+, high
-        return events at ৳{Number(shrinkageThresholds.returnAlertMin || 0).toFixed(0)}+, and timeline risk becomes
-        critical at ৳{Number(shrinkageThresholds.criticalAmount || 0).toFixed(0)}+.
+        High discount events are flagged at {bdt0(shrinkageThresholds.discountAlertMin)}+, high
+        return events at {bdt0(shrinkageThresholds.returnAlertMin)}+, and timeline risk becomes
+        critical at {bdt0(shrinkageThresholds.criticalAmount)}+.
         <br />
         <small>
           Risk score is based on discount count, price overrides, return count, discount %, and return % relative to
@@ -529,9 +1080,10 @@ function Reports() {
           vatAmountLabel: `৳${Number(row.vatAmount || 0).toFixed(2)}`,
           grossAmountLabel: `৳${Number(row.grossAmount || 0).toFixed(2)}`,
         }))}
-        searchableKeys={["invoiceNo", "date", "customer", "customerPhone"]}
+        searchableKeys={["invoiceNo", "date", "customer", "customerPhone", "saleId"]}
         columns={[
           { key: "serial", label: "SL" },
+          { key: "saleId", label: "Sale ID" },
           { key: "invoiceNo", label: "Invoice" },
           { key: "date", label: "Date" },
           { key: "customer", label: "Customer" },
@@ -539,6 +1091,64 @@ function Reports() {
           { key: "taxableAmountLabel", label: "Taxable Amount" },
           { key: "vatAmountLabel", label: "Output VAT" },
           { key: "grossAmountLabel", label: "Gross Amount" },
+          {
+            key: "mushak63",
+            label: "Mushak 6.3",
+            render: (_, row) => {
+              const sid = row.saleId;
+              const anyBusy = mushak63BusyId !== null;
+              const rowBusy = mushak63BusyId === sid;
+              return (
+                <span style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    disabled={anyBusy}
+                    title="Open in Sale lookup"
+                    onClick={() => openSaleLookupDeepLink(row.invoiceNo, row.saleId)}
+                  >
+                    Lookup
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    disabled={anyBusy}
+                    title="Run NBR completeness check"
+                    onClick={async () => {
+                      setMushak63BusyId(sid);
+                      try {
+                        await runMushak63CompletenessCheck(sid);
+                      } catch (err) {
+                        notifyError(err.response?.data?.error || "Completeness check failed");
+                      } finally {
+                        setMushak63BusyId(null);
+                      }
+                    }}
+                  >
+                    {rowBusy ? "…" : "Check"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    disabled={anyBusy}
+                    title="Download Mushak 6.3 XML"
+                    onClick={async () => {
+                      setMushak63BusyId(sid);
+                      try {
+                        await downloadMushak63XmlWithCompletenessHint(sid);
+                      } catch (err) {
+                        notifyError(err.response?.data?.error || "Unable to download Mushak 6.3 XML");
+                      } finally {
+                        setMushak63BusyId(null);
+                      }
+                    }}
+                  >
+                    {rowBusy ? "…" : "XML"}
+                  </button>
+                </span>
+              );
+            },
+          },
         ]}
       />
       <DataTable
@@ -606,7 +1216,7 @@ function Reports() {
                   display: "inline-block",
                 }}
               >
-                {v?.label || "Low"}
+                {tt(v?.labelKey || "repRiskLow")}
               </span>
             ),
           },
@@ -645,7 +1255,7 @@ function Reports() {
                   display: "inline-block",
                 }}
               >
-                {v?.label || "Low"}
+                {tt(v?.labelKey || "repRiskLow")}
               </span>
             ),
           },
@@ -690,7 +1300,7 @@ function Reports() {
                   display: "inline-block",
                 }}
               >
-                {v?.label || "Low"}
+                {tt(v?.labelKey || "repRiskLow")}
               </span>
             ),
           },
@@ -757,11 +1367,12 @@ function Reports() {
       />
       <div className="quick-stats" style={{ marginBottom: "12px" }}>
         <div className="stat">Cheque Journals: {Number(chequeLedger.summary?.journalCount || 0)}</div>
-        <div className="stat">Total Debit: ৳{Number(chequeLedger.summary?.totalDebit || 0).toFixed(2)}</div>
-        <div className="stat">Total Credit: ৳{Number(chequeLedger.summary?.totalCredit || 0).toFixed(2)}</div>
+        <div className="stat">Total Debit: {bdt(chequeLedger.summary?.totalDebit)}</div>
+        <div className="stat">Total Credit: {bdt(chequeLedger.summary?.totalCredit)}</div>
       </div>
       <div className="form-grid" style={{ marginBottom: "12px" }}>
         <select
+          className="form-select-sm"
           value={chequeLedgerFilter.direction}
           onChange={(e) => setChequeLedgerFilter((prev) => ({ ...prev, direction: e.target.value }))}
         >
@@ -770,6 +1381,7 @@ function Reports() {
           <option value="ISSUED">ISSUED</option>
         </select>
         <select
+          className="form-select-sm"
           value={chequeLedgerFilter.status}
           onChange={(e) => setChequeLedgerFilter((prev) => ({ ...prev, status: e.target.value }))}
         >
@@ -858,6 +1470,7 @@ function Reports() {
           onChange={(e) => setStockValuationFilter((prev) => ({ ...prev, category: e.target.value }))}
         />
         <select
+          className="form-select-sm"
           value={stockValuationFilter.warehouseId}
           onChange={(e) => setStockValuationFilter((prev) => ({ ...prev, warehouseId: e.target.value }))}
         >

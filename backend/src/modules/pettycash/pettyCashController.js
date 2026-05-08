@@ -1,5 +1,5 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
 
 const TXN_TYPES = new Set(["TOPUP", "SPEND", "REPLENISH"]);
@@ -78,6 +78,7 @@ exports.listFunds = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -115,6 +116,7 @@ exports.createFund = async (req, res) => {
     });
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -152,6 +154,7 @@ exports.updateFund = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -174,6 +177,7 @@ exports.listTransactions = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -273,6 +277,7 @@ exports.listClaims = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

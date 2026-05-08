@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
+import { t } from "../i18n";
 
 function ShortcutRow({ keys, description }) {
   return (
@@ -10,7 +11,8 @@ function ShortcutRow({ keys, description }) {
 }
 
 export default function KeyboardShortcutsModal({ open, onClose, lang }) {
-  const bn = lang === "bn";
+  const uiLang = lang === "bn" ? "bn" : "en";
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
 
   useEffect(() => {
     if (!open) return;
@@ -26,7 +28,7 @@ export default function KeyboardShortcutsModal({ open, onClose, lang }) {
 
   if (!open) return null;
 
-  const title = bn ? "কীবোর্ড শর্টকাট" : "Keyboard shortcuts";
+  const title = tt("ksTitle");
 
   return (
     <div
@@ -40,65 +42,22 @@ export default function KeyboardShortcutsModal({ open, onClose, lang }) {
         <div className="shortcuts-modal-head">
           <h3>{title}</h3>
           <button type="button" className="btn-secondary btn-sm" onClick={onClose}>
-            {bn ? "বন্ধ" : "Close"}
+            {tt("ksClose")}
           </button>
         </div>
-        <p className="shortcuts-intro">
-          {bn
-            ? "ইনপুট বা টেক্সট এরিয়াতে টাইপ করার সময় ? খুলবে না।"
-            : "Press ? when focus is not in an input or textarea to open this panel."}
-        </p>
+        <p className="shortcuts-intro">{tt("ksIntro")}</p>
         <div className="shortcuts-section">
-          <div className="shortcuts-section-title">{bn ? "অ্যাপ" : "App"}</div>
-          <ShortcutRow
-            keys="⌘ / Ctrl + K"
-            description={
-              bn ? "সাইডবার মেনু সার্চ ফোকাস" : "Focus sidebar menu search"
-            }
-          />
-          <ShortcutRow
-            keys="Enter"
-            description={
-              bn
-                ? "মেনু সার্চ ফোকাসে থাকলে প্রথম ফলাফল খুলুন"
-                : "While menu search is focused, open the first match"
-            }
-          />
-          <ShortcutRow
-            keys="?"
-            description={
-              bn ? "এই প্যানেল (ইনপুটে না থাকলে)" : "Open this panel (when not typing)"
-            }
-          />
+          <div className="shortcuts-section-title">{tt("ksApp")}</div>
+          <ShortcutRow keys="⌘ / Ctrl + K" description={tt("ksMenuSearchFocus")} />
+          <ShortcutRow keys="Enter" description={tt("ksMenuSearchEnter")} />
+          <ShortcutRow keys="?" description={tt("ksQuestionPanel")} />
         </div>
         <div className="shortcuts-section">
-          <div className="shortcuts-section-title">POS</div>
-          <ShortcutRow
-            keys="F2"
-            description={
-              bn
-                ? "চেকআউট (কার্ট খালি না হলে)"
-                : "Checkout (when cart has lines)"
-            }
-          />
-          <ShortcutRow
-            keys="F4"
-            description={
-              bn ? "সর্বশেষ ইনভয়েস পুনঃপ্রিন্ট" : "Reprint last invoice"
-            }
-          />
-          <ShortcutRow
-            keys="F6"
-            description={
-              bn ? "কার্ট হোল্ড (কার্ট খালি না হলে)" : "Hold cart (when cart has lines)"
-            }
-          />
-          <ShortcutRow
-            keys="F7"
-            description={
-              bn ? "হোল্ড করা কার্ট প্যানেল খুলুন/বন্ধ" : "Toggle held-cart panel"
-            }
-          />
+          <div className="shortcuts-section-title">{tt("ksPos")}</div>
+          <ShortcutRow keys="F2" description={tt("ksCheckout")} />
+          <ShortcutRow keys="F4" description={tt("ksReprintLast")} />
+          <ShortcutRow keys="F6" description={tt("ksHoldCart")} />
+          <ShortcutRow keys="F7" description={tt("ksToggleHeldPanel")} />
         </div>
       </div>
     </div>

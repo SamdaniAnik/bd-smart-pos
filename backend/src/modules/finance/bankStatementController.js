@@ -1,5 +1,5 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
 const VALID_TARGET_TYPES = ["SALE_PAYMENT", "CHEQUE"];
 
@@ -81,6 +81,7 @@ exports.listBankImports = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -149,6 +150,7 @@ exports.createBankImport = async (req, res) => {
     });
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -199,6 +201,7 @@ exports.getBankImportLines = async (req, res) => {
     });
     res.json({ import: parent, lines });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -339,6 +342,7 @@ exports.getChequeReconcileWorkspace = async (req, res) => {
       suggestedJournal,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -771,6 +775,7 @@ exports.deleteBankLineAllocation = async (req, res) => {
     await prisma.bankStatementAllocation.delete({ where: { id: allocId } });
     res.json({ ok: true });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -847,6 +852,7 @@ exports.postReconcileAdjustmentJournal = async (req, res) => {
     });
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -944,6 +950,7 @@ exports.closeBankImport = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -971,6 +978,7 @@ exports.reopenBankImport = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1099,6 +1107,7 @@ exports.getBankReconciliationSnapshot = async (req, res) => {
     summary.matchedPct = summary.totalCredits > 0 ? Number(((summary.totalMatched / summary.totalCredits) * 100).toFixed(2)) : 0;
     res.json({ summary, rows });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1178,6 +1187,7 @@ exports.exportBankReconciliationSnapshotCSV = async (req, res) => {
     res.setHeader("Content-Disposition", 'attachment; filename="bank-reconciliation-snapshot.csv"');
     res.send(csv);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1214,6 +1224,7 @@ exports.flagBankLineException = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1251,6 +1262,7 @@ exports.resolveBankLineException = async (req, res) => {
     });
     res.json(updated);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

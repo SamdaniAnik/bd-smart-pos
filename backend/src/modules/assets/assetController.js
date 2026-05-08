@@ -1,5 +1,5 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
 
 function parseDate(value) {
@@ -38,6 +38,7 @@ exports.listAssets = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -242,6 +243,7 @@ exports.disposeAsset = async (req, res) => {
       },
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -339,6 +341,7 @@ exports.runDepreciation = async (req, res) => {
     });
     res.json(result);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -356,6 +359,7 @@ exports.listDepreciationEntries = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

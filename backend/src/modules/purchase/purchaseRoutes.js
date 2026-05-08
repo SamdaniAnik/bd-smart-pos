@@ -20,6 +20,8 @@ const {
   receivePurchaseInStages,
   exportPurchaseGrnHistoryCSV,
   exportPurchaseGrnHistoryPDF,
+  getOutstandingPurchaseLoans,
+  payPurchaseLoan,
 } = require("./purchaseController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -36,11 +38,13 @@ router.post("/plan-approvals", requireAuth, requirePermission("purchase.create")
 router.get("/plan-approvals", requireAuth, requirePermission("purchase.view"), getPurchasePlanApprovals);
 router.post("/plan-approvals/:id/approve", requireAuth, requirePermission("purchase.create"), approvePurchasePlanApproval);
 router.post("/plan-approvals/:id/reject", requireAuth, requirePermission("purchase.create"), rejectPurchasePlanApproval);
-router.get("/:id", requireAuth, requirePermission("purchase.view"), getPurchaseDetails);
 router.get("/returns", requireAuth, requirePermission("purchase.view"), getPurchaseReturns);
 router.get("/returns/export.csv", requireAuth, requirePermission("purchase.view"), exportPurchaseReturnsCSV);
 router.get("/returns/export.pdf", requireAuth, requirePermission("purchase.view"), exportPurchaseReturnsPDF);
+router.get("/outstanding-loans", requireAuth, requirePermission("purchase.view"), getOutstandingPurchaseLoans);
+router.get("/:id", requireAuth, requirePermission("purchase.view"), getPurchaseDetails);
 router.post("/", requireAuth, requirePermission("purchase.create"), createPurchase);
+router.post("/:id/loan-payment", requireAuth, requirePermission("purchase.create"), payPurchaseLoan);
 router.post("/:id/receive", requireAuth, requirePermission("purchase.create"), receivePurchaseInStages);
 router.get("/:id/grn-history/export.csv", requireAuth, requirePermission("purchase.view"), exportPurchaseGrnHistoryCSV);
 router.get("/:id/grn-history/export.pdf", requireAuth, requirePermission("purchase.view"), exportPurchaseGrnHistoryPDF);

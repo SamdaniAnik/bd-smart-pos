@@ -1,6 +1,38 @@
 const prisma = require("../../utils/prisma");
 const { writeAuditLog } = require("../../utils/audit");
 
+const BDT_DENOMINATIONS = [1000, 500, 200, 100, 50, 20, 10, 5, 2, 1];
+
+function normalizeClosingDenomination(raw) {
+  if (raw == null) return { rows: null, error: null };
+  let parsed = raw;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return { rows: null, error: "Invalid closingDenomination JSON" };
+    }
+  }
+  if (!Array.isArray(parsed)) return { rows: null, error: null };
+  const allowed = new Set(BDT_DENOMINATIONS);
+  const rows = [];
+  for (const x of parsed) {
+    const denomination = Number(x?.denomination ?? x?.value ?? 0);
+    const count = Math.max(0, Math.floor(Number(x?.count ?? x?.qty ?? 0)));
+    if (!count) continue;
+    if (!allowed.has(denomination)) {
+      return { rows: null, error: `Unsupported denomination: ${denomination}` };
+    }
+    rows.push({ denomination, count });
+  }
+  return { rows: rows.length ? rows : null, error: null };
+}
+
+function sumDenominationRows(rows) {
+  if (!rows?.length) return 0;
+  return Number(rows.reduce((sum, r) => sum + Number(r.denomination || 0) * Number(r.count || 0), 0).toFixed(2));
+}
+
 function parsePaymentBreakdown(notes) {
   if (!notes) return [];
   try {
@@ -274,6 +306,17 @@ exports.closeShift = async (req, res) => {
     const branchId = req.branchId;
     const userId = req.user?.id;
     const closingCash = Number(req.body.closingCash || 0);
+    const { rows: denomRows, error: denomError } = normalizeClosingDenomination(req.body.closingDenomination);
+    if (denomError) return res.status(400).json({ error: denomError });
+    if (denomRows) {
+      const sumFromDenom = sumDenominationRows(denomRows);
+      if (Math.abs(sumFromDenom - closingCash) > 0.02) {
+        return res.status(400).json({
+          error: "Counted bill/coin total must match closing cash when a denomination breakdown is sent",
+          meta: { sumFromDenom, closingCash },
+        });
+      }
+    }
     const shift = await prisma.shift.findFirst({
       where: { branchId, userId, closedAt: null },
       orderBy: { openedAt: "desc" },
@@ -324,6 +367,7 @@ exports.closeShift = async (req, res) => {
         closingCash,
         closedAt,
         varianceReason: absVariance > 0 ? varianceReason.slice(0, 191) : null,
+        closingDenomination: denomRows,
       },
     });
     res.json({

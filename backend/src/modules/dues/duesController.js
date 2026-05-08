@@ -1,11 +1,12 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
+const { resolveFundingAccountCode } = require("../../utils/fundingAccount");
 
 exports.getDueSummary = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const [customers, suppliers] = await Promise.all([
+    const [customers, suppliers, loanAgg] = await Promise.all([
       prisma.customer.findMany({
         where: { branchId, balance: { gt: 0 } },
         orderBy: { balance: "desc" },
@@ -14,9 +15,22 @@ exports.getDueSummary = async (req, res) => {
         where: { branchId, payableBalance: { gt: 0 } },
         orderBy: { payableBalance: "desc" },
       }),
+      prisma.purchase.aggregate({
+        where: { branchId, financingSource: "BANK_LOAN", dueAmount: { gt: 0 } },
+        _sum: { dueAmount: true },
+        _count: { id: true },
+      }),
     ]);
-    res.json({ customers, suppliers });
+    res.json({
+      customers,
+      suppliers,
+      purchaseBankLoans: {
+        count: loanAgg._count.id,
+        totalOutstanding: Number(Number(loanAgg._sum.dueAmount || 0).toFixed(2)),
+      },
+    });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -24,9 +38,11 @@ exports.getDueSummary = async (req, res) => {
 exports.collectCustomerDue = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const { customerId, amount, method, note } = req.body;
+    const { customerId, amount, method, note, fundingAccountCode } = req.body;
     const parsedAmount = Number(amount);
     if (!(parsedAmount > 0)) return res.status(400).json({ error: "Amount must be greater than zero" });
+
+    const fundingCode = resolveFundingAccountCode(method, fundingAccountCode);
 
     await ensureOpenFiscalPeriod(branchId);
     const created = await prisma.$transaction(async (tx) => {
@@ -53,9 +69,9 @@ exports.collectCustomerDue = async (req, res) => {
 
       const accounts = await tx.account.findMany({ where: { branchId } });
       const map = new Map(accounts.map((a) => [a.code, a]));
-      const cash = map.get("1100");
+      const funding = map.get(fundingCode);
       const receivable = map.get("1200");
-      if (cash && receivable) {
+      if (funding && receivable) {
         await tx.journal.create({
           data: {
             branchId,
@@ -65,7 +81,7 @@ exports.collectCustomerDue = async (req, res) => {
             narration: `Customer collection ${customer.name}`,
             lines: {
               create: [
-                { accountId: cash.id, debit: parsedAmount, credit: 0 },
+                { accountId: funding.id, debit: parsedAmount, credit: 0 },
                 { accountId: receivable.id, debit: 0, credit: parsedAmount },
               ],
             },
@@ -86,6 +102,7 @@ exports.collectCustomerDue = async (req, res) => {
 
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -93,9 +110,11 @@ exports.collectCustomerDue = async (req, res) => {
 exports.paySupplierDue = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const { supplierId, amount, method, note } = req.body;
+    const { supplierId, amount, method, note, fundingAccountCode } = req.body;
     const parsedAmount = Number(amount);
     if (!(parsedAmount > 0)) return res.status(400).json({ error: "Amount must be greater than zero" });
+
+    const fundingCode = resolveFundingAccountCode(method, fundingAccountCode);
 
     await ensureOpenFiscalPeriod(branchId);
     const created = await prisma.$transaction(async (tx) => {
@@ -122,9 +141,9 @@ exports.paySupplierDue = async (req, res) => {
 
       const accounts = await tx.account.findMany({ where: { branchId } });
       const map = new Map(accounts.map((a) => [a.code, a]));
-      const cash = map.get("1100");
+      const funding = map.get(fundingCode);
       const payable = map.get("2100");
-      if (cash && payable) {
+      if (funding && payable) {
         await tx.journal.create({
           data: {
             branchId,
@@ -135,7 +154,7 @@ exports.paySupplierDue = async (req, res) => {
             lines: {
               create: [
                 { accountId: payable.id, debit: parsedAmount, credit: 0 },
-                { accountId: cash.id, debit: 0, credit: parsedAmount },
+                { accountId: funding.id, debit: 0, credit: parsedAmount },
               ],
             },
           },
@@ -155,6 +174,7 @@ exports.paySupplierDue = async (req, res) => {
 
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -168,6 +188,7 @@ exports.getCustomerCollections = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -181,6 +202,7 @@ exports.getSupplierPayments = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

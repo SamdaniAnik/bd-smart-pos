@@ -186,19 +186,34 @@ exports.updateSupplier = async (req, res) => {
       return res.status(404).json({ error: "Supplier not found" });
     }
 
-    const { name, phone, address } = req.body;
+    const {
+      name,
+      phone,
+      address,
+      tinNumber,
+      binNumber,
+      taxCategory,
+      withholdingExempt,
+      withholdingNote,
+    } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Supplier name must be at least 2 characters" });
     }
 
-    const supplier = await prisma.supplier.update({
-      where: { id },
-      data: {
-        name: String(name).trim(),
-        phone: phone || null,
-        address: address || null,
-      },
-    });
+    const data = {
+      name: String(name).trim(),
+      phone: phone || null,
+      address: address || null,
+    };
+    // Only set the BD-tax fields when present in the body so existing PUT
+    // callers (without tax fields) don't accidentally null them out.
+    if ("tinNumber" in req.body) data.tinNumber = tinNumber || null;
+    if ("binNumber" in req.body) data.binNumber = binNumber || null;
+    if ("taxCategory" in req.body) data.taxCategory = taxCategory || null;
+    if ("withholdingExempt" in req.body) data.withholdingExempt = Boolean(withholdingExempt);
+    if ("withholdingNote" in req.body) data.withholdingNote = withholdingNote || null;
+
+    const supplier = await prisma.supplier.update({ where: { id }, data });
     res.json(supplier);
   } catch (error) {
     res.status(500).json({ error: error.message });

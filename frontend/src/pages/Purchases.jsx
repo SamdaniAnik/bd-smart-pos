@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import Select from "react-select";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import SubmitButton from "../components/SubmitButton";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
 import { createSearchSelectStyles } from "../utils/selectStyles";
 import {
@@ -9,6 +11,7 @@ import {
   notifyPermissionRequired,
   notifySuccess,
 } from "../utils/notify";
+import { getLang, t } from "../i18n";
 
 const PURCHASE_DRAFT_KEY = "bd_pos_purchase_draft_v1";
 const SEARCH_SELECT_STYLES = createSearchSelectStyles(38);
@@ -26,6 +29,18 @@ function Purchases() {
   const canCreatePurchaseReturn = hasPermission("purchase.return", permissions);
   const canExportReports = hasPermission("accounting.report", permissions);
 
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+
   const [purchases, setPurchases] = useState([]);
   const [purchaseReturns, setPurchaseReturns] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
@@ -34,6 +49,10 @@ function Purchases() {
     supplierId: "",
     invoiceNo: "",
     paidAmount: "",
+    financingSource: "SUPPLIER_CREDIT",
+    loanReference: "",
+    loanNote: "",
+    loanMaturityDate: "",
     productId: "",
     qty: "",
     cost: "",
@@ -69,6 +88,18 @@ function Purchases() {
   });
   const [grnReceiveQtyByProduct, setGrnReceiveQtyByProduct] = useState({});
   const [purchasesTab, setPurchasesTab] = useState("create");
+  const [submittingPurchase, setSubmittingPurchase] = useState(false);
+  const [submittingReturn, setSubmittingReturn] = useState(false);
+
+  const branchIdForFiscal = typeof window !== "undefined" ? localStorage.getItem("bd_pos_branch_id") || "1" : "1";
+  const { data: fiscalGateData } = useQuery({
+    queryKey: ["fiscal-gate", branchIdForFiscal],
+    queryFn: async () => (await api.get("/fiscal/fiscal-period-status")).data,
+    staleTime: 45_000,
+    refetchOnWindowFocus: true,
+    retry: 1,
+  });
+  const fiscalBlocked = Boolean(fiscalGateData && fiscalGateData.ok === false);
 
   const load = useCallback(async () => {
     const query = new URLSearchParams();
@@ -147,17 +178,23 @@ function Purchases() {
     () =>
       purchases.map((p) => ({
         value: String(p.id),
-        label: `#${p.id} - ${p.supplier?.name || "Supplier"} - ৳${Number(p.total || 0).toFixed(2)}`,
+        label: `#${p.id} — ${p.supplier?.name || tt("purGenericSupplier")} — ৳${Number(p.total || 0).toFixed(2)}${
+          String(p.financingSource || "").toUpperCase() === "BANK_LOAN" ? ` ${tt("purPurchaseOptLoan")}` : ""
+        }`,
       })),
-    [purchases]
+    [purchases, tt]
   );
   const returnProductOptions = useMemo(
     () =>
       returnItems.map((i) => ({
         value: String(i.productId),
-        label: `Product #${i.productId} (Purchased Qty: ${i.qty}, Cost: ৳${Number(i.cost || 0).toFixed(2)})`,
+        label: tt("purReturnProductOption", {
+          pid: i.productId,
+          qty: i.qty,
+          cost: Number(i.cost || 0).toFixed(2),
+        }),
       })),
-    [returnItems]
+    [returnItems, tt]
   );
 
   const productVatById = useMemo(
@@ -216,7 +253,7 @@ function Purchases() {
     for (const row of draftSuggestions) {
       if (!row.suggestion?.supplierId) continue;
       const id = Number(row.suggestion.supplierId);
-      const label = row.suggestion.supplierName || `Supplier #${id}`;
+      const label = row.suggestion.supplierName || tt("purSupplierNum", { n: id });
       counts.set(id, {
         supplierId: id,
         supplierName: label,
@@ -224,12 +261,16 @@ function Purchases() {
       });
     }
     return [...counts.values()].sort((a, b) => b.count - a.count);
-  }, [draftSuggestions]);
+  }, [draftSuggestions, tt]);
 
   const submit = async (e) => {
     e.preventDefault();
     if (!canManagePurchases) {
-      notifyPermissionRequired("purchase.create.");
+      notifyPermissionRequired(tt("purNeedPermCreate"));
+      return;
+    }
+    if (fiscalBlocked) {
+      notifyActionRequired(fiscalGateData?.message || tt("posFiscalNoPeriod"));
       return;
     }
     const manualLine =
@@ -270,30 +311,45 @@ function Purchases() {
     }
     const lines = [...lineMap.values()].filter((x) => x.qty > 0);
     if (!lines.length) {
-      notifyActionRequired("add at least one purchase line or apply draft items.");
+      notifyActionRequired(tt("purNotifyAddLineOrDraft"));
       return;
     }
-    await api.post("/purchases", {
-      supplierId: Number(form.supplierId),
-      invoiceNo: form.invoiceNo || null,
-      paidAmount: Number(form.paidAmount || 0),
-      items: lines,
-      deferStockPosting: Boolean(form.deferStockPosting),
-    });
-    setForm({
-      supplierId: "",
-      invoiceNo: "",
-      paidAmount: "",
-      productId: "",
-      qty: "",
-      cost: "",
-      vatRate: "",
-      vatType: "EXCLUSIVE",
-      deferStockPosting: false,
-    });
-    setDraftItems([]);
-    localStorage.removeItem(PURCHASE_DRAFT_KEY);
-    load();
+    setSubmittingPurchase(true);
+    try {
+      await api.post("/purchases", {
+        supplierId: Number(form.supplierId),
+        invoiceNo: form.invoiceNo || null,
+        paidAmount: Number(form.paidAmount || 0),
+        financingSource: form.financingSource || "SUPPLIER_CREDIT",
+        loanReference: form.financingSource === "BANK_LOAN" ? form.loanReference?.trim() || null : null,
+        loanNote: form.financingSource === "BANK_LOAN" ? form.loanNote?.trim() || null : null,
+        loanMaturityDate:
+          form.financingSource === "BANK_LOAN" && form.loanMaturityDate ? form.loanMaturityDate : null,
+        items: lines,
+        deferStockPosting: Boolean(form.deferStockPosting),
+      });
+      setForm({
+        supplierId: "",
+        invoiceNo: "",
+        paidAmount: "",
+        financingSource: "SUPPLIER_CREDIT",
+        loanReference: "",
+        loanNote: "",
+        loanMaturityDate: "",
+        productId: "",
+        qty: "",
+        cost: "",
+        vatRate: "",
+        vatType: "EXCLUSIVE",
+        deferStockPosting: false,
+      });
+      setDraftItems([]);
+      localStorage.removeItem(PURCHASE_DRAFT_KEY);
+      await load();
+      notifySuccess(tt("purSuccessPurchaseCreated"));
+    } finally {
+      setSubmittingPurchase(false);
+    }
   };
 
   const createSplitPurchasesBySuggestedSupplier = async () => {
@@ -321,13 +377,15 @@ function Purchases() {
       });
     }
     if (!grouped.size) {
-      notifyActionRequired("no supplier suggestions are available for draft items yet.");
+      notifyActionRequired(tt("purNotifyNoSupplierSuggestions"));
       return;
     }
-    const confirmed = window.confirm(
-      `Create ${grouped.size} purchase bill(s) split by suggested supplier?`
-    );
+    const confirmed = window.confirm(tt("purConfirmSplitBills", { n: grouped.size }));
     if (!confirmed) return;
+    if (fiscalBlocked) {
+      notifyActionRequired(fiscalGateData?.message || tt("posFiscalNoPeriod"));
+      return;
+    }
 
     for (const [supplierId, items] of grouped.entries()) {
       await api.post("/purchases", {
@@ -358,11 +416,11 @@ function Purchases() {
     if (nextDraftItems.length) {
       localStorage.setItem(PURCHASE_DRAFT_KEY, JSON.stringify(nextDraftItems));
       notifySuccess(
-        `created ${grouped.size} purchase bill(s). ${nextDraftItems.length} item(s) remain without suggestions.`
+        tt("purSuccessSplitWithRemain", { bills: grouped.size, items: nextDraftItems.length })
       );
     } else {
       localStorage.removeItem(PURCHASE_DRAFT_KEY);
-      notifySuccess(`created ${grouped.size} purchase bill(s). Draft is now empty.`);
+      notifySuccess(tt("purSuccessSplitDraftEmpty", { bills: grouped.size }));
     }
     await load();
   };
@@ -392,7 +450,7 @@ function Purchases() {
 
   const exportPlan = async (format) => {
     if (!canExportReports) {
-      notifyPermissionRequired("accounting.report to export planning reports.");
+      notifyPermissionRequired(tt("purNeedPermExportPlan"));
       return;
     }
     const query = new URLSearchParams();
@@ -411,27 +469,31 @@ function Purchases() {
 
   const createSplitPurchasesFromPlan = async () => {
     if (!canManagePurchases) {
-      notifyPermissionRequired("purchase.create.");
+      notifyPermissionRequired(tt("purNeedPermCreate"));
       return;
     }
     if (!planReviewRows?.length) {
-      notifyActionRequired("generate a plan first.");
+      notifyActionRequired(tt("purNotifyGenPlanFirst"));
       return;
     }
     const includedRows = planReviewRows.filter((row) => row.include !== false && Number(row.plannedQty || 0) > 0);
     if (!includedRows.length) {
-      notifyActionRequired("include at least one plan row with a valid planned quantity.");
+      notifyActionRequired(tt("purNotifyIncludePlanRow"));
       return;
     }
-    const ok = window.confirm("Create split purchases directly from this plan now?");
+    const ok = window.confirm(tt("purConfirmSplitFromPlan"));
     if (!ok) return;
+    if (fiscalBlocked) {
+      notifyActionRequired(fiscalGateData?.message || tt("posFiscalNoPeriod"));
+      return;
+    }
     await api.post("/purchases/plan-suggestion/create-split", {
       days: Number(optimizationDays || 30),
       leadDays: Number(optimizationLeadDays || 7),
       budget: Number(planBudget || 0),
       rows: includedRows,
     });
-    notifySuccess("split purchases created from plan.");
+    notifySuccess(tt("purSuccessSplitFromPlan"));
     setPlanData({
       summary: { lineCount: 0, supplierCount: 0, totalEstimatedCost: 0, remainingBudget: 0 },
       supplierGroups: [],
@@ -443,45 +505,45 @@ function Purchases() {
 
   const submitPlanForApproval = async () => {
     if (!canManagePurchases) {
-      notifyPermissionRequired("purchase.create.");
+      notifyPermissionRequired(tt("purNeedPermCreate"));
       return;
     }
     if (!planReviewRows?.length) {
-      notifyActionRequired("generate a plan first.");
+      notifyActionRequired(tt("purNotifyGenPlanFirst"));
       return;
     }
     const includedRows = planReviewRows.filter((row) => row.include !== false && Number(row.plannedQty || 0) > 0);
     if (!includedRows.length) {
-      notifyActionRequired("include at least one plan row with a valid planned quantity.");
+      notifyActionRequired(tt("purNotifyIncludePlanRow"));
       return;
     }
-    const note = window.prompt("Approval note (optional):", "") || "";
+    const note = window.prompt(tt("purPromptApprovalNote"), "") || "";
     await api.post("/purchases/plan-approvals", { rows: includedRows, note });
-    notifySuccess("plan submitted for approval.");
+    notifySuccess(tt("purSuccessPlanSubmitted"));
     await load();
   };
 
   const approvePlanRequest = async (approvalId) => {
     if (!canManagePurchases) {
-      notifyPermissionRequired("purchase.create.");
+      notifyPermissionRequired(tt("purNeedPermCreate"));
       return;
     }
-    const pin = window.prompt("Enter manager approval PIN:");
+    const pin = window.prompt(tt("purPromptManagerPin"));
     if (!pin) return;
     await api.post(`/purchases/plan-approvals/${Number(approvalId)}/approve`, { managerApprovalPin: pin });
-    notifySuccess("approval completed and split purchase orders were created.");
+    notifySuccess(tt("purSuccessApprovalCreated"));
     await load();
   };
 
   const rejectPlanRequest = async (approvalId) => {
     if (!canManagePurchases) {
-      notifyPermissionRequired("purchase.create.");
+      notifyPermissionRequired(tt("purNeedPermCreate"));
       return;
     }
-    const reason = (window.prompt("Rejection reason:") || "").trim();
+    const reason = (window.prompt(tt("purPromptRejectReason")) || "").trim();
     if (!reason) return;
     await api.post(`/purchases/plan-approvals/${Number(approvalId)}/reject`, { reason });
-    notifySuccess("approval request rejected.");
+    notifySuccess(tt("purSuccessApprovalRejected"));
     await load();
   };
 
@@ -515,7 +577,7 @@ function Purchases() {
   const applyPlanToDraft = () => {
     const planRows = Array.isArray(planData.rows) ? planData.rows : [];
     if (!planRows.length) {
-      notifyActionRequired("no planned rows are available to apply.");
+      notifyActionRequired(tt("purNotifyNoPlannedRows"));
       return;
     }
     const next = planRows.map((row) => ({
@@ -533,7 +595,7 @@ function Purchases() {
     if (!form.supplierId && planData.supplierGroups?.length === 1) {
       setForm((prev) => ({ ...prev, supplierId: String(planData.supplierGroups[0].supplierId) }));
     }
-    notifySuccess(`applied ${next.length} planned line(s) to draft.`);
+    notifySuccess(tt("purSuccessAppliedDraft", { n: next.length }));
   };
 
   const removeDraftItem = (productId) => {
@@ -557,26 +619,36 @@ function Purchases() {
   const submitReturn = async (e) => {
     e.preventDefault();
     if (!canCreatePurchaseReturn) {
-      notifyPermissionRequired("purchase.return.");
+      notifyPermissionRequired(tt("purNeedPermReturn"));
       return;
     }
-    await api.post(`/purchases/${Number(returnForm.purchaseId)}/return`, {
-      reason: returnForm.reason,
-      items: [
-        {
-          productId: Number(returnForm.productId),
-          qty: Number(returnForm.qty),
-          cost: Number(returnForm.cost),
-        },
-      ],
-    });
-    setReturnForm({ purchaseId: "", productId: "", qty: "", cost: "", reason: "" });
-    load();
+    if (fiscalBlocked) {
+      notifyActionRequired(fiscalGateData?.message || tt("posFiscalNoPeriod"));
+      return;
+    }
+    setSubmittingReturn(true);
+    try {
+      await api.post(`/purchases/${Number(returnForm.purchaseId)}/return`, {
+        reason: returnForm.reason,
+        items: [
+          {
+            productId: Number(returnForm.productId),
+            qty: Number(returnForm.qty),
+            cost: Number(returnForm.cost),
+          },
+        ],
+      });
+      setReturnForm({ purchaseId: "", productId: "", qty: "", cost: "", reason: "" });
+      await load();
+      notifySuccess(tt("purSuccessReturnPosted"));
+    } finally {
+      setSubmittingReturn(false);
+    }
   };
 
   const exportReturns = async (format) => {
     if (!canExportReports) {
-      notifyPermissionRequired("accounting.report to export return reports.");
+      notifyPermissionRequired(tt("purNeedPermExportReturns"));
       return;
     }
     const query = new URLSearchParams();
@@ -624,7 +696,7 @@ function Purchases() {
       setGrnReceiveQtyByProduct(lineMap);
       setPurchaseDetailsModal({ open: true, loading: false, data: res.data });
     } catch (error) {
-      setPurchaseDetailsModal({ open: true, loading: false, data: { error: error?.response?.data?.error || "Failed to load purchase details" } });
+      setPurchaseDetailsModal({ open: true, loading: false, data: { error: error?.response?.data?.error || tt("purErrLoadDetails") } });
     }
   };
 
@@ -635,7 +707,7 @@ function Purchases() {
 
   const submitGrnReceive = async () => {
     if (!canManagePurchases) {
-      notifyPermissionRequired("purchase.create.");
+      notifyPermissionRequired(tt("purNeedPermCreate"));
       return;
     }
     const purchaseId = Number(purchaseDetailsModal.data?.id || 0);
@@ -644,7 +716,7 @@ function Purchases() {
       .map(([productId, qty]) => ({ productId: Number(productId), qty: Number(qty || 0) }))
       .filter((x) => x.productId > 0 && Number.isInteger(x.qty) && x.qty > 0);
     if (!items.length) {
-      notifyActionRequired("enter receiving quantity for at least one line.");
+      notifyActionRequired(tt("purNotifyReceiveQty"));
       return;
     }
     await api.post(`/purchases/${purchaseId}/receive`, { items });
@@ -664,7 +736,7 @@ function Purchases() {
 
   const exportPurchaseGrnHistory = async (format) => {
     if (!canExportReports) {
-      notifyPermissionRequired("accounting.report to export GRN history.");
+      notifyPermissionRequired(tt("purNeedPermExportGrn"));
       return;
     }
     const purchaseId = Number(purchaseDetailsModal.data?.id || 0);
@@ -680,15 +752,21 @@ function Purchases() {
   };
 
   return (
-    <div>
+    <div className="page-stack">
       <div className="page-header">
         <div>
-          <div className="page-title">Purchases</div>
-          <div className="page-subtitle">Step-by-step purchasing workflow</div>
+          <div className="page-title">{tt("purchases")}</div>
+          <div className="page-subtitle">{tt("purchasesPageSubtitle")}</div>
         </div>
       </div>
+      {fiscalBlocked ? (
+        <div className="page-card fiscal-banner">
+          <strong>{tt("purFiscalBannerTitle")}</strong>
+          <p>{fiscalGateData?.message || tt("posFiscalNoPeriod")}</p>
+        </div>
+      ) : null}
       <div className="pos-tabs">
-        <div className="pos-tablist" role="tablist" aria-label="Purchases workflow">
+        <div className="pos-tablist" role="tablist" aria-label={tt("purchasesTabsAria")}>
           <button
             type="button"
             role="tab"
@@ -696,7 +774,7 @@ function Purchases() {
             className={`pos-tab ${purchasesTab === "create" ? "pos-tab-active" : ""}`}
             onClick={() => setPurchasesTab("create")}
           >
-            1. Create Purchase
+            {tt("purTabCreate")}
           </button>
           <button
             type="button"
@@ -705,7 +783,7 @@ function Purchases() {
             className={`pos-tab ${purchasesTab === "planning" ? "pos-tab-active" : ""}`}
             onClick={() => setPurchasesTab("planning")}
           >
-            2. Planning & Supplier Risk
+            {tt("purTabPlanning")}
           </button>
           <button
             type="button"
@@ -714,42 +792,42 @@ function Purchases() {
             className={`pos-tab ${purchasesTab === "history" ? "pos-tab-active" : ""}`}
             onClick={() => setPurchasesTab("history")}
           >
-            3. History & Returns
+            {tt("purTabHistory")}
           </button>
         </div>
       </div>
       {!canManagePurchases ? (
         <div className="page-card" style={{ marginBottom: 10 }}>
-          <strong>Permission required:</strong> <code>purchase.create</code> to create purchases, plan approvals, GRN posting, and split PO actions.
+          <p style={{ margin: 0, fontSize: 13 }}>{tt("purPermBannerCreate")}</p>
         </div>
       ) : null}
       {!canCreatePurchaseReturn && purchasesTab === "history" ? (
         <div className="page-card" style={{ marginBottom: 10 }}>
-          <strong>Permission required:</strong> <code>purchase.return</code> to create purchase returns.
+          <p style={{ margin: 0, fontSize: 13 }}>{tt("purPermBannerReturn")}</p>
         </div>
       ) : null}
       {!canExportReports ? (
         <div className="page-card" style={{ marginBottom: 10 }}>
-          <strong>Permission required:</strong> <code>accounting.report</code> to export plan, return, and GRN report files.
+          <p style={{ margin: 0, fontSize: 13 }}>{tt("purPermBannerExport")}</p>
         </div>
       ) : null}
       {purchasesTab === "planning" ? (
       <div className="page-card" style={{ marginBottom: 10 }}>
-        <h4 style={{ marginTop: 0 }}>Purchase Optimization Controls</h4>
+        <h4 style={{ marginTop: 0 }}>{tt("purOptControlsTitle")}</h4>
         <div className="form-grid">
           <input
             type="number"
             min={7}
             value={optimizationDays}
             onChange={(e) => setOptimizationDays(e.target.value)}
-            placeholder="Sales Lookback Days"
+            placeholder={tt("purPhSalesLookback")}
           />
           <input
             type="number"
             min={1}
             value={optimizationLeadDays}
             onChange={(e) => setOptimizationLeadDays(e.target.value)}
-            placeholder="Lead Days"
+            placeholder={tt("purPhLeadDays")}
           />
           <input
             type="number"
@@ -757,78 +835,78 @@ function Purchases() {
             step="0.01"
             value={planBudget}
             onChange={(e) => setPlanBudget(e.target.value)}
-            placeholder="PO Planning Budget (Optional)"
+            placeholder={tt("purPhPlanBudget")}
           />
           <input
             type="number"
             min={7}
             value={supplierScorecardDays}
             onChange={(e) => setSupplierScorecardDays(e.target.value)}
-            placeholder="Supplier Scorecard Lookback Days"
+            placeholder={tt("purPhScorecardLookback")}
           />
           <button type="button" className="btn-secondary" onClick={generatePurchasePlan}>
-            Generate PO Plan
+            {tt("purBtnGenPlan")}
           </button>
           <button type="button" className="btn-secondary" onClick={applyPlanToDraft}>
-            Apply Plan to Draft
+            {tt("purBtnApplyPlanDraft")}
           </button>
           <button type="button" className="btn-secondary" onClick={() => exportPlan("csv")} disabled={!canExportReports}>
-            Export Plan CSV
+            {tt("purBtnExportPlanCsv")}
           </button>
           <button type="button" className="btn-secondary" onClick={() => exportPlan("pdf")} disabled={!canExportReports}>
-            Export Plan PDF
+            {tt("purBtnExportPlanPdf")}
           </button>
           <button type="button" className="btn-secondary" onClick={createSplitPurchasesFromPlan} disabled={!canManagePurchases}>
-            Create Split POs from Plan
+            {tt("purBtnCreateSplitFromPlan")}
           </button>
           <button type="button" className="btn-secondary" onClick={submitPlanForApproval} disabled={!canManagePurchases}>
-            Submit Plan for Approval
+            {tt("purBtnSubmitPlanApproval")}
           </button>
         </div>
         {planData?.summary ? (
           <div className="quick-stats" style={{ marginTop: 8 }}>
-            <div className="stat">Plan Lines: {Number(planData.summary.lineCount || 0)}</div>
-            <div className="stat">Suppliers: {Number(planData.summary.supplierCount || 0)}</div>
-            <div className="stat">Plan Cost: ৳{Number(planData.summary.totalEstimatedCost || 0).toFixed(2)}</div>
-            <div className="stat">Budget Left: ৳{Number(planData.summary.remainingBudget || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purStatPlanLines")} {Number(planData.summary.lineCount || 0)}</div>
+            <div className="stat">{tt("purStatSuppliers")} {Number(planData.summary.supplierCount || 0)}</div>
+            <div className="stat">{tt("purStatPlanCost")} ৳{Number(planData.summary.totalEstimatedCost || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purStatBudgetLeft")} ৳{Number(planData.summary.remainingBudget || 0).toFixed(2)}</div>
           </div>
         ) : null}
         {planReviewRows.length ? (
           <div className="quick-stats" style={{ marginTop: 8 }}>
-            <div className="stat">Review Lines: {Number(reviewSummary.lineCount || 0)}</div>
-            <div className="stat">Review Suppliers: {Number(reviewSummary.supplierCount || 0)}</div>
-            <div className="stat">Review Cost: ৳{Number(reviewSummary.totalEstimatedCost || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purStatReviewLines")} {Number(reviewSummary.lineCount || 0)}</div>
+            <div className="stat">{tt("purStatReviewSuppliers")} {Number(reviewSummary.supplierCount || 0)}</div>
+            <div className="stat">{tt("purStatReviewCost")} ৳{Number(reviewSummary.totalEstimatedCost || 0).toFixed(2)}</div>
           </div>
         ) : null}
       </div>
       ) : null}
       {purchasesTab === "planning" && planData?.supplierGroups?.length ? (
         <DataTable
-          title="PO Plan by Supplier"
+          title={tt("purDtPlanBySupplier")}
           rows={(planData.supplierGroups || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
           searchableKeys={["supplierName"]}
           columns={[
-            { key: "rowNo", label: "ID" },
-            { key: "supplierName", label: "Supplier" },
-            { key: "lineCount", label: "Lines" },
-            { key: "estimatedCost", label: "Estimated Cost", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "rowNo", label: tt("colId") },
+            { key: "supplierName", label: tt("purColSupplier") },
+            { key: "lineCount", label: tt("purColLines") },
+            { key: "estimatedCost", label: tt("purColEstimatedCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           ]}
         />
       ) : null}
       {purchasesTab === "planning" && planReviewRows?.length ? (
         <DataTable
-          title="Auto PO Planner Lines (Review Mode)"
+          title={tt("purDtPlannerReview")}
           rows={(planReviewRows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
           searchableKeys={["productName", "sku", "supplierName"]}
           columns={[
-            { key: "rowNo", label: "ID" },
-            { key: "productName", label: "Product" },
-            { key: "sku", label: "SKU", render: (v) => v || "-" },
-            { key: "stock", label: "Stock" },
-            { key: "recommendedQty", label: "Recommended" },
+            { key: "rowNo", label: tt("colId") },
+            { key: "productName", label: tt("invColProduct") },
+            { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
+            { key: "stock", label: tt("prodLblStock") },
+            { key: "recommendedQty", label: tt("purColRecommended") },
             {
               key: "plannedQty",
-              label: "Planned Qty",
+              label: tt("purColPlannedQty"),
               render: (v, row) => (
                 <input
                   type="number"
@@ -840,10 +918,10 @@ function Purchases() {
                 />
               ),
             },
-            { key: "supplierName", label: "Supplier" },
+            { key: "supplierName", label: tt("purColSupplier") },
             {
               key: "unitCost",
-              label: "Unit Cost",
+              label: tt("purColUnitCost"),
               render: (v, row) => (
                 <input
                   type="number"
@@ -855,11 +933,11 @@ function Purchases() {
                 />
               ),
             },
-            { key: "estimatedCost", label: "Estimated Cost", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-            { key: "moq", label: "MOQ" },
+            { key: "estimatedCost", label: tt("purColEstimatedCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "moq", label: tt("purColMoq") },
             {
               key: "include",
-              label: "Include",
+              label: tt("purColInclude"),
               render: (v, row) => (
                 <input
                   type="checkbox"
@@ -873,19 +951,19 @@ function Purchases() {
       ) : null}
       {purchasesTab === "planning" && planApprovals?.length ? (
         <DataTable
-          title="PO Plan Approval Queue"
+          title={tt("purDtPlanApprovalQueue")}
           rows={(planApprovals || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
           searchableKeys={["status", "submittedBy", "note"]}
           columns={[
-            { key: "rowNo", label: "ID" },
-            { key: "status", label: "Status" },
-            { key: "submittedBy", label: "Requested By", render: (v) => v || "-" },
-            { key: "lineCount", label: "Lines" },
-            { key: "totalEstimatedCost", label: "Estimated Cost", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-            { key: "note", label: "Note", render: (v) => v || "-" },
+            { key: "rowNo", label: tt("colId") },
+            { key: "status", label: tt("colStatus") },
+            { key: "submittedBy", label: tt("purColRequestedBy"), render: (v) => v || "-" },
+            { key: "lineCount", label: tt("purColLines") },
+            { key: "totalEstimatedCost", label: tt("purColEstimatedCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "note", label: tt("purColNoteShort"), render: (v) => v || "-" },
             {
               key: "action",
-              label: "Action",
+              label: tt("colActions"),
               render: (_, row) =>
                 row.status === "PENDING" ? (
                   <div style={{ display: "flex", gap: 6 }}>
@@ -895,7 +973,7 @@ function Purchases() {
                       onClick={() => approvePlanRequest(row.id)}
                       disabled={!canManagePurchases}
                     >
-                      Approve & Create
+                      {tt("purBtnApproveCreate")}
                     </button>
                     <button
                       type="button"
@@ -903,7 +981,7 @@ function Purchases() {
                       onClick={() => rejectPlanRequest(row.id)}
                       disabled={!canManagePurchases}
                     >
-                      Reject
+                      {tt("invReject")}
                     </button>
                   </div>
                 ) : (
@@ -915,33 +993,33 @@ function Purchases() {
       ) : null}
       {purchasesTab === "planning" ? (
       <div className="page-card" style={{ marginBottom: 10 }}>
-        <h4 style={{ marginTop: 0 }}>Supplier Scorecards with Penalties</h4>
+        <h4 style={{ marginTop: 0 }}>{tt("purScorecardsTitle")}</h4>
         <div className="quick-stats">
-          <div className="stat">Suppliers: {Number(supplierScorecards.summary?.supplierCount || 0)}</div>
-          <div className="stat">Avg Score: {Number(supplierScorecards.summary?.avgScore || 0).toFixed(2)}</div>
-          <div className="stat">High Risk: {Number(supplierScorecards.summary?.highRiskSuppliers || 0)}</div>
-          <div className="stat">Total Spend: ৳{Number(supplierScorecards.summary?.totalSpend || 0).toFixed(2)}</div>
+          <div className="stat">{tt("purStatScoreSuppliers")} {Number(supplierScorecards.summary?.supplierCount || 0)}</div>
+          <div className="stat">{tt("purStatAvgScore")} {Number(supplierScorecards.summary?.avgScore || 0).toFixed(2)}</div>
+          <div className="stat">{tt("purStatHighRisk")} {Number(supplierScorecards.summary?.highRiskSuppliers || 0)}</div>
+          <div className="stat">{tt("purStatTotalSpend")} ৳{Number(supplierScorecards.summary?.totalSpend || 0).toFixed(2)}</div>
         </div>
       </div>
       ) : null}
       {purchasesTab === "planning" && supplierScorecards?.rows?.length ? (
         <DataTable
-          title="Supplier Risk & Penalty Scorecards"
+          title={tt("purDtSupplierRisk")}
           rows={(supplierScorecards.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
           searchableKeys={["supplierName", "riskBand"]}
           columns={[
-            { key: "rowNo", label: "ID" },
-            { key: "supplierName", label: "Supplier" },
-            { key: "purchaseCount", label: "Purchases" },
-            { key: "totalSpend", label: "Spend", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-            { key: "returnRatePct", label: "Return %", render: (v) => `${Number(v || 0).toFixed(2)}%` },
-            { key: "priceVolatilityPct", label: "Price Volatility %", render: (v) => `${Number(v || 0).toFixed(2)}%` },
-            { key: "totalDue", label: "Due", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-            { key: "penaltyPoints", label: "Penalty", render: (v) => Number(v || 0).toFixed(2) },
-            { key: "score", label: "Score", render: (v) => Number(v || 0).toFixed(2) },
+            { key: "rowNo", label: tt("colId") },
+            { key: "supplierName", label: tt("purColSupplier") },
+            { key: "purchaseCount", label: tt("purColPurchaseCount") },
+            { key: "totalSpend", label: tt("purColSpend"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "returnRatePct", label: tt("purColReturnPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+            { key: "priceVolatilityPct", label: tt("purColPriceVolatilityPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+            { key: "totalDue", label: tt("dashDue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "penaltyPoints", label: tt("purColPenaltyPts"), render: (v) => Number(v || 0).toFixed(2) },
+            { key: "score", label: tt("purColScore"), render: (v) => Number(v || 0).toFixed(2) },
             {
               key: "riskBand",
-              label: "Risk",
+              label: tt("purColRiskBand"),
               render: (v) => (
                 <span
                   style={{
@@ -965,59 +1043,71 @@ function Purchases() {
       ) : null}
       {draftItems.length ? (
         <div className="page-card" style={{ marginBottom: 10 }}>
-          <h4>Low-Stock Purchase Draft ({draftItems.length} items)</h4>
+          <h4>{tt("purDraftTitle", { n: draftItems.length })}</h4>
           {draftSupplierSummary.length ? (
             <div style={{ marginBottom: 8 }}>
-              <strong>Suggested Supplier:</strong>{" "}
-              {draftSupplierSummary[0].supplierName} ({draftSupplierSummary[0].count}/{draftItems.length} items)
+              <strong>{tt("purSuggestedSupplier")}</strong>{" "}
+              {draftSupplierSummary[0].supplierName}{" "}
+              ({tt("purDraftCountOf", { a: draftSupplierSummary[0].count, b: draftItems.length })})
               <button
                 type="button"
                 className="btn-secondary btn-sm"
                 style={{ marginLeft: 8 }}
                 onClick={() => applySuggestedSupplier(draftSupplierSummary[0].supplierId)}
               >
-                Use This Supplier
+                {tt("purUseThisSupplier")}
               </button>
               {draftSupplierSummary.length > 1 ? (
                 <span style={{ marginLeft: 8, color: "var(--muted)" }}>
-                  Multiple suppliers detected
+                  {tt("purMultipleSuppliers")}
                 </span>
               ) : null}
             </div>
           ) : (
             <div style={{ marginBottom: 8, color: "var(--muted)" }}>
-              No purchase history match found for draft items.
+              {tt("purNoHistoryMatch")}
             </div>
           )}
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {draftSuggestions.map((x) => (
               <div key={`draft-${x.productId}`} style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                 <span>
-                  {x.productName || `Product #${x.productId}`} · Qty {Number(x.qty || 0)} · Cost ৳
+                  {x.productName || tt("purProductNum", { n: x.productId })} · {tt("purDraftQtyLabel")}{" "}
+                  {Number(x.qty || 0)} · {tt("purDraftCostLabel")} ৳
                   {Number(x.cost || 0).toFixed(2)}
-                  {" · VAT "}
+                  {" · "}
+                  {tt("prodLblVat")}{" "}
                   {Number(
                     x.vatRate != null ? x.vatRate : productVatById.get(Number(x.productId)) || 0
                   ).toFixed(2)}
-                  % ({String(x.vatType || "EXCLUSIVE").toUpperCase() === "INCLUSIVE" ? "Inclusive" : "Exclusive"})
+                  % (
+                  {String(x.vatType || "EXCLUSIVE").toUpperCase() === "INCLUSIVE"
+                    ? tt("purVatInclusiveShort")
+                    : tt("purVatExclusiveShort")}
+                  )
                   {x.suggestion ? (
                     <span style={{ color: "var(--muted)" }}>
                       {" "}
-                      · Suggested: {x.suggestion.supplierName || `Supplier #${x.suggestion.supplierId}`} (last ৳
-                      {Number(x.suggestion.lastCost || 0).toFixed(2)})
-                      {Number(x.suggestion.moq || 0) > 1 ? ` · MOQ ${Number(x.suggestion.moq)}` : ""}
+                      ·{" "}
+                      {tt("purSuggestedLine", {
+                        name: x.suggestion.supplierName || tt("purSupplierNum", { n: x.suggestion.supplierId }),
+                        cost: Number(x.suggestion.lastCost || 0).toFixed(2),
+                      })}
+                      {Number(x.suggestion.moq || 0) > 1
+                        ? ` · ${tt("purSuggestedMoq", { n: Number(x.suggestion.moq) })}`
+                        : ""}
                     </span>
                   ) : null}
                   {x.optimization ? (
                     <span style={{ color: "var(--muted)" }}>
                       {" "}
-                      · Reorder suggestion qty: {Number(x.optimization.recommendedQty || 0)}
+                      · {tt("purReorderQtyLabel")} {Number(x.optimization.recommendedQty || 0)}
                     </span>
                   ) : null}
                   {x.suggestion?.moq && Number(x.qty || 0) < Number(x.suggestion.moq) ? (
                     <span style={{ color: "#b91c1c" }}>
                       {" "}
-                      · MOQ warning: draft qty below MOQ ({Number(x.suggestion.moq)})
+                      · {tt("purMoqWarning", { n: Number(x.suggestion.moq) })}
                     </span>
                   ) : null}
                 </span>
@@ -1028,18 +1118,18 @@ function Purchases() {
                       className="btn-secondary btn-sm"
                       onClick={() => applySuggestedSupplier(x.suggestion.supplierId)}
                     >
-                      Use Best Supplier
+                      {tt("purUseBestSupplier")}
                     </button>
                   ) : null}
                   <button type="button" className="btn-secondary btn-sm" onClick={() => removeDraftItem(x.productId)}>
-                    Remove
+                    {tt("purRemove")}
                   </button>
                 </div>
               </div>
             ))}
           </div>
           <button type="button" className="btn-secondary btn-sm" onClick={clearDraftItems} style={{ marginTop: 8 }}>
-            Clear Draft
+            {tt("purClearDraft")}
           </button>
           <button
             type="button"
@@ -1048,7 +1138,7 @@ function Purchases() {
             disabled={!canManagePurchases}
             style={{ marginTop: 8, marginLeft: 8 }}
           >
-            Auto Split & Create Bills
+            {tt("purAutoSplitBills")}
           </button>
         </div>
       ) : null}
@@ -1059,13 +1149,66 @@ function Purchases() {
           value={supplierOptions.find((opt) => opt.value === String(form.supplierId)) || null}
           options={supplierOptions}
           onChange={(opt) => setForm({ ...form, supplierId: opt?.value || "" })}
-          placeholder="Select Supplier"
+          placeholder={tt("purPhSelectSupplier")}
           isClearable
           isSearchable
           styles={SEARCH_SELECT_STYLES}
         />
-        <input placeholder="Invoice Number" value={form.invoiceNo} onChange={(e) => setForm({ ...form, invoiceNo: e.target.value })} />
-        <input placeholder="Paid Amount (BDT)" value={form.paidAmount} onChange={(e) => setForm({ ...form, paidAmount: e.target.value })} />
+        <input
+          placeholder={tt("purPhInvoiceNo")}
+          value={form.invoiceNo}
+          onChange={(e) => setForm({ ...form, invoiceNo: e.target.value })}
+        />
+        <label style={{ gridColumn: "1 / -1", display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>{tt("purLblFinancing")}</span>
+          <select
+            className="form-select-sm"
+            value={form.financingSource}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                financingSource: e.target.value,
+                ...(e.target.value !== "BANK_LOAN"
+                  ? { loanReference: "", loanNote: "", loanMaturityDate: "" }
+                  : {}),
+              })
+            }
+          >
+            <option value="SUPPLIER_CREDIT">{tt("purFinSupplierCredit")}</option>
+            <option value="BANK_LOAN">{tt("purFinBankLoan")}</option>
+          </select>
+        </label>
+        {form.financingSource === "BANK_LOAN" ? (
+          <>
+            <input
+              placeholder={tt("purPhLoanRef")}
+              value={form.loanReference}
+              onChange={(e) => setForm({ ...form, loanReference: e.target.value })}
+            />
+            <input
+              type="date"
+              title={tt("purTitleLoanMaturity")}
+              value={form.loanMaturityDate}
+              onChange={(e) => setForm({ ...form, loanMaturityDate: e.target.value })}
+            />
+            <input
+              placeholder={tt("purPhNoteOptional")}
+              value={form.loanNote}
+              onChange={(e) => setForm({ ...form, loanNote: e.target.value })}
+              style={{ gridColumn: "1 / -1" }}
+            />
+          </>
+        ) : null}
+        <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>
+            {form.financingSource === "BANK_LOAN" ? tt("purLblPaidBank") : tt("purLblPaidSupplier")}
+          </span>
+          <input
+            placeholder={form.financingSource === "BANK_LOAN" ? tt("purPhPaidFullLoan") : tt("purPhPaidFullCredit")}
+            value={form.paidAmount}
+            onChange={(e) => setForm({ ...form, paidAmount: e.target.value })}
+          />
+        </label>
         <Select
           className="form-select-sm"
           value={productOptions.find((opt) => opt.value === String(form.productId)) || null}
@@ -1092,15 +1235,23 @@ function Purchases() {
               vatType: "EXCLUSIVE",
             });
           }}
-          placeholder="Select Product"
+          placeholder={tt("purPhSelectProduct")}
           isClearable
           isSearchable
           styles={SEARCH_SELECT_STYLES}
         />
-        <input placeholder="Quantity" value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} />
-        <input placeholder="Unit Cost" value={form.cost} onChange={(e) => setForm({ ...form, cost: e.target.value })} />
         <input
-          placeholder="VAT %"
+          placeholder={tt("purPhQuantity")}
+          value={form.qty}
+          onChange={(e) => setForm({ ...form, qty: e.target.value })}
+        />
+        <input
+          placeholder={tt("purPhUnitCostShort")}
+          value={form.cost}
+          onChange={(e) => setForm({ ...form, cost: e.target.value })}
+        />
+        <input
+          placeholder={tt("purPhVatPct")}
           type="number"
           min={0}
           step={0.01}
@@ -1108,11 +1259,12 @@ function Purchases() {
           onChange={(e) => setForm({ ...form, vatRate: e.target.value })}
         />
         <select
+          className="form-select-sm"
           value={form.vatType}
           onChange={(e) => setForm({ ...form, vatType: e.target.value })}
         >
-          <option value="EXCLUSIVE">VAT Exclusive</option>
-          <option value="INCLUSIVE">VAT Inclusive</option>
+          <option value="EXCLUSIVE">{tt("purVatExclusiveOpt")}</option>
+          <option value="INCLUSIVE">{tt("purVatInclusiveOpt")}</option>
         </select>
         <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <input
@@ -1120,34 +1272,44 @@ function Purchases() {
             checked={Boolean(form.deferStockPosting)}
             onChange={(e) => setForm({ ...form, deferStockPosting: e.target.checked })}
           />
-          Defer stock posting (Receive by GRN)
+          {tt("purDeferStockGrn")}
         </label>
-        <button type="submit" disabled={!canManagePurchases}>Create Purchase</button>
+        <SubmitButton loading={submittingPurchase} loadingLabel={tt("purCreatingPurchase")} disabled={!canManagePurchases}>
+          {tt("purBtnCreatePurchase")}
+        </SubmitButton>
       </form>
       ) : null}
       {purchasesTab === "create" && form.productId ? (
         <div className="page-card" style={{ marginTop: 8 }}>
           {(() => {
             const rec = optimizationRows.find((x) => Number(x.productId) === Number(form.productId));
-            if (!rec) return <p className="pos-inline-note">No optimization data yet for selected product.</p>;
+            if (!rec) return <p className="pos-inline-note">{tt("purNoOptProduct")}</p>;
             return (
               <>
                 <p>
-                  <strong>Velocity:</strong> Sold {Number(rec.soldQty || 0)} in period, Avg/day {Number(rec.avgDailySold || 0).toFixed(2)}
+                  <strong>{tt("purLblVelocity")}</strong>{" "}
+                  {tt("purVelocityLine", {
+                    sold: Number(rec.soldQty || 0),
+                    avg: Number(rec.avgDailySold || 0).toFixed(2),
+                  })}
                 </p>
                 <p>
-                  <strong>Suggested reorder:</strong> {Number(rec.recommendedQty || 0)}
+                  <strong>{tt("purLblSuggestedReorder")}</strong> {Number(rec.recommendedQty || 0)}
                 </p>
                 {rec.bestSupplier ? (
                   <p>
-                    <strong>Best Supplier:</strong> {rec.bestSupplier.supplierName} · Avg Cost ৳
-                    {Number(rec.bestSupplier.avgCost || 0).toFixed(2)} · MOQ {Number(rec.bestSupplier.moq || 1)}
+                    <strong>{tt("purLblBestSupplier")}</strong>{" "}
+                    {tt("purBestSupplierDetail", {
+                      name: rec.bestSupplier.supplierName,
+                      cost: Number(rec.bestSupplier.avgCost || 0).toFixed(2),
+                      moq: Number(rec.bestSupplier.moq || 1),
+                    })}
                     {Number(form.qty || 0) > 0 && Number(form.qty || 0) < Number(rec.bestSupplier.moq || 1) ? (
-                      <span style={{ color: "#b91c1c" }}> (Entered quantity is below MOQ)</span>
+                      <span style={{ color: "#b91c1c" }}> {tt("purQtyBelowMoq")}</span>
                     ) : null}
                   </p>
                 ) : (
-                  <p className="pos-inline-note">No supplier price history found for this product.</p>
+                  <p className="pos-inline-note">{tt("purNoSupplierHistory")}</p>
                 )}
               </>
             );
@@ -1155,7 +1317,7 @@ function Purchases() {
         </div>
       ) : null}
 
-      {purchasesTab === "history" ? <h4 style={{ marginTop: 8 }}>Purchase Return</h4> : null}
+      {purchasesTab === "history" ? <h4 style={{ marginTop: 8 }}>{tt("purReturnSectionTitle")}</h4> : null}
       {purchasesTab === "history" ? (
       <form onSubmit={submitReturn} className="form-grid">
         <Select
@@ -1171,7 +1333,7 @@ function Purchases() {
               cost: "",
             })
           }
-          placeholder="Select Purchase"
+          placeholder={tt("purPhSelectPurchase")}
           isClearable
           isSearchable
           styles={SEARCH_SELECT_STYLES}
@@ -1181,28 +1343,42 @@ function Purchases() {
           value={returnProductOptions.find((opt) => opt.value === String(returnForm.productId)) || null}
           options={returnProductOptions}
           onChange={(opt) => setReturnForm({ ...returnForm, productId: opt?.value || "" })}
-          placeholder="Select Product"
+          placeholder={tt("purPhSelectProduct")}
           isClearable
           isSearchable
           styles={SEARCH_SELECT_STYLES}
         />
-        <input placeholder="Return Quantity" value={returnForm.qty} onChange={(e) => setReturnForm({ ...returnForm, qty: e.target.value })} />
-        <input placeholder="Return Unit Cost" value={returnForm.cost} onChange={(e) => setReturnForm({ ...returnForm, cost: e.target.value })} />
-        <input placeholder="Reason" value={returnForm.reason} onChange={(e) => setReturnForm({ ...returnForm, reason: e.target.value })} />
-        <button type="submit" disabled={!canCreatePurchaseReturn}>Create Purchase Return</button>
+        <input
+          placeholder={tt("purPhReturnQty")}
+          value={returnForm.qty}
+          onChange={(e) => setReturnForm({ ...returnForm, qty: e.target.value })}
+        />
+        <input
+          placeholder={tt("purPhReturnUnitCost")}
+          value={returnForm.cost}
+          onChange={(e) => setReturnForm({ ...returnForm, cost: e.target.value })}
+        />
+        <input
+          placeholder={tt("purPhReason")}
+          value={returnForm.reason}
+          onChange={(e) => setReturnForm({ ...returnForm, reason: e.target.value })}
+        />
+        <SubmitButton loading={submittingReturn} loadingLabel={tt("purPostingReturn")} disabled={!canCreatePurchaseReturn}>
+          {tt("purBtnCreateReturn")}
+        </SubmitButton>
       </form>
       ) : null}
       {purchasesTab === "history" ? (
       <div className="quick-stats">
-        <div className="stat">Bills: {purchases.length}</div>
-        <div className="stat">Total: ৳{purchases.reduce((s, p) => s + Number(p.total), 0).toFixed(2)}</div>
-        <div className="stat">Paid: ৳{purchases.reduce((s, p) => s + Number(p.paidAmount), 0).toFixed(2)}</div>
-        <div className="stat">Due: ৳{purchases.reduce((s, p) => s + Number(p.dueAmount), 0).toFixed(2)}</div>
+        <div className="stat">{tt("purStatBills")} {purchases.length}</div>
+        <div className="stat">{tt("purStatPurchaseTotal")} ৳{purchases.reduce((s, p) => s + Number(p.total), 0).toFixed(2)}</div>
+        <div className="stat">{tt("purStatPurchasePaid")} ৳{purchases.reduce((s, p) => s + Number(p.paidAmount), 0).toFixed(2)}</div>
+        <div className="stat">{tt("purStatPurchaseDue")} ৳{purchases.reduce((s, p) => s + Number(p.dueAmount), 0).toFixed(2)}</div>
       </div>
       ) : null}
       {purchasesTab === "history" ? (
       <DataTable
-        title="Purchase History"
+        title={tt("purDtPurchaseHistory")}
         rows={purchases.map((p) => ({
           ...p,
           supplierName: p.supplier?.name || "-",
@@ -1212,12 +1388,13 @@ function Purchases() {
           grossAmount: Number(p.vatBreakdown?.grossAmount || p.total || 0).toFixed(2),
           receiveStatus: p.receiving?.status || "PENDING",
           remainingQty: Number(p.receiving?.remainingQtyTotal || 0),
+          financeLabel: String(p.financingSource || "SUPPLIER_CREDIT").toUpperCase() === "BANK_LOAN" ? tt("purFinanceLoan") : tt("purFinanceCredit"),
         }))}
-        searchableKeys={["supplierName", "invoiceNo", "createdAtLabel"]}
+        searchableKeys={["supplierName", "invoiceNo", "createdAtLabel", "financeLabel"]}
         filters={[
           {
             key: "supplierName",
-            label: "Supplier",
+            label: tt("purColSupplier"),
             options: [...new Set(purchases.map((p) => p.supplier?.name).filter(Boolean))].map((x) => ({
               label: x,
               value: x,
@@ -1225,24 +1402,25 @@ function Purchases() {
           },
         ]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "createdAtLabel", label: "Date" },
-          { key: "supplierName", label: "Supplier" },
-          { key: "invoiceNo", label: "Invoice", render: (v) => v || "-" },
-          { key: "total", label: "Total", render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "taxableAmount", label: "Taxable", render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "inputVat", label: "Input VAT", render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "grossAmount", label: "Gross", render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "receiveStatus", label: "Receive Status", render: (v) => v || "-" },
-          { key: "remainingQty", label: "Pending Qty", render: (v) => Number(v || 0) },
-          { key: "paidAmount", label: "Paid", render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "dueAmount", label: "Due", render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "id", label: tt("colId") },
+          { key: "createdAtLabel", label: tt("receiptDate") },
+          { key: "supplierName", label: tt("purColSupplier") },
+          { key: "invoiceNo", label: tt("receiptInvoice"), render: (v) => v || "-" },
+          { key: "financeLabel", label: tt("purColFinance"), render: (v) => v || "-" },
+          { key: "total", label: tt("receiptTotal"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "taxableAmount", label: tt("purColTaxable"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "inputVat", label: tt("purColInputVat"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "grossAmount", label: tt("purColGross"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "receiveStatus", label: tt("purColReceiveStatus"), render: (v) => v || "-" },
+          { key: "remainingQty", label: tt("purColPendingQty"), render: (v) => Number(v || 0) },
+          { key: "paidAmount", label: tt("dashPaid"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "dueAmount", label: tt("dashDue"), render: (v) => `৳${Number(v).toFixed(2)}` },
           {
             key: "actions",
-            label: "Actions",
+            label: tt("colActions"),
             render: (_, row) => (
               <button type="button" className="btn-secondary btn-sm" onClick={() => openPurchaseDetails(row)}>
-                Details
+                {tt("purBtnDetails")}
               </button>
             ),
           },
@@ -1251,7 +1429,7 @@ function Purchases() {
       ) : null}
       {purchasesTab === "history" ? (
       <DataTable
-        title="Purchase Return History"
+        title={tt("purDtReturnHistory")}
         rows={purchaseReturns.map((r) => ({
           ...r,
           purchaseId: r.purchase?.id || r.purchaseId,
@@ -1263,7 +1441,7 @@ function Purchases() {
         filters={[
           {
             key: "supplierName",
-            label: "Supplier",
+            label: tt("purColSupplier"),
             options: [...new Set(purchaseReturns.map((r) => r.purchase?.supplier?.name).filter(Boolean))].map((x) => ({
               label: x,
               value: x,
@@ -1271,13 +1449,13 @@ function Purchases() {
           },
         ]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "purchaseId", label: "Purchase ID" },
-          { key: "invoiceNo", label: "Invoice" },
-          { key: "supplierName", label: "Supplier" },
-          { key: "amount", label: "Amount", render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "reason", label: "Reason", render: (v) => v || "-" },
-          { key: "createdAtLabel", label: "Date" },
+          { key: "id", label: tt("colId") },
+          { key: "purchaseId", label: tt("purColPurchaseId") },
+          { key: "invoiceNo", label: tt("receiptInvoice") },
+          { key: "supplierName", label: tt("purColSupplier") },
+          { key: "amount", label: tt("receiptAmount"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "reason", label: tt("invColReason"), render: (v) => v || "-" },
+          { key: "createdAtLabel", label: tt("receiptDate") },
         ]}
       />
       ) : null}
@@ -1294,19 +1472,19 @@ function Purchases() {
           onChange={(e) => setReturnRange((prev) => ({ ...prev, to: e.target.value }))}
         />
         <button type="button" className="btn-secondary" onClick={() => setReturnPresetRange("today")}>
-          Today
+          {tt("purBtnToday")}
         </button>
         <button type="button" className="btn-secondary" onClick={() => setReturnPresetRange("last7")}>
-          Last 7 Days
+          {tt("purBtnLast7Days")}
         </button>
         <button type="button" className="btn-secondary" onClick={() => setReturnPresetRange("month")}>
-          This Month
+          {tt("purBtnThisMonth")}
         </button>
         <button type="button" className="btn-secondary" onClick={() => setReturnPresetRange("clear")}>
-          Clear Range
+          {tt("purBtnClearRange")}
         </button>
-        <button type="button" onClick={() => exportReturns("csv")} disabled={!canExportReports}>Export Returns CSV</button>
-        <button type="button" className="btn-secondary" onClick={() => exportReturns("pdf")} disabled={!canExportReports}>Export Returns PDF</button>
+        <button type="button" onClick={() => exportReturns("csv")} disabled={!canExportReports}>{tt("purBtnExportReturnsCsv")}</button>
+        <button type="button" className="btn-secondary" onClick={() => exportReturns("pdf")} disabled={!canExportReports}>{tt("purBtnExportReturnsPdf")}</button>
       </div>
       ) : null}
       {purchaseDetailsModal.open ? (
@@ -1317,29 +1495,53 @@ function Purchases() {
             style={{ maxWidth: 980 }}
           >
             <div className="shortcuts-modal-head">
-              <h3>Purchase VAT Details</h3>
+              <h3>{tt("purModalVatTitle")}</h3>
               <button type="button" className="btn-secondary btn-sm" onClick={closePurchaseDetails}>
-                Close
+                {tt("ksClose")}
               </button>
             </div>
             {purchaseDetailsModal.loading ? (
-              <p className="text-muted">Loading...</p>
+              <p className="text-muted">{tt("purModalLoading")}</p>
             ) : purchaseDetailsModal.data?.error ? (
               <p style={{ color: "#b91c1c" }}>{purchaseDetailsModal.data.error}</p>
             ) : (
               <>
                 <div className="quick-stats" style={{ marginBottom: 8 }}>
-                  <div className="stat">Purchase ID: {purchaseDetailsModal.data?.id}</div>
-                  <div className="stat">Invoice: {purchaseDetailsModal.data?.invoiceNo || "-"}</div>
-                  <div className="stat">Supplier: {purchaseDetailsModal.data?.supplier?.name || "-"}</div>
-                  <div className="stat">Taxable: ৳{Number(purchaseDetailsModal.data?.vatBreakdown?.taxableAmount || 0).toFixed(2)}</div>
-                  <div className="stat">Input VAT: ৳{Number(purchaseDetailsModal.data?.vatBreakdown?.inputVat || 0).toFixed(2)}</div>
-                  <div className="stat">Gross: ৳{Number(purchaseDetailsModal.data?.vatBreakdown?.grossAmount || 0).toFixed(2)}</div>
-                  <div className="stat">Receive: {purchaseDetailsModal.data?.receiving?.status || "-"}</div>
-                  <div className="stat">Pending Quantity: {Number(purchaseDetailsModal.data?.receiving?.remainingQtyTotal || 0)}</div>
+                  <div className="stat">{tt("purMdlPurchaseId")} {purchaseDetailsModal.data?.id}</div>
+                  <div className="stat">{tt("purMdlInvoice")} {purchaseDetailsModal.data?.invoiceNo || "-"}</div>
+                  <div className="stat">{tt("purMdlSupplier")} {purchaseDetailsModal.data?.supplier?.name || "-"}</div>
+                  <div className="stat">
+                    {tt("purMdlFinance")}{" "}
+                    {String(purchaseDetailsModal.data?.financingSource || "SUPPLIER_CREDIT").toUpperCase() === "BANK_LOAN"
+                      ? tt("purMdlBankLoan")
+                      : tt("purMdlSupplierCredit")}
+                  </div>
+                  {String(purchaseDetailsModal.data?.financingSource || "").toUpperCase() === "BANK_LOAN" &&
+                  (purchaseDetailsModal.data?.loanReference || purchaseDetailsModal.data?.loanMaturityDate || purchaseDetailsModal.data?.loanNote) ? (
+                    <>
+                      {purchaseDetailsModal.data?.loanReference ? (
+                        <div className="stat">{tt("purMdlLoanRef")} {purchaseDetailsModal.data.loanReference}</div>
+                      ) : null}
+                      {purchaseDetailsModal.data?.loanMaturityDate ? (
+                        <div className="stat">
+                          {tt("purMdlMaturity")} {new Date(purchaseDetailsModal.data.loanMaturityDate).toLocaleDateString()}
+                        </div>
+                      ) : null}
+                      {purchaseDetailsModal.data?.loanNote ? (
+                        <div className="stat" style={{ gridColumn: "1 / -1" }}>
+                          {tt("purMdlNote")} {purchaseDetailsModal.data.loanNote}
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                  <div className="stat">{tt("purColTaxable")}: ৳{Number(purchaseDetailsModal.data?.vatBreakdown?.taxableAmount || 0).toFixed(2)}</div>
+                  <div className="stat">{tt("purColInputVat")}: ৳{Number(purchaseDetailsModal.data?.vatBreakdown?.inputVat || 0).toFixed(2)}</div>
+                  <div className="stat">{tt("purColGross")}: ৳{Number(purchaseDetailsModal.data?.vatBreakdown?.grossAmount || 0).toFixed(2)}</div>
+                  <div className="stat">{tt("purMdlReceive")} {purchaseDetailsModal.data?.receiving?.status || "-"}</div>
+                  <div className="stat">{tt("purMdlPendingQty")} {Number(purchaseDetailsModal.data?.receiving?.remainingQtyTotal || 0)}</div>
                 </div>
                 <DataTable
-                  title="Line-wise VAT Trace"
+                  title={tt("purDtVatTrace")}
                   rows={(purchaseDetailsModal.data?.vatLines || []).map((line, idx) => ({
                     rowNo: idx + 1,
                     ...line,
@@ -1347,37 +1549,37 @@ function Purchases() {
                   searchableKeys={["productName", "vatType"]}
                   pageSize={5}
                   columns={[
-                    { key: "rowNo", label: "SL" },
-                    { key: "productName", label: "Product" },
-                    { key: "qty", label: "Qty" },
-                    { key: "cost", label: "Unit Cost", render: (v) => `৳${Number(v).toFixed(2)}` },
-                    { key: "vatRate", label: "VAT %" },
-                    { key: "vatType", label: "VAT Type" },
-                    { key: "taxableAmount", label: "Taxable", render: (v) => `৳${Number(v).toFixed(2)}` },
-                    { key: "vatAmount", label: "VAT", render: (v) => `৳${Number(v).toFixed(2)}` },
-                    { key: "grossAmount", label: "Gross", render: (v) => `৳${Number(v).toFixed(2)}` },
+                    { key: "rowNo", label: tt("purColSl") },
+                    { key: "productName", label: tt("invColProduct") },
+                    { key: "qty", label: tt("receiptQty") },
+                    { key: "cost", label: tt("purPhUnitCostShort"), render: (v) => `৳${Number(v).toFixed(2)}` },
+                    { key: "vatRate", label: tt("prodLblVat") },
+                    { key: "vatType", label: tt("purColVatType") },
+                    { key: "taxableAmount", label: tt("purColTaxable"), render: (v) => `৳${Number(v).toFixed(2)}` },
+                    { key: "vatAmount", label: tt("receiptVat"), render: (v) => `৳${Number(v).toFixed(2)}` },
+                    { key: "grossAmount", label: tt("purColGross"), render: (v) => `৳${Number(v).toFixed(2)}` },
                   ]}
                 />
                 <DataTable
-                  title="GRN Receiving Progress"
+                  title={tt("purDtGrnProgress")}
                   rows={(purchaseDetailsModal.data?.receiving?.rows || []).map((line, idx) => ({
                     rowNo: idx + 1,
                     ...line,
                     productName:
                       (purchaseDetailsModal.data?.vatLines || []).find((x) => Number(x.productId) === Number(line.productId))?.productName ||
-                      `Product #${line.productId}`,
+                      tt("purProductNum", { n: line.productId }),
                   }))}
                   searchableKeys={["productName"]}
                   pageSize={5}
                   columns={[
-                    { key: "rowNo", label: "SL" },
-                    { key: "productName", label: "Product" },
-                    { key: "orderedQty", label: "Ordered" },
-                    { key: "receivedQty", label: "Received" },
-                    { key: "remainingQty", label: "Remaining" },
+                    { key: "rowNo", label: tt("purColSl") },
+                    { key: "productName", label: tt("invColProduct") },
+                    { key: "orderedQty", label: tt("purColOrdered") },
+                    { key: "receivedQty", label: tt("purColReceived") },
+                    { key: "remainingQty", label: tt("purColRemaining") },
                     {
                       key: "receiveNow",
-                      label: "Receive Now",
+                      label: tt("purColReceiveNow"),
                       render: (_, row) => (
                         <input
                           type="number"
@@ -1398,10 +1600,10 @@ function Purchases() {
                 />
                 <div style={{ marginTop: 8 }}>
                   <button type="button" className="btn-secondary btn-sm" onClick={receiveAllRemaining} style={{ marginRight: 6 }}>
-                    Receive All Remaining
+                    {tt("purBtnReceiveAllRemaining")}
                   </button>
                   <button type="button" className="btn-secondary btn-sm" onClick={submitGrnReceive} disabled={!canManagePurchases}>
-                    Post GRN Receive
+                    {tt("purBtnPostGrn")}
                   </button>
                   <button
                     type="button"
@@ -1410,7 +1612,7 @@ function Purchases() {
                     disabled={!canExportReports}
                     style={{ marginLeft: 6 }}
                   >
-                    Export GRN CSV
+                    {tt("purBtnExportGrnCsv")}
                   </button>
                   <button
                     type="button"
@@ -1419,7 +1621,7 @@ function Purchases() {
                     disabled={!canExportReports}
                     style={{ marginLeft: 6 }}
                   >
-                    Export GRN PDF
+                    {tt("purBtnExportGrnPdf")}
                   </button>
                 </div>
               </>

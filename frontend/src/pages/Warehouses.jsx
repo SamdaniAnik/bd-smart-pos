@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import SubmitButton from "../components/SubmitButton";
 
 function Warehouses() {
   const [warehouses, setWarehouses] = useState([]);
   const [form, setForm] = useState({ name: "" });
   const [editingId, setEditingId] = useState(null);
   const [selected, setSelected] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
 
   const load = async () => {
     const res = await api.get("/warehouses");
@@ -20,15 +22,20 @@ function Warehouses() {
   const submit = async (e) => {
     e.preventDefault();
     const payload = { name: form.name.trim() };
-    if (editingId) {
-      await api.put(`/warehouses/${editingId}`, payload);
-    } else {
-      await api.post("/warehouses", payload);
+    setSubmitting(true);
+    try {
+      if (editingId) {
+        await api.put(`/warehouses/${editingId}`, payload);
+      } else {
+        await api.post("/warehouses", payload);
+      }
+      setForm({ name: "" });
+      setEditingId(null);
+      setSelected(null);
+      await load();
+    } finally {
+      setSubmitting(false);
     }
-    setForm({ name: "" });
-    setEditingId(null);
-    setSelected(null);
-    load();
   };
 
   const handleDetails = async (row) => {
@@ -56,8 +63,13 @@ function Warehouses() {
   };
 
   return (
-    <div>
-      <h2>Warehouse Master</h2>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Warehouse master</div>
+          <div className="page-subtitle">Storage locations for stock and transfers</div>
+        </div>
+      </div>
       <form onSubmit={submit} className="form-grid">
         <input
           placeholder="Warehouse Name"
@@ -65,7 +77,9 @@ function Warehouses() {
           onChange={(e) => setForm({ ...form, name: e.target.value })}
           required
         />
-        <button type="submit">{editingId ? "Update Warehouse" : "Add Warehouse"}</button>
+        <SubmitButton loading={submitting} loadingLabel={editingId ? "Updating…" : "Saving…"}>
+          {editingId ? "Update warehouse" : "Add warehouse"}
+        </SubmitButton>
         {editingId ? (
           <button
             type="button"

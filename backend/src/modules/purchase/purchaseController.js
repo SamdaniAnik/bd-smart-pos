@@ -1,10 +1,26 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
+const { resolveFundingAccountCode } = require("../../utils/fundingAccount");
 const PDFDocument = require("pdfkit");
 
-async function getSystemAccount(branchId, code) {
-  return prisma.account.findFirst({ where: { branchId, code } });
+async function getSystemAccount(branchId, code, tx = null) {
+  const db = tx || prisma;
+  return db.account.findFirst({ where: { branchId, code } });
+}
+
+async function ensureBankLoanPayableAccount(tx, branchId) {
+  return tx.account.upsert({
+    where: { branchId_code: { branchId, code: "2320" } },
+    update: {},
+    create: {
+      branchId,
+      code: "2320",
+      name: "Bank Loans Payable",
+      type: "Liability",
+      isSystem: true,
+    },
+  });
 }
 
 function getManagerApprovalPin() {
@@ -76,6 +92,28 @@ exports.createPurchase = async (req, res) => {
     const branchId = req.branchId;
     const { supplierId, invoiceNo, items, paidAmount = 0 } = req.body;
     const deferStockPosting = Boolean(req.body?.deferStockPosting);
+    const financingRaw = String(req.body?.financingSource || "SUPPLIER_CREDIT").toUpperCase();
+    const financingSource = financingRaw === "BANK_LOAN" ? "BANK_LOAN" : "SUPPLIER_CREDIT";
+    const isBankLoan = financingSource === "BANK_LOAN";
+
+    let loanReference = null;
+    let loanNote = null;
+    let loanMaturityDate = null;
+    if (isBankLoan) {
+      loanReference =
+        req.body.loanReference != null && String(req.body.loanReference).trim()
+          ? String(req.body.loanReference).trim().slice(0, 190)
+          : null;
+      loanNote =
+        req.body.loanNote != null && String(req.body.loanNote).trim()
+          ? String(req.body.loanNote).trim().slice(0, 500)
+          : null;
+      if (req.body.loanMaturityDate) {
+        const d = new Date(req.body.loanMaturityDate);
+        if (!Number.isNaN(d.getTime())) loanMaturityDate = d;
+      }
+    }
+
     if (!Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: "Purchase items required" });
     }
@@ -108,6 +146,10 @@ exports.createPurchase = async (req, res) => {
           total,
           paidAmount: Number(paidAmount),
           dueAmount,
+          financingSource,
+          loanReference,
+          loanNote,
+          loanMaturityDate,
           items: {
             create: items.map((i) => ({
               productId: Number(i.productId),
@@ -141,14 +183,34 @@ exports.createPurchase = async (req, res) => {
         }
       }
 
-      await tx.supplier.update({
-        where: { id: Number(supplierId) },
-        data: { payableBalance: { increment: dueAmount } },
-      });
+      if (!isBankLoan && dueAmount > 0) {
+        await tx.supplier.update({
+          where: { id: Number(supplierId) },
+          data: { payableBalance: { increment: dueAmount } },
+        });
+      }
 
-      const inventory = await getSystemAccount(branchId, "1300");
-      const payable = await getSystemAccount(branchId, "2100");
-      const cash = await getSystemAccount(branchId, "1100");
+      const inventory = await getSystemAccount(branchId, "1300", tx);
+      const cash = await getSystemAccount(branchId, "1100", tx);
+      let liabilityAccount = null;
+      if (dueAmount > 0) {
+        liabilityAccount = isBankLoan
+          ? await ensureBankLoanPayableAccount(tx, branchId)
+          : await getSystemAccount(branchId, "2100", tx);
+      }
+      if (!inventory || !cash) {
+        throw new Error("Required GL accounts missing (1300 Inventory, 1100 Cash)");
+      }
+      if (dueAmount > 0 && !liabilityAccount) {
+        throw new Error(isBankLoan ? "Could not resolve Bank Loans Payable (2320)" : "Accounts Payable (2100) missing");
+      }
+
+      const journalLineCreates = [{ accountId: inventory.id, debit: total, credit: 0 }];
+      if (dueAmount > 0) {
+        journalLineCreates.push({ accountId: liabilityAccount.id, debit: 0, credit: dueAmount });
+      }
+      journalLineCreates.push({ accountId: cash.id, debit: 0, credit: Number(paidAmount) });
+
       const journal = await tx.journal.create({
         data: {
           branchId,
@@ -156,13 +218,9 @@ exports.createPurchase = async (req, res) => {
           createdBy: req.user?.id || null,
           refType: "PURCHASE",
           refId: created.id,
-          narration: `Purchase ${created.id}`,
+          narration: `Purchase ${created.id}${isBankLoan ? " (bank loan)" : ""}`,
           lines: {
-            create: [
-              { accountId: inventory.id, debit: total, credit: 0 },
-              { accountId: payable.id, debit: 0, credit: dueAmount },
-              { accountId: cash.id, debit: 0, credit: Number(paidAmount) },
-            ],
+            create: journalLineCreates,
           },
         },
       });
@@ -179,6 +237,10 @@ exports.createPurchase = async (req, res) => {
         supplierId: Number(supplierId),
         total: Number(purchase.total || 0),
         deferStockPosting,
+        financingSource,
+        loanReference,
+        loanNote,
+        loanMaturityDate: loanMaturityDate ? loanMaturityDate.toISOString() : null,
         inputVat: Number(inputVatTotal.toFixed(2)),
         vatLines: (items || []).map((item) => ({
           productId: Number(item.productId),
@@ -205,6 +267,7 @@ exports.createPurchase = async (req, res) => {
     });
     res.status(201).json(purchase);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -256,6 +319,7 @@ exports.getPurchases = async (req, res) => {
     });
     res.json(withVat);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -361,6 +425,7 @@ exports.getPurchaseDetails = async (req, res) => {
       })),
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -433,6 +498,7 @@ exports.receivePurchaseInStages = async (req, res) => {
       receiving,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -591,10 +657,15 @@ exports.createPurchaseReturn = async (req, res) => {
 
       const payableReduction = Math.min(Number(purchase.dueAmount || 0), totalReturnAmount);
       const paidRefund = Math.max(0, totalReturnAmount - payableReduction);
-      await tx.supplier.update({
-        where: { id: purchase.supplierId },
-        data: { payableBalance: { decrement: payableReduction } },
-      });
+      const financingSource = String(purchase.financingSource || "SUPPLIER_CREDIT").toUpperCase();
+      const isBankLoanPurchase = financingSource === "BANK_LOAN";
+
+      if (!isBankLoanPurchase && payableReduction > 0) {
+        await tx.supplier.update({
+          where: { id: purchase.supplierId },
+          data: { payableBalance: { decrement: payableReduction } },
+        });
+      }
       await tx.purchase.update({
         where: { id: purchaseId },
         data: {
@@ -604,10 +675,21 @@ exports.createPurchaseReturn = async (req, res) => {
         },
       });
 
-      const inventory = await getSystemAccount(branchId, "1300");
-      const payable = await getSystemAccount(branchId, "2100");
-      const cash = await getSystemAccount(branchId, "1100");
-      if (inventory && payable && cash) {
+      const inventory = await getSystemAccount(branchId, "1300", tx);
+      let liabilityAccount = null;
+      if (payableReduction > 0) {
+        liabilityAccount = isBankLoanPurchase
+          ? await ensureBankLoanPayableAccount(tx, branchId)
+          : await getSystemAccount(branchId, "2100", tx);
+      }
+      const cash = await getSystemAccount(branchId, "1100", tx);
+      if (inventory && cash && (!payableReduction || liabilityAccount)) {
+        const lines = [];
+        if (payableReduction > 0 && liabilityAccount) {
+          lines.push({ accountId: liabilityAccount.id, debit: payableReduction, credit: 0 });
+        }
+        lines.push({ accountId: cash.id, debit: paidRefund, credit: 0 });
+        lines.push({ accountId: inventory.id, debit: 0, credit: totalReturnAmount });
         await tx.journal.create({
           data: {
             branchId,
@@ -617,11 +699,7 @@ exports.createPurchaseReturn = async (req, res) => {
             refId: returnRecord.id,
             narration: `Purchase return ${returnRecord.id}`,
             lines: {
-              create: [
-                { accountId: payable.id, debit: payableReduction, credit: 0 },
-                { accountId: cash.id, debit: paidRefund, credit: 0 },
-                { accountId: inventory.id, debit: 0, credit: totalReturnAmount },
-              ],
+              create: lines,
             },
           },
         });
@@ -639,6 +717,7 @@ exports.createPurchaseReturn = async (req, res) => {
     });
     res.status(201).json(created);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -667,6 +746,7 @@ exports.getPurchaseReturns = async (req, res) => {
     });
     res.json(returns);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -740,6 +820,7 @@ exports.exportPurchaseReturnsCSV = async (req, res) => {
     res.setHeader("Content-Disposition", 'attachment; filename="purchase-returns.csv"');
     res.send(toCSV(rows));
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -771,6 +852,7 @@ exports.exportPurchaseReturnsPDF = async (req, res) => {
     }));
     writeReturnsPdf(res, rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -880,6 +962,7 @@ exports.getPurchaseOptimization = async (req, res) => {
 
     res.json({ params: { days, leadDays }, rows });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1038,6 +1121,7 @@ exports.getPurchasePlanSuggestion = async (req, res) => {
     const payload = await buildPurchasePlanSuggestion(req.branchId, req.query || {});
     res.json(payload);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1060,6 +1144,7 @@ exports.exportPurchasePlanCSV = async (req, res) => {
     res.setHeader("Content-Disposition", 'attachment; filename="purchase-plan.csv"');
     res.send(toCSV(rows));
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1100,6 +1185,7 @@ exports.exportPurchasePlanPDF = async (req, res) => {
     });
     doc.end();
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1152,6 +1238,7 @@ exports.createSplitPurchasesFromPlan = async (req, res) => {
       lineCount: rows.length,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1179,6 +1266,7 @@ async function createPurchasesFromPlanRows({ branchId, rows, actorUserId }) {
             total: Number(total.toFixed(2)),
             paidAmount: 0,
             dueAmount: Number(total.toFixed(2)),
+            financingSource: "SUPPLIER_CREDIT",
             items: {
               create: lines.map((line) => ({
                 productId: Number(line.productId),
@@ -1208,9 +1296,9 @@ async function createPurchasesFromPlanRows({ branchId, rows, actorUserId }) {
           where: { id: Number(supplierId) },
           data: { payableBalance: { increment: Number(total.toFixed(2)) } },
         });
-        const inventory = await getSystemAccount(branchId, "1300");
-        const payable = await getSystemAccount(branchId, "2100");
-        const cash = await getSystemAccount(branchId, "1100");
+        const inventory = await getSystemAccount(branchId, "1300", tx);
+        const payable = await getSystemAccount(branchId, "2100", tx);
+        const cash = await getSystemAccount(branchId, "1100", tx);
         if (inventory && payable && cash) {
           await tx.journal.create({
             data: {
@@ -1275,6 +1363,7 @@ exports.submitPurchasePlanApproval = async (req, res) => {
     });
     res.status(201).json({ id: created.id, status: "PENDING", totalEstimatedCost, lineCount: rows.length });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1307,6 +1396,7 @@ exports.getPurchasePlanApprovals = async (req, res) => {
       .filter((x) => (status ? x.status === status : true));
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1349,6 +1439,7 @@ exports.approvePurchasePlanApproval = async (req, res) => {
     });
     res.json({ message: "Purchase plan approved and executed", createdPurchaseIds });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1382,6 +1473,7 @@ exports.rejectPurchasePlanApproval = async (req, res) => {
     });
     res.json({ message: "Purchase plan rejected" });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1493,6 +1585,119 @@ exports.getSupplierScorecards = async (req, res) => {
       rows: sorted,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+/** Purchases financed via bank loan (2320) with remaining principal. */
+exports.getOutstandingPurchaseLoans = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const rows = await prisma.purchase.findMany({
+      where: {
+        branchId,
+        financingSource: "BANK_LOAN",
+        dueAmount: { gt: 0 },
+      },
+      include: { supplier: { select: { id: true, name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 500,
+    });
+    const totalOutstanding = rows.reduce((s, p) => s + Number(p.dueAmount || 0), 0);
+    res.json({
+      purchases: rows,
+      totalOutstanding: Number(totalOutstanding.toFixed(2)),
+    });
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+/**
+ * Repay purchase bank loan: Dr Bank Loans Payable, Cr Cash or Bank account.
+ * Reduces Purchase.dueAmount and increases paidAmount.
+ */
+exports.payPurchaseLoan = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const purchaseId = Number(req.params.id);
+    if (Number.isNaN(purchaseId)) return res.status(400).json({ error: "Invalid purchase id" });
+    const parsedAmount = Number(req.body?.amount);
+    if (!(parsedAmount > 0)) return res.status(400).json({ error: "Amount must be greater than zero" });
+
+    const method = req.body?.method != null ? String(req.body.method) : "Cash";
+    const note = req.body?.note != null ? String(req.body.note).slice(0, 500) : null;
+    const fundingCode = resolveFundingAccountCode(method, req.body?.fundingAccountCode);
+
+    await ensureOpenFiscalPeriod(branchId);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const purchase = await tx.purchase.findFirst({
+        where: { id: purchaseId, branchId },
+        include: { supplier: true },
+      });
+      if (!purchase) throw new Error("Purchase not found");
+      if (String(purchase.financingSource || "").toUpperCase() !== "BANK_LOAN") {
+        throw new Error("This purchase is not financed as a bank loan");
+      }
+      const due = Number(purchase.dueAmount || 0);
+      if (due <= 0) throw new Error("No outstanding loan balance for this purchase");
+      if (parsedAmount > due + 0.005) throw new Error("Payment exceeds outstanding loan for this purchase");
+
+      const loanPayable = await ensureBankLoanPayableAccount(tx, branchId);
+      const fundingAcc = await getSystemAccount(branchId, fundingCode, tx);
+      if (!fundingAcc) {
+        throw new Error(`Funding account ${fundingCode} not found — run DB migration or add the account in Chart of Accounts`);
+      }
+
+      const updated = await tx.purchase.update({
+        where: { id: purchaseId },
+        data: {
+          paidAmount: { increment: parsedAmount },
+          dueAmount: { decrement: parsedAmount },
+        },
+      });
+
+      await tx.journal.create({
+        data: {
+          branchId,
+          purchaseId,
+          createdBy: req.user?.id || null,
+          refType: "PURCHASE_LOAN_PAYMENT",
+          refId: purchaseId,
+          narration: `Bank loan repayment purchase #${purchaseId}${purchase.supplier?.name ? ` (${purchase.supplier.name})` : ""}${note ? ` — ${note}` : ""}`,
+          lines: {
+            create: [
+              { accountId: loanPayable.id, debit: parsedAmount, credit: 0 },
+              { accountId: fundingAcc.id, debit: 0, credit: parsedAmount },
+            ],
+          },
+        },
+      });
+
+      return { purchase: updated, fundingAccountCode: fundingCode, method };
+    });
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "PURCHASE_LOAN_PAYMENT",
+      entity: "Purchase",
+      entityId: purchaseId,
+      payload: {
+        branchId,
+        amount: parsedAmount,
+        fundingAccountCode: result.fundingAccountCode,
+        method: result.method,
+        note: note || null,
+        remainingDue: Number(result.purchase.dueAmount || 0),
+      },
+    });
+
+    res.status(201).json(result.purchase);
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

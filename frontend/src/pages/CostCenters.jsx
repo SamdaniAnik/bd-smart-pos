@@ -84,9 +84,13 @@ export default function CostCenters() {
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Cost Centers</h2>
-      <p className="text-muted">Create departments/projects and analyze tagged journals by cost center.</p>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Cost centers</div>
+          <div className="page-subtitle">Department and project tags for journals and budgets</div>
+        </div>
+      </div>
 
       <form onSubmit={create} className="form-grid" style={{ marginBottom: 14 }}>
         <label>
@@ -201,6 +205,7 @@ export default function CostCenters() {
         <label>
           Cost Center
           <select
+            className="form-select-sm"
             required
             value={budgetForm.costCenterId}
             onChange={(e) => setBudgetForm((p) => ({ ...p, costCenterId: e.target.value }))}

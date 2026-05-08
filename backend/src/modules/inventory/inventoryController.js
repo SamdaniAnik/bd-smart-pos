@@ -1,6 +1,6 @@
 const prisma = require("../../utils/prisma");
 const { writeAuditLog } = require("../../utils/audit");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const PDFDocument = require("pdfkit");
 const XLSX = require("xlsx");
 
@@ -269,6 +269,7 @@ exports.getStockLedger = async (req, res) => {
     });
     res.json(items);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -392,6 +393,7 @@ exports.adjustStock = async (req, res) => {
       payload: { qtyChange: qty, reason: reasonText || "manual_adjustment", reasonCode: normalizedReasonCode },
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(error.httpStatus || 400).json({
       error: error.message,
       ...(error.meta || {}),
@@ -468,6 +470,7 @@ exports.getStockAdjustments = async (req, res) => {
       }))
     );
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -596,6 +599,7 @@ exports.updateStockAdjustment = async (req, res) => {
 
     res.json({ message: "Stock adjustment updated" });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(error.httpStatus || 400).json({
       error: error.message,
       ...(error.meta || {}),
@@ -656,6 +660,7 @@ exports.listInventoryAdjustReasons = async (req, res) => {
     });
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -687,6 +692,7 @@ exports.createInventoryAdjustReason = async (req, res) => {
     res.status(201).json(row);
   } catch (error) {
     if (String(error?.code) === "P2002") return res.status(409).json({ error: "Reason code already exists" });
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -728,6 +734,7 @@ exports.updateInventoryAdjustReason = async (req, res) => {
     res.json(row);
   } catch (error) {
     if (String(error?.code) === "P2002") return res.status(409).json({ error: "Reason code already exists" });
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -783,6 +790,7 @@ exports.transferStock = async (req, res) => {
       payload: { fromBranchId, toBranchId: Number(toBranchId), itemsCount: items.length, status: "PENDING" },
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -857,6 +865,7 @@ exports.approveStockTransfer = async (req, res) => {
     });
     res.json(completed);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -888,6 +897,7 @@ exports.rejectStockTransfer = async (req, res) => {
     });
     res.json(rejected);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -914,6 +924,7 @@ exports.getStockTransfers = async (req, res) => {
     });
     res.json(logs);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1015,6 +1026,7 @@ exports.getLowStockAlerts = async (req, res) => {
       },
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1181,6 +1193,7 @@ exports.getInventoryIntelligence = async (req, res) => {
       params: { days, deadDays, leadDays, forecastDays },
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1205,6 +1218,7 @@ exports.getTransferBranchProducts = async (req, res) => {
     });
     res.json(products);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1229,6 +1243,7 @@ exports.createStockCountSession = async (req, res) => {
     const itemsCount = Array.isArray(created.payload?.items) ? created.payload.items.length : 0;
     res.status(201).json({ id: created.id, status: "OPEN", itemsCount });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1276,6 +1291,7 @@ exports.createStockCountSchedule = async (req, res) => {
     });
     res.status(201).json({ id: created.id, ...(created.payload || {}) });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1310,6 +1326,7 @@ exports.getStockCountSchedules = async (req, res) => {
       }));
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1367,6 +1384,7 @@ exports.updateStockCountSchedule = async (req, res) => {
     });
     res.json({ id: updated.id, ...(updated.payload || {}) });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1384,6 +1402,7 @@ exports.deleteStockCountSchedule = async (req, res) => {
     await prisma.auditLog.delete({ where: { id } });
     res.json({ message: "Schedule deleted" });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1410,6 +1429,7 @@ exports.toggleStockCountScheduleStatus = async (req, res) => {
     });
     res.json({ id: updated.id, ...(updated.payload || {}) });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1454,6 +1474,7 @@ exports.runStockCountScheduleNow = async (req, res) => {
     const result = await runSingleSchedule({ branchId, userId: req.user?.id || null, schedule });
     res.json({ message: "Schedule executed", scheduleId: id, createdSessionId: result.sessionId, nextDueAt: result.nextDueAt });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1485,6 +1506,7 @@ exports.runStockCountSchedules = async (req, res) => {
       createdSessionIds,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1494,6 +1516,7 @@ exports.getStockCountSessions = async (req, res) => {
     const rows = await getStockCountSessions(req);
     res.json(rows);
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1515,6 +1538,7 @@ exports.getStockCountSessionDetails = async (req, res) => {
     const warehouseMap = new Map(warehouses.map((w) => [w.id, w.name]));
     res.json(normalizeStockCountLog(log, productMap, warehouseMap));
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1556,6 +1580,7 @@ exports.updateStockCountSessionItems = async (req, res) => {
     });
     res.json({ message: "Stock count items updated", itemsCount: items.length });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1605,6 +1630,7 @@ exports.recountStockCountSession = async (req, res) => {
     });
     res.json({ message: "Recount round started", recountRound: nextRecountRound });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1746,6 +1772,7 @@ exports.finalizeStockCountSession = async (req, res) => {
     });
     res.json({ message: "Stock count finalized", changedItems: changed.length });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1768,6 +1795,7 @@ exports.exportStockCountSessionsCSV = async (req, res) => {
     res.setHeader("Content-Disposition", 'attachment; filename="stock-count-sessions.csv"');
     res.send(toCSV(data));
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1798,6 +1826,7 @@ exports.exportStockCountSessionsPDF = async (req, res) => {
       "stock-count-sessions.pdf"
     );
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1818,6 +1847,7 @@ exports.exportStockCountSessionsXLSX = async (req, res) => {
     }));
     sendXlsx(res, data, "stock-count-sessions.xlsx", "StockCount");
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1938,6 +1968,7 @@ exports.getInventoryBatches = async (req, res) => {
       return ea - eb;
     }));
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -1996,6 +2027,7 @@ exports.createInventoryBatch = async (req, res) => {
     res.status(201).json({ id: created.id, message: "Batch created" });
   } catch (error) {
     if (error.code === "P2002") return res.status(400).json({ error: "Batch code already exists for this product" });
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -2107,6 +2139,7 @@ exports.updateInventoryBatchQty = async (req, res) => {
     });
     res.json({ message: "Batch quantity updated" });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -2138,6 +2171,7 @@ exports.getInventoryBatchAlerts = async (req, res) => {
       params: { days },
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -2218,6 +2252,7 @@ exports.createExpiryMarkdownCampaign = async (req, res) => {
       rows: createdRules,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -2282,6 +2317,7 @@ exports.getTransferSuggestions = async (req, res) => {
       rows,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };
@@ -2349,6 +2385,7 @@ exports.getReorderSuggestions = async (req, res) => {
       rows,
     });
   } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
   }
 };

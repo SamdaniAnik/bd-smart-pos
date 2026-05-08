@@ -1,5 +1,5 @@
 const prisma = require("../../utils/prisma");
-const { ensureOpenFiscalPeriod } = require("../../utils/fiscal");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
 
 const VALID_DIRECTIONS = ["ISSUED", "RECEIVED"];
@@ -224,6 +224,7 @@ exports.listCheques = async (req, res) => {
     });
     res.json(rows);
   } catch (err) {
+    if (respondFiscalBlocked(res, err)) return;
     res.status(500).json({ error: err.message });
   }
 };
@@ -282,6 +283,7 @@ exports.summary = async (req, res) => {
 
     res.json({ grouped, upcoming, overdueDeposit });
   } catch (err) {
+    if (respondFiscalBlocked(res, err)) return;
     res.status(500).json({ error: err.message });
   }
 };
@@ -305,6 +307,7 @@ exports.getCheque = async (req, res) => {
     if (!cheque) return res.status(404).json({ error: "Cheque not found" });
     res.json(cheque);
   } catch (err) {
+    if (respondFiscalBlocked(res, err)) return;
     res.status(500).json({ error: err.message });
   }
 };
@@ -460,6 +463,7 @@ async function transitionStatus(req, res, targetStatus, eventType, mutate) {
     });
     res.json(updated);
   } catch (err) {
+    if (respondFiscalBlocked(res, err)) return;
     res.status(400).json({ error: err.message });
   }
 }

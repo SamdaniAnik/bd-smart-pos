@@ -231,10 +231,16 @@ function StockCount() {
   };
 
   return (
-    <div>
-      <h2>Stock Count (Physical Inventory)</h2>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Stock count</div>
+          <div className="page-subtitle">Physical inventory sessions, schedules, and variance approvals</div>
+        </div>
+      </div>
       <form onSubmit={createSession} className="form-grid">
         <select
+          className="form-select-sm"
           value={sessionForm.warehouseId}
           onChange={(e) => setSessionForm((prev) => ({ ...prev, warehouseId: e.target.value }))}
         >
@@ -258,6 +264,7 @@ function StockCount() {
           Blind Count Mode
         </label>
         <select
+          className="form-select-sm"
           value={sessionForm.assignedToUserId}
           onChange={(e) => setSessionForm((prev) => ({ ...prev, assignedToUserId: e.target.value }))}
         >
@@ -277,6 +284,7 @@ function StockCount() {
           onChange={(e) => setScheduleForm((prev) => ({ ...prev, name: e.target.value }))}
         />
         <select
+          className="form-select-sm"
           value={scheduleForm.warehouseId}
           onChange={(e) => setScheduleForm((prev) => ({ ...prev, warehouseId: e.target.value }))}
         >
@@ -286,6 +294,7 @@ function StockCount() {
           ))}
         </select>
         <select
+          className="form-select-sm"
           value={scheduleForm.frequency}
           onChange={(e) => setScheduleForm((prev) => ({ ...prev, frequency: e.target.value }))}
         >
@@ -312,6 +321,7 @@ function StockCount() {
           Active
         </label>
         <select
+          className="form-select-sm"
           value={scheduleForm.assignedToUserId}
           onChange={(e) => setScheduleForm((prev) => ({ ...prev, assignedToUserId: e.target.value }))}
         >
@@ -412,7 +422,7 @@ function StockCount() {
       <div className="form-grid" style={{ marginTop: 12 }}>
         <input type="date" value={filters.from} onChange={(e) => setFilters((p) => ({ ...p, from: e.target.value }))} />
         <input type="date" value={filters.to} onChange={(e) => setFilters((p) => ({ ...p, to: e.target.value }))} />
-        <select value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
+        <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
           <option value="">All Status</option>
           <option value="OPEN">OPEN</option>
           <option value="CLOSED">CLOSED</option>

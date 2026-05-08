@@ -20,10 +20,13 @@ const {
   getChequeLedger,
   exportChequeLedgerCSV,
   exportChequeLedgerPDF,
+  getHqBranchSummary,
 } = require("./reportController");
-const { requireAuth, requirePermission } = require("../../middleware/auth");
+const { requireAuth, requirePermission, requireAnyPermission } = require("../../middleware/auth");
 
 const router = express.Router();
+
+router.get("/hq-branch-summary", requireAuth, requireAnyPermission(["rbac.manage", "branch.manage"]), getHqBranchSummary);
 
 router.get("/dashboard", requireAuth, requirePermission("report.view"), getDashboard);
 router.get("/dashboard/trends", requireAuth, requirePermission("report.view"), getDashboardTrends);

@@ -96,9 +96,13 @@ export default function Assets() {
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Asset Register &amp; Depreciation</h2>
-      <p className="text-muted">Track fixed assets and post monthly straight-line depreciation to journals.</p>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Asset register &amp; depreciation</div>
+          <div className="page-subtitle">Fixed assets and monthly straight-line depreciation postings</div>
+        </div>
+      </div>
 
       <form onSubmit={createAsset} className="form-grid" style={{ marginBottom: 16 }}>
         <label>
@@ -145,7 +149,7 @@ export default function Assets() {
       <div className="form-grid" style={{ marginBottom: 12 }}>
         <label>
           Status
-          <select value={status} onChange={(e) => setStatus(e.target.value)}>
+          <select className="form-select-sm" value={status} onChange={(e) => setStatus(e.target.value)}>
             <option value="">All</option>
             <option value="ACTIVE">Active</option>
             <option value="DISPOSED">Disposed</option>

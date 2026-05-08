@@ -153,28 +153,28 @@ export default function Cheques() {
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+    <div className="page-stack">
+      <div className="page-header">
         <div>
-          <h2 style={{ marginBottom: 4 }}>Cheque register</h2>
-          <p className="text-muted" style={{ marginTop: 0 }}>
-            Track issued and received cheques (incl. post-dated) through their full lifecycle.
-          </p>
+          <div className="page-title">Cheque register</div>
+          <div className="page-subtitle">Issued and received cheques (incl. post-dated) through their full lifecycle</div>
         </div>
-        <button onClick={() => { setForm({ ...emptyForm(), direction: tab }); setShowCreate(true); }}>
-          + Register cheque
-        </button>
+        <div className="page-actions">
+          <button type="button" onClick={() => { setForm({ ...emptyForm(), direction: tab }); setShowCreate(true); }}>
+            + Register cheque
+          </button>
+        </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginTop: 16 }}>
+      <div className="metrics-grid" style={{ marginTop: 4 }}>
         {["RECEIVED", "ISSUED"].map((dir) => {
           const d = summaryByDirection[dir] || {};
           const pending = d.PENDING || { count: 0, amount: 0 };
           const cleared = d.CLEARED || { count: 0, amount: 0 };
           const bounced = d.BOUNCED || { count: 0, amount: 0 };
           return (
-            <div key={dir} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: 14, background: "#fff" }}>
-              <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", fontWeight: 600 }}>{dir}</div>
+            <div key={dir} className="metric">
+              <div className="metric-label">{dir}</div>
               <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 13 }}>
                 <span>Pending</span>
                 <strong>{pending.count} · {Number(pending.amount).toFixed(2)}</strong>
@@ -232,7 +232,7 @@ export default function Cheques() {
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12, alignItems: "flex-end" }}>
         <label>
           <div style={{ fontSize: 12, color: "#64748b" }}>Status</div>
-          <select value={filters.status} onChange={(e) => setFilters({ ...filters, status: e.target.value })}>
+          <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters({ ...filters, status: e.target.value })}>
             {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s || "All"}</option>)}
           </select>
         </label>
@@ -317,7 +317,7 @@ export default function Cheques() {
           <form onSubmit={submitCreate} className="form-grid" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12 }}>
             <label>
               Direction
-              <select value={form.direction} onChange={(e) => setForm({ ...form, direction: e.target.value })}>
+              <select className="form-select-sm" value={form.direction} onChange={(e) => setForm({ ...form, direction: e.target.value })}>
                 {DIRECTION_OPTIONS.filter(Boolean).map((o) => <option key={o} value={o}>{o}</option>)}
               </select>
             </label>
@@ -374,7 +374,7 @@ export default function Cheques() {
             </label>
             <label>
               Linked document type
-              <select value={form.linkedType} onChange={(e) => setForm({ ...form, linkedType: e.target.value })}>
+              <select className="form-select-sm" value={form.linkedType} onChange={(e) => setForm({ ...form, linkedType: e.target.value })}>
                 {LINKED_TYPES.map((o) => <option key={o} value={o}>{o || "—"}</option>)}
               </select>
             </label>

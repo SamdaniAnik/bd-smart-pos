@@ -166,9 +166,13 @@ export default function PettyCash() {
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Petty Cash (Imprest)</h2>
-      <p className="text-muted">Manage petty cash funds, post spends, and replenish with automatic journal entries.</p>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Petty cash (imprest)</div>
+          <div className="page-subtitle">Funds, spends, claims, and replenishment with automatic journals</div>
+        </div>
+      </div>
 
       <div className="summary-cards" style={{ marginBottom: 12 }}>
         <div className="summary-card">
@@ -256,7 +260,7 @@ export default function PettyCash() {
       <form onSubmit={postTxn} className="form-grid" style={{ marginBottom: 12 }}>
         <label>
           Fund
-          <select required value={txnForm.fundId} onChange={(e) => setTxnForm((p) => ({ ...p, fundId: e.target.value }))}>
+          <select required className="form-select-sm" value={txnForm.fundId} onChange={(e) => setTxnForm((p) => ({ ...p, fundId: e.target.value }))}>
             <option value="">Select</option>
             {funds.filter((x) => x.isActive).map((f) => (
               <option key={f.id} value={f.id}>
@@ -267,7 +271,7 @@ export default function PettyCash() {
         </label>
         <label>
           Type
-          <select value={txnForm.type} onChange={(e) => setTxnForm((p) => ({ ...p, type: e.target.value }))}>
+          <select className="form-select-sm" value={txnForm.type} onChange={(e) => setTxnForm((p) => ({ ...p, type: e.target.value }))}>
             <option value="SPEND">Spend</option>
             <option value="TOPUP">Top-up</option>
             <option value="REPLENISH">Replenish</option>
@@ -293,7 +297,7 @@ export default function PettyCash() {
       <div className="form-grid" style={{ marginBottom: 10 }}>
         <label>
           Filter by fund
-          <select value={fundFilter} onChange={(e) => setFundFilter(e.target.value)}>
+          <select className="form-select-sm" value={fundFilter} onChange={(e) => setFundFilter(e.target.value)}>
             <option value="">All Funds</option>
             {funds.map((f) => (
               <option key={f.id} value={f.id}>
@@ -342,7 +346,7 @@ export default function PettyCash() {
       <form onSubmit={submitClaim} className="form-grid" style={{ marginBottom: 12 }}>
         <label>
           Fund
-          <select required value={claimForm.fundId} onChange={(e) => setClaimForm((p) => ({ ...p, fundId: e.target.value }))}>
+          <select required className="form-select-sm" value={claimForm.fundId} onChange={(e) => setClaimForm((p) => ({ ...p, fundId: e.target.value }))}>
             <option value="">Select</option>
             {funds.filter((x) => x.isActive).map((f) => (
               <option key={f.id} value={f.id}>
@@ -353,7 +357,7 @@ export default function PettyCash() {
         </label>
         <label>
           Linked Spend (optional)
-          <select value={claimForm.txnId} onChange={(e) => setClaimForm((p) => ({ ...p, txnId: e.target.value }))}>
+          <select className="form-select-sm" value={claimForm.txnId} onChange={(e) => setClaimForm((p) => ({ ...p, txnId: e.target.value }))}>
             <option value="">None</option>
             {txns
               .filter((x) => x.type === "SPEND" && Number(x.fundId) === Number(claimForm.fundId || 0))
@@ -387,7 +391,7 @@ export default function PettyCash() {
       <div className="form-grid" style={{ marginBottom: 10 }}>
         <label>
           Claim Status
-          <select value={claimStatusFilter} onChange={(e) => setClaimStatusFilter(e.target.value)}>
+          <select className="form-select-sm" value={claimStatusFilter} onChange={(e) => setClaimStatusFilter(e.target.value)}>
             <option value="">All</option>
             <option value="PENDING">Pending</option>
             <option value="APPROVED">Approved</option>

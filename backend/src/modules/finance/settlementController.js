@@ -1,5 +1,6 @@
 const prisma = require("../../utils/prisma");
 const { writeAuditLog } = require("../../utils/audit");
+const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 
 exports.importSettlement = async (req, res) => {
   try {
@@ -102,6 +103,76 @@ exports.listUnmatchedPayments = async (req, res) => {
       },
       orderBy: { id: "desc" },
       take: 500,
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.createDigitalCashOut = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const fromMethod = String(req.body?.fromMethod || "").trim();
+    const toMethod = String(req.body?.toMethod || "Cash").trim() || "Cash";
+    const amount = Number(req.body?.amount || 0);
+    const note = String(req.body?.note || "").slice(0, 200) || null;
+    if (!fromMethod) return res.status(400).json({ error: "fromMethod is required" });
+    if (!toMethod) return res.status(400).json({ error: "toMethod is required" });
+    if (fromMethod.toLowerCase() === toMethod.toLowerCase()) {
+      return res.status(400).json({ error: "fromMethod and toMethod cannot be same" });
+    }
+    if (!(amount > 0)) return res.status(400).json({ error: "amount must be positive" });
+
+    await ensureOpenFiscalPeriod(branchId);
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "DIGITAL_CASH_TRANSFER",
+      entity: "Branch",
+      entityId: branchId,
+      payload: {
+        branchId,
+        fromMethod,
+        toMethod,
+        amount,
+        note,
+      },
+    });
+
+    res.status(201).json({
+      ok: true,
+      fromMethod,
+      toMethod,
+      amount,
+      note,
+    });
+  } catch (err) {
+    if (respondFiscalBlocked(res, err)) return;
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.listDigitalCashOuts = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const fromRaw = String(req.query?.from || "").trim();
+    const toRaw = String(req.query?.to || "").trim();
+    const where = {
+      action: { in: ["DIGITAL_CASH_TRANSFER", "DIGITAL_CASH_OUT"] },
+      entity: "Branch",
+      entityId: branchId,
+    };
+    if (fromRaw || toRaw) {
+      where.createdAt = {};
+      if (fromRaw) where.createdAt.gte = new Date(`${fromRaw}T00:00:00.000Z`);
+      if (toRaw) where.createdAt.lt = new Date(new Date(`${toRaw}T00:00:00.000Z`).getTime() + 24 * 60 * 60 * 1000);
+    }
+    const rows = await prisma.auditLog.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: 500,
+      include: { user: { select: { id: true, name: true, email: true } } },
     });
     res.json(rows);
   } catch (err) {

@@ -109,11 +109,13 @@ export default function FiscalPeriods() {
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Fiscal Period Lock Control</h2>
-      <p className="text-muted">
-        Close a period to block posting/editing transactions inside that date range.
-      </p>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Fiscal period lock control</div>
+          <div className="page-subtitle">Close or reopen periods to control posting for date ranges</div>
+        </div>
+      </div>
       <div className="page-card" style={{ marginBottom: 12 }}>
         <strong>Current Active Period:</strong>{" "}
         {activePeriod ? (
@@ -142,7 +144,7 @@ export default function FiscalPeriods() {
         </label>
         <label>
           Status filter
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <select className="form-select-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
             <option value="ALL">All</option>
             <option value="OPEN">Open only</option>
             <option value="CLOSED">Closed only</option>

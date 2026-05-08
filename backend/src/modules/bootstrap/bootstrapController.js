@@ -1,4 +1,5 @@
 const prisma = require("../../utils/prisma");
+const config = require("../../utils/config");
 const bcrypt = require("bcrypt");
 
 const permissionCodes = [
@@ -40,23 +41,88 @@ const accountDefaults = [
   { code: "1100", name: "Cash In Hand", type: "Asset", isSystem: true },
   { code: "1110", name: "Cheques In Hand", type: "Asset", isSystem: true },
   { code: "1120", name: "Petty Cash", type: "Asset", isSystem: true },
+  { code: "1130", name: "Bank Current Account", type: "Asset", isSystem: true },
   { code: "1200", name: "Accounts Receivable", type: "Asset", isSystem: true },
   { code: "1300", name: "Inventory", type: "Asset", isSystem: true },
   { code: "1400", name: "Fixed Assets", type: "Asset", isSystem: true },
   { code: "1410", name: "Accumulated Depreciation", type: "Asset", isSystem: true },
   { code: "2100", name: "Accounts Payable", type: "Liability", isSystem: true },
   { code: "2110", name: "Cheques Issued", type: "Liability", isSystem: true },
+  { code: "2120", name: "AIT Payable to NBR", type: "Liability", isSystem: true },
+  { code: "2125", name: "VDS Payable to NBR", type: "Liability", isSystem: true },
+  { code: "2320", name: "Bank Loans Payable", type: "Liability", isSystem: true },
   { code: "3100", name: "Owner Equity", type: "Equity", isSystem: true },
   { code: "4100", name: "Sales Revenue", type: "Revenue", isSystem: true },
   { code: "5100", name: "Cost Of Goods Sold", type: "Expense", isSystem: true },
   { code: "5200", name: "Operating Expense", type: "Expense", isSystem: true },
 ];
 
+function constantTimeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+function getRequestSeedToken(req) {
+  const headerToken = req.headers["x-bootstrap-token"];
+  if (typeof headerToken === "string" && headerToken.length > 0) return headerToken;
+  if (req.body && typeof req.body.seedToken === "string") return req.body.seedToken;
+  return "";
+}
+
 exports.seedSystem = async (req, res) => {
   try {
-    const { branchId, branchName = "Main Branch", adminEmail = "admin@bdpos.local", adminPassword = "123456" } = req.body;
+    // Gate 1: optional shared-secret token. Mandatory in production.
+    const expectedToken = config.bootstrap.seedToken || "";
+    if (config.isProd && !expectedToken) {
+      return res.status(503).json({
+        error: "Bootstrap is disabled in production. Set BOOTSTRAP_SEED_TOKEN to enable.",
+      });
+    }
+    if (expectedToken) {
+      const got = getRequestSeedToken(req);
+      if (!constantTimeEqual(expectedToken, got)) {
+        return res.status(401).json({ error: "Invalid bootstrap token." });
+      }
+    }
+
+    const {
+      branchId,
+      branchName = "Main Branch",
+      adminEmail = "admin@bdpos.local",
+      adminPassword = "123456",
+    } = req.body || {};
+
     let bId = Number(branchId || 0);
-    if (!bId) {
+
+    // Gate 2: if a branch is supplied and already bootstrapped, refuse.
+    if (bId) {
+      const existing = await prisma.branch.findUnique({ where: { id: bId } });
+      if (!existing) {
+        return res.status(404).json({ error: `Branch ${bId} not found.` });
+      }
+      if (existing.bootstrapped) {
+        return res.status(409).json({
+          error: `Branch ${bId} is already bootstrapped (at ${existing.bootstrappedAt?.toISOString() || "unknown"}).`,
+        });
+      }
+    } else {
+      // Gate 3: if no branchId is supplied AND any branch is already bootstrapped,
+      // assume the system is set up and refuse to create another root.
+      const anyBootstrapped = await prisma.branch.findFirst({
+        where: { bootstrapped: true },
+        select: { id: true, name: true, bootstrappedAt: true },
+      });
+      if (anyBootstrapped) {
+        return res.status(409).json({
+          error: `System already bootstrapped (branch "${anyBootstrapped.name}", id ${anyBootstrapped.id}). Pass an explicit branchId to seed an additional branch.`,
+        });
+      }
+
       const createdBranch = await prisma.branch.create({
         data: {
           code: `BR-${Date.now()}`,
@@ -65,6 +131,8 @@ exports.seedSystem = async (req, res) => {
       });
       bId = createdBranch.id;
     }
+
+    // --- Idempotent seed body (unchanged behaviour) ---
 
     for (const code of permissionCodes) {
       await prisma.permission.upsert({
@@ -132,6 +200,12 @@ exports.seedSystem = async (req, res) => {
 
     const existingAdmin = await prisma.user.findUnique({ where: { email: adminEmail } });
     if (!existingAdmin) {
+      // Refuse to seed the default insecure admin password in production.
+      if (config.isProd && adminPassword === "123456") {
+        return res.status(400).json({
+          error: "Refusing to create admin with the default password in production. Pass a strong adminPassword.",
+        });
+      }
       const passwordHash = await bcrypt.hash(adminPassword, 10);
       await prisma.user.create({
         data: {
@@ -144,8 +218,21 @@ exports.seedSystem = async (req, res) => {
       });
     }
 
-    res.json({ message: "System seeded", branchId: bId, adminEmail, adminPassword });
+    // Mark branch as bootstrapped — this blocks future seed attempts on this branch.
+    await prisma.branch.update({
+      where: { id: bId },
+      data: { bootstrapped: true, bootstrappedAt: new Date() },
+    });
+
+    return res.json({
+      message: "System seeded",
+      branchId: bId,
+      adminEmail,
+      // Never echo the password back in production.
+      adminPassword: config.isProd ? "***" : adminPassword,
+      bootstrappedAt: new Date().toISOString(),
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 };

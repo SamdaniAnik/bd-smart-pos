@@ -44,8 +44,8 @@ function Promotions() {
   }, []);
 
   useEffect(() => {
-    if (tab === "coupons") loadCoupons();
-  }, [tab]);
+    loadCoupons();
+  }, []);
 
   const createRule = async (e) => {
     e.preventDefault();
@@ -129,23 +129,35 @@ function Promotions() {
   };
 
   return (
-    <div>
-      <h2>Promotions</h2>
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-        <button
-          type="button"
-          className={tab === "rules" ? "btn-secondary" : "btn-ghost"}
-          onClick={() => setTab("rules")}
-        >
-          Auto rules (BOGO / cart %)
-        </button>
-        <button
-          type="button"
-          className={tab === "coupons" ? "btn-secondary" : "btn-ghost"}
-          onClick={() => setTab("coupons")}
-        >
-          Checkout coupon codes
-        </button>
+    <div className="page-stack">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Promotions</div>
+          <div className="page-subtitle">Automatic cart rules and checkout coupon codes</div>
+        </div>
+      </div>
+      <div className="pos-tabs">
+        <div className="pos-tablist" role="tablist" aria-label="Promotion views">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "rules"}
+            className={`pos-tab ${tab === "rules" ? "pos-tab-active" : ""}`}
+            onClick={() => setTab("rules")}
+          >
+            Auto rules (BOGO / cart %)
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "coupons"}
+            className={`pos-tab ${tab === "coupons" ? "pos-tab-active" : ""}`}
+            onClick={() => setTab("coupons")}
+          >
+            Checkout coupon codes
+            <span className="pos-tab-badge">{couponRows.length}</span>
+          </button>
+        </div>
       </div>
 
       {tab === "coupons" ? (
@@ -161,6 +173,7 @@ function Promotions() {
               required
             />
             <select
+              className="form-select-sm"
               value={couponForm.discountType}
               onChange={(e) => setCouponForm((f) => ({ ...f, discountType: e.target.value }))}
             >
@@ -240,7 +253,7 @@ function Promotions() {
           onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
           required
         />
-        <select value={form.type} onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}>
+        <select className="form-select-sm" value={form.type} onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}>
           <option value="CART_PERCENT">Cart % Off</option>
           <option value="CATEGORY_PERCENT">Category % Off</option>
           <option value="BOGO_PRODUCT">BOGO Product</option>
@@ -249,7 +262,7 @@ function Promotions() {
         </select>
         {form.type === "BOGO_PRODUCT" ? (
           <>
-            <select value={form.productId} onChange={(e) => setForm((f) => ({ ...f, productId: e.target.value }))} required>
+            <select className="form-select-sm" value={form.productId} onChange={(e) => setForm((f) => ({ ...f, productId: e.target.value }))} required>
               <option value="">Select product</option>
               {products.map((p) => (
                 <option key={p.id} value={p.id}>

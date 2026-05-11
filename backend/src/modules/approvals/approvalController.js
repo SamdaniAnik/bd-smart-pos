@@ -166,6 +166,93 @@ async function executePendingStockAdjustmentApproval(tx, approvalEvent) {
   return { adjustmentId };
 }
 
+async function resolveVendorBillApproval({ approvalEvent, decision, reviewerUserId }) {
+  const payload = approvalEvent.payload || {};
+  const branchId = Number(payload.branchId || 0);
+  const request = payload.request || {};
+  const purchaseId = Number(request.purchaseId || approvalEvent.entityId || 0);
+  if (!branchId || !purchaseId) return;
+  const logs = await prisma.auditLog.findMany({
+    where: {
+      action: "VENDOR_BILL_RECORD",
+      entity: "Purchase",
+      entityId: purchaseId,
+    },
+    orderBy: { createdAt: "desc" },
+    take: 1,
+  });
+  const existing = logs[0]?.payload || {};
+  if (Number(existing.branchId || 0) !== Number(branchId)) return;
+  const nowIso = new Date().toISOString();
+  const nextPayload = {
+    ...existing,
+    status: decision === "APPROVED" ? "APPROVED" : decision === "REJECTED" ? "REJECTED" : existing.status || "SUBMITTED",
+    approvedAt: decision === "APPROVED" ? nowIso : existing.approvedAt || null,
+    approvedByUserId: decision === "APPROVED" ? reviewerUserId || null : existing.approvedByUserId || null,
+    rejectedAt: decision === "REJECTED" ? nowIso : null,
+    rejectedByUserId: decision === "REJECTED" ? reviewerUserId || null : null,
+    rejectionReason:
+      decision === "REJECTED"
+        ? String(payload?.review?.remark || "").trim()
+        : "",
+    updatedAt: nowIso,
+    linkedApprovalEventId: Number(approvalEvent.id || 0) || existing.linkedApprovalEventId || null,
+  };
+  await prisma.auditLog.create({
+    data: {
+      userId: reviewerUserId || null,
+      action: "VENDOR_BILL_RECORD",
+      entity: "Purchase",
+      entityId: purchaseId,
+      payload: nextPayload,
+    },
+  });
+}
+
+async function executeApprovedHighRiskFinancialAction({ approvalEvent, reviewerUserId }) {
+  const payload = approvalEvent.payload || {};
+  const request = payload.request || {};
+  if (approvalEvent.action === "APPROVAL_FINANCIAL_PERIOD_REOPEN") {
+    const periodId = Number(request.periodId || approvalEvent.entityId || 0);
+    const branchId = Number(request.branchId || 0);
+    if (!periodId || !branchId) return;
+    const period = await prisma.fiscalPeriod.findFirst({ where: { id: periodId, branchId } });
+    if (!period || !period.isClosed) return;
+    await prisma.fiscalPeriod.update({
+      where: { id: periodId },
+      data: { isClosed: false },
+    });
+    return;
+  }
+  if (approvalEvent.action === "APPROVAL_MANUAL_JOURNAL_HIGH_VALUE") {
+    const branchId = Number(request.branchId || 0);
+    const lines = Array.isArray(request.lines) ? request.lines : [];
+    const narration = String(request.narration || "");
+    const refType = String(request.refType || "MANUAL");
+    const costCenterId = request.costCenterId != null ? Number(request.costCenterId) : null;
+    if (!branchId || lines.length < 2) return;
+    const debit = lines.reduce((s, l) => s + Number(l.debit || 0), 0);
+    const credit = lines.reduce((s, l) => s + Number(l.credit || 0), 0);
+    if (Math.abs(debit - credit) > 0.001) return;
+    await prisma.journal.create({
+      data: {
+        branchId,
+        createdBy: reviewerUserId || null,
+        refType,
+        costCenterId: Number.isFinite(costCenterId) && costCenterId > 0 ? costCenterId : null,
+        narration,
+        lines: {
+          create: lines.map((l) => ({
+            accountId: Number(l.accountId),
+            debit: Number(l.debit || 0),
+            credit: Number(l.credit || 0),
+          })),
+        },
+      },
+    });
+  }
+}
+
 function toCSV(rows) {
   if (!rows.length) return "";
   const headers = Object.keys(rows[0]);
@@ -408,6 +495,33 @@ exports.reviewApproval = async (req, res) => {
         },
       },
     });
+    if (row.action === "APPROVAL_VENDOR_BILL" && ["APPROVED", "REJECTED"].includes(nextStatus)) {
+      await resolveVendorBillApproval({
+        approvalEvent: {
+          ...row,
+          payload: {
+            ...(row.payload || {}),
+            review,
+            status: nextStatus,
+          },
+        },
+        decision: nextStatus,
+        reviewerUserId: req.user?.id || null,
+      });
+    }
+    if (nextStatus === "APPROVED" && ["APPROVAL_FINANCIAL_PERIOD_REOPEN", "APPROVAL_MANUAL_JOURNAL_HIGH_VALUE"].includes(row.action)) {
+      await executeApprovedHighRiskFinancialAction({
+        approvalEvent: {
+          ...row,
+          payload: {
+            ...(row.payload || {}),
+            review,
+            status: nextStatus,
+          },
+        },
+        reviewerUserId: req.user?.id || null,
+      });
+    }
     const reviewerName = req.user?.name || req.user?.email || "";
     res.json({
       ...normalizeApprovalLog(updated),
@@ -501,6 +615,123 @@ exports.exportApprovalsPDF = async (req, res) => {
       data,
       "approval-queue.pdf"
     );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getOverrideAuthorityDashboard = async (_req, res) => {
+  try {
+    const targetCodes = ["financial.lock.override", "financial.lock.maturity.override"];
+    const permissions = await prisma.permission.findMany({
+      where: { code: { in: targetCodes } },
+      select: { id: true, code: true },
+    });
+    const permById = new Map(permissions.map((p) => [p.id, p.code]));
+    const roles = await prisma.role.findMany({
+      include: {
+        rolePermissions: { include: { permission: true } },
+        users: { select: { id: true, name: true, email: true } },
+      },
+      orderBy: { name: "asc" },
+    });
+    const roleRows = roles
+      .map((role) => {
+        const codes = new Set(
+          (role.rolePermissions || [])
+            .map((rp) => rp?.permission?.code || permById.get(rp?.permissionId))
+            .filter(Boolean)
+        );
+        return {
+          roleId: role.id,
+          roleName: role.name,
+          override: codes.has("financial.lock.override"),
+          maturityOverride: codes.has("financial.lock.maturity.override"),
+          userCount: Array.isArray(role.users) ? role.users.length : 0,
+        };
+      })
+      .filter((x) => x.override || x.maturityOverride);
+    const userRows = roleRows.flatMap((role) => {
+      const roleRef = roles.find((r) => Number(r.id) === Number(role.roleId));
+      return (roleRef?.users || []).map((u) => ({
+        userId: u.id,
+        userName: u.name || u.email || `User#${u.id}`,
+        roleName: role.roleName,
+        override: role.override,
+        maturityOverride: role.maturityOverride,
+      }));
+    });
+    res.json({
+      summary: {
+        roleCount: roleRows.length,
+        userCount: userRows.length,
+        maturityOverrideRoleCount: roleRows.filter((r) => r.maturityOverride).length,
+      },
+      roleRows,
+      userRows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getOverrideExceptionReport = async (req, res) => {
+  try {
+    const from = req.query.from ? new Date(`${req.query.from}T00:00:00.000Z`) : null;
+    const to = req.query.to ? new Date(`${req.query.to}T23:59:59.999Z`) : null;
+    const domain = String(req.query.domain || "PROCUREMENT_PAYABLES").trim().toUpperCase();
+    const logs = await prisma.auditLog.findMany({
+      where: {
+        action: "FINANCIAL_LOCK_BYPASS",
+        ...(from || to
+          ? {
+              createdAt: {
+                ...(from ? { gte: from } : {}),
+                ...(to ? { lte: to } : {}),
+              },
+            }
+          : {}),
+      },
+      orderBy: { createdAt: "desc" },
+      take: 1000,
+    });
+    const filtered = logs.filter((log) =>
+      domain ? String(log?.payload?.overrideDomain || "").toUpperCase() === domain : true
+    );
+    const userIds = [...new Set(filtered.map((x) => Number(x.userId || 0)).filter(Boolean))];
+    const users = userIds.length
+      ? await prisma.user.findMany({
+          where: { id: { in: userIds } },
+          select: { id: true, name: true, email: true, role: { select: { name: true } } },
+        })
+      : [];
+    const userMap = new Map(users.map((u) => [u.id, u]));
+    const rows = filtered.map((log) => {
+      const u = userMap.get(Number(log.userId || 0));
+      return {
+        id: log.id,
+        date: log.createdAt,
+        actionName: String(log.payload?.actionName || ""),
+        overrideDomain: String(log.payload?.overrideDomain || ""),
+        overrideReason: String(log.payload?.overrideReason || ""),
+        overrideRefNo: String(log.payload?.overrideRefNo || ""),
+        roleName: String(log.payload?.roleName || u?.role?.name || ""),
+        userName: u?.name || u?.email || `User#${log.userId || ""}`,
+        quota: Number(log.payload?.quota || 0),
+        monthUsageAfter: Number(log.payload?.monthUsageAfter || 0),
+      };
+    });
+    res.json({
+      summary: {
+        count: rows.length,
+        byRole: rows.reduce((acc, row) => {
+          const key = row.roleName || "Unknown";
+          acc[key] = Number(acc[key] || 0) + 1;
+          return acc;
+        }, {}),
+      },
+      rows,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

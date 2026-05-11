@@ -1,5 +1,6 @@
 const prisma = require("../../utils/prisma");
 const { writeAuditLog } = require("../../utils/audit");
+const PDFDocument = require("pdfkit");
 
 function clean(value, max = 120) {
   return String(value || "").trim().slice(0, max);
@@ -9,6 +10,117 @@ function normalizePeriodKey(value) {
   const raw = String(value || "").trim();
   if (!/^\d{4}-\d{2}$/.test(raw)) return null;
   return raw;
+}
+
+function toCSV(rows) {
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  const lines = [headers.join(",")];
+  for (const row of rows) {
+    const values = headers.map((h) => `"${String(row[h] ?? "").replaceAll('"', '""')}"`);
+    lines.push(values.join(","));
+  }
+  return lines.join("\n");
+}
+
+async function buildCostCenterBudgetVsActualPayload(branchId, query = {}) {
+  const periodKey =
+    normalizePeriodKey(query.periodKey) ||
+    `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
+  const thresholdPctRaw = Number(query.thresholdPct || 10);
+  const thresholdPct = Number.isFinite(thresholdPctRaw) && thresholdPctRaw >= 0 ? thresholdPctRaw : 10;
+  const periodStart = new Date(`${periodKey}-01T00:00:00.000Z`);
+  const periodEnd = new Date(
+    Date.UTC(periodStart.getUTCFullYear(), periodStart.getUTCMonth() + 1, 0, 23, 59, 59, 999)
+  );
+
+  const [costCenters, budgets, lines] = await Promise.all([
+    prisma.costCenter.findMany({
+      where: { branchId },
+      orderBy: [{ isActive: "desc" }, { code: "asc" }],
+      take: 1000,
+    }),
+    prisma.costCenterBudget.findMany({
+      where: { branchId, periodKey },
+    }),
+    prisma.journalLine.findMany({
+      where: {
+        journal: {
+          branchId,
+          createdAt: { gte: periodStart, lte: periodEnd },
+          costCenterId: { not: null },
+        },
+      },
+      include: {
+        journal: {
+          select: { costCenterId: true },
+        },
+        account: { select: { type: true } },
+      },
+      take: 20000,
+    }),
+  ]);
+
+  const budgetByCc = new Map(budgets.map((b) => [Number(b.costCenterId), b]));
+  const actualByCc = new Map();
+  for (const line of lines) {
+    const ccId = Number(line.journal?.costCenterId || 0);
+    if (!ccId) continue;
+    if (!actualByCc.has(ccId)) {
+      actualByCc.set(ccId, { expenseActual: 0, revenueActual: 0 });
+    }
+    const current = actualByCc.get(ccId);
+    const debit = Number(line.debit || 0);
+    const credit = Number(line.credit || 0);
+    if (line.account?.type === "Expense") current.expenseActual += debit - credit;
+    if (line.account?.type === "Revenue") current.revenueActual += credit - debit;
+    actualByCc.set(ccId, current);
+  }
+
+  const rows = costCenters.map((cc) => {
+    const budget = budgetByCc.get(cc.id);
+    const actual = actualByCc.get(cc.id) || { expenseActual: 0, revenueActual: 0 };
+    const expenseBudget = Number(budget?.expenseBudget || 0);
+    const revenueBudget = Number(budget?.revenueBudget || 0);
+    const expenseActual = Number(actual.expenseActual || 0);
+    const revenueActual = Number(actual.revenueActual || 0);
+    const expenseVariance = expenseActual - expenseBudget;
+    const revenueVariance = revenueActual - revenueBudget;
+    const expenseVariancePct = expenseBudget > 0 ? (expenseVariance / expenseBudget) * 100 : 0;
+    const revenueVariancePct = revenueBudget > 0 ? (revenueVariance / revenueBudget) * 100 : 0;
+    const expenseAlert = expenseBudget > 0 && expenseVariancePct >= thresholdPct;
+    const revenueAlert = revenueBudget > 0 && revenueVariancePct <= -thresholdPct;
+    return {
+      costCenterId: cc.id,
+      code: cc.code,
+      name: cc.name,
+      isActive: cc.isActive,
+      periodKey,
+      expenseBudget: Number(expenseBudget.toFixed(2)),
+      expenseActual: Number(expenseActual.toFixed(2)),
+      expenseVariance: Number(expenseVariance.toFixed(2)),
+      expenseVariancePct: Number(expenseVariancePct.toFixed(2)),
+      expenseAlert,
+      revenueBudget: Number(revenueBudget.toFixed(2)),
+      revenueActual: Number(revenueActual.toFixed(2)),
+      revenueVariance: Number(revenueVariance.toFixed(2)),
+      revenueVariancePct: Number(revenueVariancePct.toFixed(2)),
+      revenueAlert,
+      hasAlert: Boolean(expenseAlert || revenueAlert),
+    };
+  });
+
+  const summary = rows.reduce(
+    (acc, row) => {
+      if (row.expenseAlert) acc.expenseAlerts += 1;
+      if (row.revenueAlert) acc.revenueAlerts += 1;
+      if (row.hasAlert) acc.totalAlertedCostCenters += 1;
+      return acc;
+    },
+    { totalAlertedCostCenters: 0, expenseAlerts: 0, revenueAlerts: 0 }
+  );
+
+  return { periodKey, thresholdPct, summary, rows };
 }
 
 exports.listCostCenters = async (req, res) => {
@@ -232,80 +344,79 @@ exports.upsertCostCenterBudget = async (req, res) => {
 
 exports.getCostCenterBudgetVsActual = async (req, res) => {
   try {
-    const branchId = req.branchId;
-    const periodKey =
-      normalizePeriodKey(req.query?.periodKey) ||
-      `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
-    const periodStart = new Date(`${periodKey}-01T00:00:00.000Z`);
-    const periodEnd = new Date(Date.UTC(periodStart.getUTCFullYear(), periodStart.getUTCMonth() + 1, 0, 23, 59, 59, 999));
+    const payload = await buildCostCenterBudgetVsActualPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
 
-    const [costCenters, budgets, lines] = await Promise.all([
-      prisma.costCenter.findMany({
-        where: { branchId },
-        orderBy: [{ isActive: "desc" }, { code: "asc" }],
-        take: 1000,
-      }),
-      prisma.costCenterBudget.findMany({
-        where: { branchId, periodKey },
-      }),
-      prisma.journalLine.findMany({
-        where: {
-          journal: {
-            branchId,
-            createdAt: { gte: periodStart, lte: periodEnd },
-            costCenterId: { not: null },
-          },
-        },
-        include: {
-          journal: {
-            select: { costCenterId: true },
-          },
-          account: { select: { type: true } },
-        },
-        take: 20000,
-      }),
-    ]);
+exports.exportCostCenterBudgetVsActualCSV = async (req, res) => {
+  try {
+    const payload = await buildCostCenterBudgetVsActualPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      period: payload.periodKey,
+      cost_center_code: r.code,
+      cost_center_name: r.name,
+      expense_budget: Number(r.expenseBudget || 0).toFixed(2),
+      expense_actual: Number(r.expenseActual || 0).toFixed(2),
+      expense_variance: Number(r.expenseVariance || 0).toFixed(2),
+      expense_variance_pct: Number(r.expenseVariancePct || 0).toFixed(2),
+      expense_alert: r.expenseAlert ? "YES" : "NO",
+      revenue_budget: Number(r.revenueBudget || 0).toFixed(2),
+      revenue_actual: Number(r.revenueActual || 0).toFixed(2),
+      revenue_variance: Number(r.revenueVariance || 0).toFixed(2),
+      revenue_variance_pct: Number(r.revenueVariancePct || 0).toFixed(2),
+      revenue_alert: r.revenueAlert ? "YES" : "NO",
+      has_alert: r.hasAlert ? "YES" : "NO",
+    }));
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="cost-center-budget-vs-actual.csv"');
+    res.send(toCSV(rows));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
 
-    const budgetByCc = new Map(budgets.map((b) => [Number(b.costCenterId), b]));
-    const actualByCc = new Map();
-    for (const line of lines) {
-      const ccId = Number(line.journal?.costCenterId || 0);
-      if (!ccId) continue;
-      if (!actualByCc.has(ccId)) {
-        actualByCc.set(ccId, { expenseActual: 0, revenueActual: 0 });
-      }
-      const current = actualByCc.get(ccId);
-      const debit = Number(line.debit || 0);
-      const credit = Number(line.credit || 0);
-      if (line.account?.type === "Expense") current.expenseActual += debit - credit;
-      if (line.account?.type === "Revenue") current.revenueActual += credit - debit;
-      actualByCc.set(ccId, current);
+exports.exportCostCenterBudgetVsActualPDF = async (req, res) => {
+  try {
+    const payload = await buildCostCenterBudgetVsActualPayload(req.branchId, req.query || {});
+    const doc = new PDFDocument({ margin: 40, size: "A4", bufferPages: true });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="cost-center-budget-vs-actual.pdf"');
+    doc.pipe(res);
+
+    doc.fontSize(16).font("Helvetica-Bold").text("Cost Center Budget vs Actual", { align: "center" });
+    doc.moveDown(0.5);
+    doc.fontSize(10).font("Helvetica").text(`Period: ${payload.periodKey}`);
+    doc.text(`Alert threshold: ${Number(payload.thresholdPct || 0).toFixed(2)}%`);
+    doc.text(
+      `Alerted cost centers: ${payload.summary?.totalAlertedCostCenters || 0} | Expense alerts: ${payload.summary?.expenseAlerts || 0} | Revenue alerts: ${payload.summary?.revenueAlerts || 0}`
+    );
+    doc.moveDown(0.8);
+
+    for (const r of payload.rows || []) {
+      const flags = [];
+      if (r.expenseAlert) flags.push("Expense Alert");
+      if (r.revenueAlert) flags.push("Revenue Alert");
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(10)
+        .text(`${r.code} - ${r.name}${flags.length ? ` [${flags.join(", ")}]` : ""}`);
+      doc
+        .font("Helvetica")
+        .fontSize(9)
+        .text(
+          `Exp Budget: ${Number(r.expenseBudget || 0).toFixed(2)} | Exp Actual: ${Number(r.expenseActual || 0).toFixed(2)} | Exp Var: ${Number(r.expenseVariance || 0).toFixed(2)} (${Number(r.expenseVariancePct || 0).toFixed(2)}%)`
+        );
+      doc.text(
+        `Rev Budget: ${Number(r.revenueBudget || 0).toFixed(2)} | Rev Actual: ${Number(r.revenueActual || 0).toFixed(2)} | Rev Var: ${Number(r.revenueVariance || 0).toFixed(2)} (${Number(r.revenueVariancePct || 0).toFixed(2)}%)`
+      );
+      doc.moveDown(0.45);
+      if (doc.y > 760) doc.addPage();
     }
 
-    const rows = costCenters.map((cc) => {
-      const budget = budgetByCc.get(cc.id);
-      const actual = actualByCc.get(cc.id) || { expenseActual: 0, revenueActual: 0 };
-      const expenseBudget = Number(budget?.expenseBudget || 0);
-      const revenueBudget = Number(budget?.revenueBudget || 0);
-      const expenseActual = Number(actual.expenseActual || 0);
-      const revenueActual = Number(actual.revenueActual || 0);
-      const expenseVariance = expenseActual - expenseBudget;
-      const revenueVariance = revenueActual - revenueBudget;
-      return {
-        costCenterId: cc.id,
-        code: cc.code,
-        name: cc.name,
-        isActive: cc.isActive,
-        periodKey,
-        expenseBudget: Number(expenseBudget.toFixed(2)),
-        expenseActual: Number(expenseActual.toFixed(2)),
-        expenseVariance: Number(expenseVariance.toFixed(2)),
-        revenueBudget: Number(revenueBudget.toFixed(2)),
-        revenueActual: Number(revenueActual.toFixed(2)),
-        revenueVariance: Number(revenueVariance.toFixed(2)),
-      };
-    });
-    res.json(rows);
+    doc.end();
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

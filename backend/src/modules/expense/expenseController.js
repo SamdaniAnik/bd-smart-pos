@@ -20,7 +20,11 @@ exports.createExpense = async (req, res) => {
       return res.status(400).json({ error: "Invalid costCenterId" });
     }
 
-    await ensureOpenFiscalPeriod(branchId, parsedDate);
+    await ensureOpenFiscalPeriod(branchId, parsedDate, {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      actionName: "expense.create",
+    });
     if (costCenterId != null) {
       const cc = await prisma.costCenter.findFirst({ where: { id: costCenterId, branchId } });
       if (!cc) return res.status(404).json({ error: "Cost center not found in this branch" });
@@ -141,7 +145,11 @@ exports.updateExpense = async (req, res) => {
       return res.status(400).json({ error: "Invalid costCenterId" });
     }
 
-    await ensureOpenFiscalPeriod(req.branchId, parsedDate);
+    await ensureOpenFiscalPeriod(req.branchId, parsedDate, {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      actionName: "expense.update",
+    });
     if (costCenterId != null) {
       const cc = await prisma.costCenter.findFirst({ where: { id: costCenterId, branchId: req.branchId } });
       if (!cc) return res.status(404).json({ error: "Cost center not found in this branch" });

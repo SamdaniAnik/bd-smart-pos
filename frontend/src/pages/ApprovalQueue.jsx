@@ -7,6 +7,8 @@ const APPROVAL_FOCUS_KEY = "bd_pos_approval_focus_id";
 function ApprovalQueue() {
   const [rows, setRows] = useState([]);
   const [summary, setSummary] = useState({});
+  const [overrideAuthority, setOverrideAuthority] = useState({ summary: {}, roleRows: [], userRows: [] });
+  const [overrideExceptions, setOverrideExceptions] = useState({ summary: {}, rows: [] });
   const [filters, setFilters] = useState({ id: "", from: "", to: "", action: "", status: "", overdueOnly: false });
   const [reviewRemark, setReviewRemark] = useState("");
 
@@ -22,9 +24,15 @@ function ApprovalQueue() {
   };
 
   const load = async () => {
-    const res = await api.get(`/approvals${queryString()}`);
+    const [res, authorityRes, exceptionsRes] = await Promise.all([
+      api.get(`/approvals${queryString()}`),
+      api.get("/approvals/override-authority"),
+      api.get(`/approvals/override-exceptions${queryString()}`),
+    ]);
     setRows(res.data.rows || []);
     setSummary(res.data.summary || {});
+    setOverrideAuthority(authorityRes.data || { summary: {}, roleRows: [], userRows: [] });
+    setOverrideExceptions(exceptionsRes.data || { summary: {}, rows: [] });
   };
 
   useEffect(() => {
@@ -98,10 +106,13 @@ function ApprovalQueue() {
           <option value="APPROVAL_RETURN">Return Approval</option>
           <option value="APPROVAL_STOCK_COUNT">Stock Count Approval</option>
           <option value="APPROVAL_STOCK_ADJUSTMENT">Stock Write-off Approval</option>
+          <option value="APPROVAL_VENDOR_BILL">Vendor Bill Approval</option>
           <option value="APPROVAL_PETTY_CASH_CLAIM">Petty Cash Claim Approval</option>
           <option value="APPROVAL_HOLD_DISCARD">Held Cart Discard (other cashier)</option>
           <option value="APPROVAL_HOLD_RESUME">Held Cart Resume (other cashier)</option>
           <option value="APPROVAL_CREDIT_LIMIT">Credit limit override</option>
+          <option value="APPROVAL_FINANCIAL_PERIOD_REOPEN">Fiscal period reopen</option>
+          <option value="APPROVAL_MANUAL_JOURNAL_HIGH_VALUE">High-value manual journal</option>
         </select>
         <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
           <option value="">All Status</option>
@@ -140,6 +151,12 @@ function ApprovalQueue() {
         <div className="stat">Overdue 24h+: {Number(summary.overdue24h || 0)}</div>
         <div className="stat">Amount: ৳{Number(summary.totalAmount || 0).toFixed(2)}</div>
       </div>
+      <div className="quick-stats" style={{ marginBottom: 12 }}>
+        <div className="stat">Override roles: {Number(overrideAuthority.summary?.roleCount || 0)}</div>
+        <div className="stat">Override users: {Number(overrideAuthority.summary?.userCount || 0)}</div>
+        <div className="stat">Maturity override roles: {Number(overrideAuthority.summary?.maturityOverrideRoleCount || 0)}</div>
+        <div className="stat">Override exceptions: {Number(overrideExceptions.summary?.count || 0)}</div>
+      </div>
       <div className="form-grid" style={{ marginBottom: 12 }}>
         <input
           placeholder="Review remark for selected row action"
@@ -147,6 +164,33 @@ function ApprovalQueue() {
           onChange={(e) => setReviewRemark(e.target.value)}
         />
       </div>
+      <DataTable
+        title="Who can override"
+        rows={overrideAuthority.roleRows || []}
+        searchableKeys={["roleName"]}
+        columns={[
+          { key: "roleName", label: "Role" },
+          { key: "override", label: "Can override", render: (v) => (v ? "Yes" : "No") },
+          { key: "maturityOverride", label: "Can override maturity lock", render: (v) => (v ? "Yes" : "No") },
+          { key: "userCount", label: "Users" },
+        ]}
+      />
+      <DataTable
+        title="Override exception review report"
+        rows={(overrideExceptions.rows || []).map((r) => ({ ...r, dateLabel: new Date(r.date).toLocaleString() }))}
+        searchableKeys={["userName", "roleName", "actionName", "overrideReason", "overrideRefNo"]}
+        columns={[
+          { key: "id", label: "ID" },
+          { key: "dateLabel", label: "Date" },
+          { key: "userName", label: "User" },
+          { key: "roleName", label: "Role" },
+          { key: "actionName", label: "Action" },
+          { key: "overrideReason", label: "Reason" },
+          { key: "overrideRefNo", label: "Ticket/Ref" },
+          { key: "monthUsageAfter", label: "Monthly usage after" },
+          { key: "quota", label: "Quota" },
+        ]}
+      />
       <DataTable
         rows={rows.map((r) => ({ ...r, createdAtLabel: new Date(r.createdAt).toLocaleString() }))}
         searchableKeys={["action", "status", "reason", "reviewRemark", "requestedByName", "reviewedByName", "createdAtLabel"]}

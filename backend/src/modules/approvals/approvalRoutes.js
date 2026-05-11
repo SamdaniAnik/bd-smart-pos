@@ -6,6 +6,8 @@ const {
   exportApprovalsCSV,
   exportApprovalsPDF,
   exportApprovalsXLSX,
+  getOverrideAuthorityDashboard,
+  getOverrideExceptionReport,
 } = require("./approvalController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -17,5 +19,7 @@ router.post("/:id/escalate", requireAuth, requirePermission("report.view"), esca
 router.get("/export.csv", requireAuth, requirePermission("report.view"), exportApprovalsCSV);
 router.get("/export.pdf", requireAuth, requirePermission("report.view"), exportApprovalsPDF);
 router.get("/export.xlsx", requireAuth, requirePermission("report.view"), exportApprovalsXLSX);
+router.get("/override-authority", requireAuth, requirePermission("report.view"), getOverrideAuthorityDashboard);
+router.get("/override-exceptions", requireAuth, requirePermission("report.view"), getOverrideExceptionReport);
 
 module.exports = router;

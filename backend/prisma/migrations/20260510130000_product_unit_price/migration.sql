@@ -1,0 +1,13 @@
+SET @db := DATABASE();
+SET @sql := (
+  SELECT IF(
+    (SELECT COUNT(*)
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = @db
+       AND TABLE_NAME = 'Product'
+       AND COLUMN_NAME = 'unitPrice') > 0,
+    'SELECT 1',
+    'ALTER TABLE `Product` ADD COLUMN `unitPrice` DOUBLE NOT NULL DEFAULT 0'
+  )
+);
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

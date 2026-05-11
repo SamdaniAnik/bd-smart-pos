@@ -23,8 +23,397 @@ async function ensureBankLoanPayableAccount(tx, branchId) {
   });
 }
 
+async function ensurePurchaseExtraCostAccounts(tx, branchId) {
+  const transportation = await tx.account.upsert({
+    where: { branchId_code: { branchId, code: "5211" } },
+    update: {},
+    create: {
+      branchId,
+      code: "5211",
+      name: "Transportation Expense",
+      type: "Expense",
+      isSystem: true,
+    },
+  });
+  const bribes = await tx.account.upsert({
+    where: { branchId_code: { branchId, code: "5212" } },
+    update: {},
+    create: {
+      branchId,
+      code: "5212",
+      name: "Bribes / Compliance Risk Cost",
+      type: "Expense",
+      isSystem: true,
+    },
+  });
+  const extraOther = await tx.account.upsert({
+    where: { branchId_code: { branchId, code: "5213" } },
+    update: {},
+    create: {
+      branchId,
+      code: "5213",
+      name: "Other Purchase-related Expense",
+      type: "Expense",
+      isSystem: true,
+    },
+  });
+  return { transportation, bribes, extraOther };
+}
+
 function getManagerApprovalPin() {
   return String(process.env.MANAGER_APPROVAL_PIN || "1234");
+}
+
+function normalizeVendorBillAttachments(items = []) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => ({
+      name: String(item?.name || "").trim().slice(0, 160),
+      url: String(item?.url || "").trim().slice(0, 500),
+      mimeType: String(item?.mimeType || "").trim().slice(0, 80),
+      size: Number(item?.size || 0),
+      note: String(item?.note || "").trim().slice(0, 200),
+    }))
+    .filter((x) => x.name && x.url)
+    .slice(0, 20);
+}
+
+function normalizeVendorBillPayload(payload = {}, fallback = {}) {
+  const current = payload || {};
+  return {
+    branchId: Number(current.branchId || fallback.branchId || 0),
+    purchaseId: Number(current.purchaseId || fallback.purchaseId || 0),
+    billNo: String(current.billNo || "").trim(),
+    dueDate: current.dueDate || null,
+    note: String(current.note || "").trim(),
+    status: String(current.status || fallback.status || "DRAFT").toUpperCase(),
+    attachments: normalizeVendorBillAttachments(current.attachments || []),
+    submittedAt: current.submittedAt || null,
+    submittedByUserId: Number(current.submittedByUserId || 0) || null,
+    approvedAt: current.approvedAt || null,
+    approvedByUserId: Number(current.approvedByUserId || 0) || null,
+    rejectedAt: current.rejectedAt || null,
+    rejectedByUserId: Number(current.rejectedByUserId || 0) || null,
+    rejectionReason: String(current.rejectionReason || "").trim(),
+    linkedApprovalEventId: Number(current.linkedApprovalEventId || 0) || null,
+    updatedAt: current.updatedAt || null,
+  };
+}
+
+function startOfDay(value) {
+  const d = new Date(value);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function toIsoDate(value) {
+  return startOfDay(value).toISOString().slice(0, 10);
+}
+
+function buildAutoScheduleEntries({ purchase, installmentCount = 3, startAt = null, endAt = null }) {
+  const due = Number(purchase?.dueAmount || 0);
+  if (!(due > 0)) return [];
+  const count = Math.max(1, Math.min(24, Number(installmentCount || 1)));
+  const anchor = startAt ? startOfDay(startAt) : startOfDay(new Date());
+  let dates = [];
+  if (endAt) {
+    const end = startOfDay(endAt);
+    const totalMonths = Math.max(1, (end.getFullYear() - anchor.getFullYear()) * 12 + (end.getMonth() - anchor.getMonth()));
+    for (let i = 0; i < count; i += 1) {
+      const d = new Date(anchor);
+      const addMonths = Math.round((totalMonths * i) / Math.max(1, count - 1));
+      d.setMonth(d.getMonth() + addMonths);
+      dates.push(toIsoDate(d));
+    }
+  } else {
+    for (let i = 0; i < count; i += 1) {
+      const d = new Date(anchor);
+      d.setMonth(d.getMonth() + i);
+      dates.push(toIsoDate(d));
+    }
+  }
+  const base = Number((due / count).toFixed(2));
+  let remaining = Number(due.toFixed(2));
+  const entries = [];
+  for (let i = 0; i < count; i += 1) {
+    const amount = i === count - 1 ? Number(remaining.toFixed(2)) : base;
+    remaining = Number((remaining - amount).toFixed(2));
+    entries.push({
+      key: `SCH-${Date.now()}-${i + 1}`,
+      dueDate: dates[i],
+      amount,
+      paidAmount: 0,
+      status: "PENDING",
+      reminderCount: 0,
+      remindedAt: null,
+      note: "",
+    });
+  }
+  return entries;
+}
+
+function computeAgingBuckets(rows = []) {
+  const today = startOfDay(new Date());
+  const buckets = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0 };
+  for (const row of rows) {
+    const outstanding = Number(row.outstanding || 0);
+    if (!(outstanding > 0)) continue;
+    const due = startOfDay(row.dueDate || new Date());
+    const days = Math.floor((today.getTime() - due.getTime()) / (24 * 60 * 60 * 1000));
+    if (days <= 0) buckets.current += outstanding;
+    else if (days <= 30) buckets.d1_30 += outstanding;
+    else if (days <= 60) buckets.d31_60 += outstanding;
+    else if (days <= 90) buckets.d61_90 += outstanding;
+    else buckets.d90_plus += outstanding;
+  }
+  return {
+    current: Number(buckets.current.toFixed(2)),
+    d1_30: Number(buckets.d1_30.toFixed(2)),
+    d31_60: Number(buckets.d31_60.toFixed(2)),
+    d61_90: Number(buckets.d61_90.toFixed(2)),
+    d90_plus: Number(buckets.d90_plus.toFixed(2)),
+  };
+}
+
+async function readLatestScheduleLogByPurchaseIds(branchId, purchaseIds = []) {
+  const ids = [...new Set((purchaseIds || []).map((x) => Number(x)).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const logs = await prisma.auditLog.findMany({
+    where: {
+      action: "PURCHASE_PAYMENT_SCHEDULE",
+      entity: "Purchase",
+      entityId: { in: ids },
+    },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, entityId: true, payload: true, createdAt: true },
+  });
+  const map = new Map();
+  for (const log of logs) {
+    const purchaseId = Number(log.entityId || 0);
+    if (!purchaseId || map.has(purchaseId)) continue;
+    const payload = log.payload || {};
+    if (Number(payload.branchId || 0) !== Number(branchId)) continue;
+    map.set(purchaseId, { id: log.id, createdAt: log.createdAt, payload });
+  }
+  return map;
+}
+
+async function writeScheduleLog({ branchId, purchaseId, userId, schedule }) {
+  return prisma.auditLog.create({
+    data: {
+      userId: userId || null,
+      action: "PURCHASE_PAYMENT_SCHEDULE",
+      entity: "Purchase",
+      entityId: purchaseId,
+      payload: {
+        branchId,
+        purchaseId,
+        ...schedule,
+        updatedAt: new Date().toISOString(),
+      },
+    },
+  });
+}
+
+async function buildPurchaseSchedulePayload(branchId, query = {}) {
+  const includeClosed = String(query.includeClosed || "").toLowerCase() === "true";
+  const purchases = await prisma.purchase.findMany({
+    where: {
+      branchId,
+      ...(includeClosed ? {} : { dueAmount: { gt: 0 } }),
+    },
+    include: { supplier: { select: { id: true, name: true } } },
+    orderBy: { createdAt: "desc" },
+    take: 1000,
+  });
+  const byScheduleLog = await readLatestScheduleLogByPurchaseIds(
+    branchId,
+    purchases.map((x) => x.id)
+  );
+  const rows = [];
+  for (const purchase of purchases) {
+    const existing = byScheduleLog.get(Number(purchase.id))?.payload || null;
+    let entries = Array.isArray(existing?.entries) ? existing.entries : [];
+    if (!entries.length && Number(purchase.dueAmount || 0) > 0) {
+      const installmentCount =
+        String(purchase.financingSource || "").toUpperCase() === "BANK_LOAN" ? 6 : 3;
+      entries = buildAutoScheduleEntries({
+        purchase,
+        installmentCount,
+        startAt: new Date(),
+        endAt: purchase.loanMaturityDate || null,
+      });
+      await writeScheduleLog({
+        branchId,
+        purchaseId: purchase.id,
+        userId: null,
+        schedule: {
+          status: "ACTIVE",
+          autoGenerated: true,
+          entries,
+        },
+      });
+    }
+    for (const entry of entries) {
+      const amount = Number(entry.amount || 0);
+      const paidAmount = Number(entry.paidAmount || 0);
+      const outstanding = Math.max(0, Number((amount - paidAmount).toFixed(2)));
+      const dueDate = entry.dueDate || toIsoDate(new Date());
+      const today = startOfDay(new Date());
+      const due = startOfDay(dueDate);
+      const daysPastDue = Math.max(0, Math.floor((today.getTime() - due.getTime()) / (24 * 60 * 60 * 1000)));
+      rows.push({
+        purchaseId: purchase.id,
+        supplierId: purchase.supplierId,
+        supplierName: purchase.supplier?.name || `Supplier #${purchase.supplierId}`,
+        financingSource: purchase.financingSource,
+        entryKey: String(entry.key || `${purchase.id}-${dueDate}`),
+        dueDate,
+        amount: Number(amount.toFixed(2)),
+        paidAmount: Number(paidAmount.toFixed(2)),
+        outstanding,
+        status: String(entry.status || (outstanding > 0 ? "PENDING" : "PAID")).toUpperCase(),
+        daysPastDue,
+        reminderCount: Number(entry.reminderCount || 0),
+        remindedAt: entry.remindedAt || null,
+      });
+    }
+  }
+  const openRows = rows.filter((x) => Number(x.outstanding || 0) > 0);
+  const aging = computeAgingBuckets(openRows);
+  return {
+    summary: {
+      purchaseCount: [...new Set(rows.map((x) => Number(x.purchaseId)))].length,
+      lineCount: rows.length,
+      openLineCount: openRows.length,
+      outstandingTotal: Number(openRows.reduce((sum, x) => sum + Number(x.outstanding || 0), 0).toFixed(2)),
+      overdueCount: openRows.filter((x) => Number(x.daysPastDue || 0) > 0).length,
+      remindersDue: openRows.filter((x) => Number(x.daysPastDue || 0) > 0 && Number(x.reminderCount || 0) === 0).length,
+      aging,
+    },
+    rows: rows.sort((a, b) => {
+      if (Number(b.daysPastDue || 0) !== Number(a.daysPastDue || 0)) return Number(b.daysPastDue || 0) - Number(a.daysPastDue || 0);
+      return Number(a.purchaseId || 0) - Number(b.purchaseId || 0);
+    }),
+  };
+}
+
+async function runPurchaseScheduleReminderAutomationInternal({ branchId, userId = null }) {
+  const payload = await buildPurchaseSchedulePayload(branchId, { includeClosed: false });
+  const overduePending = (payload.rows || []).filter(
+    (row) => Number(row.outstanding || 0) > 0 && Number(row.daysPastDue || 0) > 0 && Number(row.reminderCount || 0) === 0
+  );
+  const grouped = new Map();
+  for (const row of overduePending) {
+    if (!grouped.has(Number(row.purchaseId))) grouped.set(Number(row.purchaseId), []);
+    grouped.get(Number(row.purchaseId)).push(row);
+  }
+  let updatedEntries = 0;
+  for (const [purchaseId, dueRows] of grouped.entries()) {
+    const existing = (await readLatestScheduleLogByPurchaseIds(branchId, [purchaseId])).get(purchaseId)?.payload || null;
+    if (!existing) continue;
+    const dueKeys = new Set(dueRows.map((x) => String(x.entryKey)));
+    const entries = (Array.isArray(existing.entries) ? existing.entries : []).map((entry) => {
+      if (!dueKeys.has(String(entry.key || ""))) return entry;
+      updatedEntries += 1;
+      return {
+        ...entry,
+        reminderCount: Number(entry.reminderCount || 0) + 1,
+        remindedAt: new Date().toISOString(),
+      };
+    });
+    await writeScheduleLog({
+      branchId,
+      purchaseId,
+      userId,
+      schedule: {
+        ...existing,
+        entries,
+        status: existing.status || "ACTIVE",
+        autoReminderRunAt: new Date().toISOString(),
+      },
+    });
+  }
+  return {
+    remindedEntries: updatedEntries,
+    overdueEntries: overduePending.length,
+    affectedPurchases: grouped.size,
+  };
+}
+
+async function applyPurchaseDuePayment({ tx, branchId, purchaseId, amount, method, note, actorUserId }) {
+  const purchase = await tx.purchase.findFirst({
+    where: { id: purchaseId, branchId },
+    include: { supplier: true },
+  });
+  if (!purchase) throw new Error("Purchase not found");
+  const due = Number(purchase.dueAmount || 0);
+  if (due <= 0) throw new Error("No outstanding amount for this purchase");
+  const parsedAmount = Number(amount || 0);
+  if (!(parsedAmount > 0)) throw new Error("Amount must be greater than zero");
+  if (parsedAmount > due + 0.005) throw new Error("Payment exceeds outstanding amount");
+  const fundingCode = resolveFundingAccountCode(method, null);
+  const fundingAcc = await getSystemAccount(branchId, fundingCode, tx);
+  if (!fundingAcc) throw new Error(`Funding account ${fundingCode} not found`);
+  const financing = String(purchase.financingSource || "SUPPLIER_CREDIT").toUpperCase();
+  const liabilityAccountCode = financing === "BANK_LOAN" ? "2320" : "2100";
+  const liabilityAccount =
+    financing === "BANK_LOAN"
+      ? await ensureBankLoanPayableAccount(tx, branchId)
+      : await getSystemAccount(branchId, liabilityAccountCode, tx);
+  if (!liabilityAccount) throw new Error(`Liability account ${liabilityAccountCode} not found`);
+  const updated = await tx.purchase.update({
+    where: { id: purchaseId },
+    data: {
+      paidAmount: { increment: parsedAmount },
+      dueAmount: { decrement: parsedAmount },
+    },
+  });
+  if (financing !== "BANK_LOAN" && purchase.supplierId) {
+    await tx.supplier.update({
+      where: { id: purchase.supplierId },
+      data: { payableBalance: { decrement: parsedAmount } },
+    });
+  }
+  await tx.journal.create({
+    data: {
+      branchId,
+      purchaseId,
+      createdBy: actorUserId || null,
+      refType: "PURCHASE_DUE_PAYMENT",
+      refId: purchaseId,
+      narration: `Purchase due payment #${purchaseId}${purchase.supplier?.name ? ` (${purchase.supplier.name})` : ""}${note ? ` — ${note}` : ""}`,
+      lines: {
+        create: [
+          { accountId: liabilityAccount.id, debit: parsedAmount, credit: 0 },
+          { accountId: fundingAcc.id, debit: 0, credit: parsedAmount },
+        ],
+      },
+    },
+  });
+  return { purchase: updated, fundingCode };
+}
+
+async function getVendorBillLogsByPurchaseIds(branchId, purchaseIds = []) {
+  const ids = [...new Set((purchaseIds || []).map((x) => Number(x)).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const logs = await prisma.auditLog.findMany({
+    where: {
+      action: "VENDOR_BILL_RECORD",
+      entity: "Purchase",
+      entityId: { in: ids },
+    },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, entityId: true, payload: true, createdAt: true },
+  });
+  const map = new Map();
+  for (const log of logs) {
+    const purchaseId = Number(log.entityId || 0);
+    if (!purchaseId || map.has(purchaseId)) continue;
+    const payload = normalizeVendorBillPayload(log.payload || {}, { branchId, purchaseId, status: "DRAFT" });
+    if (Number(payload.branchId || 0) !== Number(branchId)) continue;
+    map.set(purchaseId, { ...payload, logId: log.id, logCreatedAt: log.createdAt });
+  }
+  return map;
 }
 
 async function buildPurchaseReceivingMap(branchId, purchaseIds = []) {
@@ -87,10 +476,75 @@ function toCSV(rows) {
   return lines.join("\n");
 }
 
+function buildLandedCostAllocation(items = [], extraCostsTotal = 0) {
+  const lines = (items || []).map((item) => {
+    const productId = Number(item.productId || 0);
+    const qty = Number(item.qty || 0);
+    const baseUnitCost = Number(item.cost || 0);
+    const lineBase = qty * baseUnitCost;
+    return {
+      productId,
+      qty,
+      baseUnitCost,
+      lineBase,
+      allocatedExtraCost: 0,
+      landedLineTotal: lineBase,
+      landedUnitCost: qty > 0 ? baseUnitCost : 0,
+    };
+  });
+  const baseTotal = lines.reduce((sum, line) => sum + Number(line.lineBase || 0), 0);
+  if (!(extraCostsTotal > 0) || !(baseTotal > 0) || !lines.length) {
+    return {
+      baseTotal: Number(baseTotal.toFixed(2)),
+      extraCostsTotal: Number(extraCostsTotal.toFixed(2)),
+      landedTotal: Number((baseTotal + extraCostsTotal).toFixed(2)),
+      lines: lines.map((line) => ({
+        ...line,
+        lineBase: Number(line.lineBase.toFixed(2)),
+        allocatedExtraCost: Number(line.allocatedExtraCost.toFixed(2)),
+        landedLineTotal: Number(line.landedLineTotal.toFixed(2)),
+        landedUnitCost: Number(line.landedUnitCost.toFixed(4)),
+      })),
+    };
+  }
+
+  let allocatedSum = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    let allocated = 0;
+    if (i === lines.length - 1) {
+      allocated = Number((extraCostsTotal - allocatedSum).toFixed(2));
+    } else {
+      allocated = Number(((line.lineBase / baseTotal) * extraCostsTotal).toFixed(2));
+      allocatedSum += allocated;
+    }
+    line.allocatedExtraCost = allocated;
+    line.landedLineTotal = Number((line.lineBase + allocated).toFixed(2));
+    line.landedUnitCost =
+      line.qty > 0 ? Number((line.landedLineTotal / line.qty).toFixed(4)) : Number(line.baseUnitCost.toFixed(4));
+  }
+
+  return {
+    baseTotal: Number(baseTotal.toFixed(2)),
+    extraCostsTotal: Number(extraCostsTotal.toFixed(2)),
+    landedTotal: Number((baseTotal + extraCostsTotal).toFixed(2)),
+    lines: lines.map((line) => ({
+      ...line,
+      lineBase: Number(line.lineBase.toFixed(2)),
+      allocatedExtraCost: Number(line.allocatedExtraCost.toFixed(2)),
+      landedLineTotal: Number(line.landedLineTotal.toFixed(2)),
+      landedUnitCost: Number(line.landedUnitCost.toFixed(4)),
+    })),
+  };
+}
+
 exports.createPurchase = async (req, res) => {
   try {
     const branchId = req.branchId;
     const { supplierId, invoiceNo, items, paidAmount = 0 } = req.body;
+    const transportationCost = Number(req.body?.transportationCost || 0);
+    const bribesCost = Number(req.body?.bribesCost || 0);
+    const extraOtherCost = Number(req.body?.extraOtherCost || 0);
     const deferStockPosting = Boolean(req.body?.deferStockPosting);
     const financingRaw = String(req.body?.financingSource || "SUPPLIER_CREDIT").toUpperCase();
     const financingSource = financingRaw === "BANK_LOAN" ? "BANK_LOAN" : "SUPPLIER_CREDIT";
@@ -117,18 +571,28 @@ exports.createPurchase = async (req, res) => {
     if (!Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: "Purchase items required" });
     }
-    await ensureOpenFiscalPeriod(branchId);
+    if (transportationCost < 0 || bribesCost < 0 || extraOtherCost < 0) {
+      return res.status(400).json({ error: "Transportation, bribes, and other costs must be non-negative" });
+    }
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      roleName: req.user?.role?.name || "",
+      actionName: "purchase.create",
+      overrideReason: req.body?.overrideReason,
+      overrideRefNo: req.body?.overrideRefNo,
+    });
 
     let inputVatTotal = 0;
     const purchase = await prisma.$transaction(async (tx) => {
-      let total = 0;
+      let goodsTotal = 0;
       for (const item of items) {
         const qty = Number(item.qty || 0);
         const cost = Number(item.cost || 0);
         const vatRate = Number(item.vatRate || 0);
         const vatType = String(item.vatType || "EXCLUSIVE").toUpperCase();
         const lineBase = qty * cost;
-        total += lineBase;
+        goodsTotal += lineBase;
         if (vatRate > 0 && lineBase > 0) {
           if (vatType === "INCLUSIVE") {
             inputVatTotal += lineBase - lineBase / (1 + vatRate / 100);
@@ -137,12 +601,18 @@ exports.createPurchase = async (req, res) => {
           }
         }
       }
+      const extraCostsTotal = transportationCost + bribesCost + extraOtherCost;
+      const landed = buildLandedCostAllocation(items, extraCostsTotal);
+      const total = goodsTotal + extraCostsTotal;
       const dueAmount = Math.max(0, total - Number(paidAmount));
       const created = await tx.purchase.create({
         data: {
           branchId,
           supplierId: Number(supplierId),
           invoiceNo: invoiceNo || null,
+          transportationCost,
+          bribesCost,
+          extraOtherCost,
           total,
           paidAmount: Number(paidAmount),
           dueAmount,
@@ -161,6 +631,9 @@ exports.createPurchase = async (req, res) => {
       });
 
       if (!deferStockPosting) {
+        const landedByProduct = new Map(
+          (landed.lines || []).map((line) => [Number(line.productId), Number(line.landedUnitCost || 0)])
+        );
         for (const item of items) {
           const productId = Number(item.productId);
           if (Number(item.qty) <= 0 || Number(item.cost) < 0) {
@@ -168,7 +641,10 @@ exports.createPurchase = async (req, res) => {
           }
           await tx.product.update({
             where: { id: productId },
-            data: { stock: { increment: Number(item.qty) }, price: Number(item.cost) },
+            data: {
+              stock: { increment: Number(item.qty) },
+              price: Number(landedByProduct.get(productId) || Number(item.cost)),
+            },
           });
           await tx.stockLedger.create({
             data: {
@@ -177,7 +653,7 @@ exports.createPurchase = async (req, res) => {
               refType: "PURCHASE",
               refId: created.id,
               inQty: Number(item.qty),
-              unitCost: Number(item.cost),
+              unitCost: Number(landedByProduct.get(productId) || Number(item.cost)),
             },
           });
         }
@@ -205,7 +681,31 @@ exports.createPurchase = async (req, res) => {
         throw new Error(isBankLoan ? "Could not resolve Bank Loans Payable (2320)" : "Accounts Payable (2100) missing");
       }
 
-      const journalLineCreates = [{ accountId: inventory.id, debit: total, credit: 0 }];
+      const journalLineCreates = [{ accountId: inventory.id, debit: Number(goodsTotal.toFixed(2)), credit: 0 }];
+      if (transportationCost > 0 || bribesCost > 0 || extraOtherCost > 0) {
+        const expenseAccounts = await ensurePurchaseExtraCostAccounts(tx, branchId);
+        if (transportationCost > 0) {
+          journalLineCreates.push({
+            accountId: expenseAccounts.transportation.id,
+            debit: Number(transportationCost.toFixed(2)),
+            credit: 0,
+          });
+        }
+        if (bribesCost > 0) {
+          journalLineCreates.push({
+            accountId: expenseAccounts.bribes.id,
+            debit: Number(bribesCost.toFixed(2)),
+            credit: 0,
+          });
+        }
+        if (extraOtherCost > 0) {
+          journalLineCreates.push({
+            accountId: expenseAccounts.extraOther.id,
+            debit: Number(extraOtherCost.toFixed(2)),
+            credit: 0,
+          });
+        }
+      }
       if (dueAmount > 0) {
         journalLineCreates.push({ accountId: liabilityAccount.id, debit: 0, credit: dueAmount });
       }
@@ -235,6 +735,9 @@ exports.createPurchase = async (req, res) => {
       payload: {
         branchId,
         supplierId: Number(supplierId),
+        transportationCost,
+        bribesCost,
+        extraOtherCost,
         total: Number(purchase.total || 0),
         deferStockPosting,
         financingSource,
@@ -263,6 +766,7 @@ exports.createPurchase = async (req, res) => {
             })().toFixed(2)
           ),
         })),
+        landedCostAllocation: buildLandedCostAllocation(items, transportationCost + bribesCost + extraOtherCost),
       },
     });
     res.status(201).json(purchase);
@@ -296,6 +800,7 @@ exports.getPurchases = async (req, res) => {
         .filter((x) => x.entityId != null)
         .map((x) => [Number(x.entityId), x.payload || {}])
     );
+    const vendorBillByPurchase = await getVendorBillLogsByPurchaseIds(branchId, purchaseIds);
     const receivingByPurchase = await buildPurchaseReceivingMap(branchId, purchaseIds);
     const withVat = purchases.map((purchase) => {
       const payload = logByPurchaseId.get(Number(purchase.id)) || {};
@@ -315,6 +820,12 @@ exports.getPurchases = async (req, res) => {
           vatSource: payload.inputVat != null ? "LOG" : "ESTIMATED_ZERO",
         },
         receiving,
+        vendorBill: vendorBillByPurchase.get(Number(purchase.id)) || {
+          branchId,
+          purchaseId: Number(purchase.id),
+          status: "DRAFT",
+          attachments: [],
+        },
       };
     });
     res.json(withVat);
@@ -359,6 +870,13 @@ exports.getPurchaseDetails = async (req, res) => {
     );
     const lines = (purchase.items || []).map((item) => {
       const lineBase = Number(item.qty || 0) * Number(item.cost || 0);
+      const landedMap = new Map(
+        (Array.isArray(payload.landedCostAllocation?.lines) ? payload.landedCostAllocation.lines : []).map((line) => [
+          Number(line.productId),
+          line,
+        ])
+      );
+      const landedLine = landedMap.get(Number(item.productId));
       const fromLog = vatLineByProduct.get(Number(item.productId));
       const vatRate = Number(fromLog?.vatRate ?? item.product?.vatRate ?? 0);
       const vatType = String(fromLog?.vatType || "EXCLUSIVE").toUpperCase();
@@ -382,6 +900,11 @@ exports.getPurchaseDetails = async (req, res) => {
         taxableAmount: Number(taxableAmount.toFixed(2)),
         vatAmount: Number(vatAmount.toFixed(2)),
         grossAmount: Number(lineBase.toFixed(2)),
+        allocatedExtraCost: Number(Number(landedLine?.allocatedExtraCost || 0).toFixed(2)),
+        landedUnitCost: Number(Number(landedLine?.landedUnitCost || item.cost || 0).toFixed(4)),
+        landedLineTotal: Number(
+          Number(landedLine?.landedLineTotal != null ? landedLine.landedLineTotal : lineBase).toFixed(2)
+        ),
       };
     });
     const totals = lines.reduce(
@@ -408,6 +931,7 @@ exports.getPurchaseDetails = async (req, res) => {
       take: 20,
       select: { id: true, createdAt: true, payload: true },
     });
+    const vendorBillByPurchase = await getVendorBillLogsByPurchaseIds(branchId, [id]);
     res.json({
       ...purchase,
       vatBreakdown: {
@@ -417,13 +941,130 @@ exports.getPurchaseDetails = async (req, res) => {
         vatSource: vatLinesFromLog.length ? "LOG" : "ESTIMATED",
       },
       vatLines: lines,
+      landedCostAllocation: payload.landedCostAllocation || buildLandedCostAllocation(purchase.items || [], Number(purchase.transportationCost || 0) + Number(purchase.bribesCost || 0) + Number(purchase.extraOtherCost || 0)),
       receiving: receivingSummary,
+      vendorBill: vendorBillByPurchase.get(Number(id)) || {
+        branchId,
+        purchaseId: Number(id),
+        status: "DRAFT",
+        attachments: [],
+      },
       grnHistory: (grnLogs || []).map((x) => ({
         id: x.id,
         createdAt: x.createdAt,
         lines: Array.isArray(x.payload?.items) ? x.payload.items : [],
       })),
     });
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.upsertVendorBillRecord = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const purchaseId = Number(req.params.id);
+    if (Number.isNaN(purchaseId)) return res.status(400).json({ error: "Invalid purchase id" });
+    const purchase = await prisma.purchase.findFirst({ where: { id: purchaseId, branchId }, select: { id: true } });
+    if (!purchase) return res.status(404).json({ error: "Purchase not found" });
+    const existing = (await getVendorBillLogsByPurchaseIds(branchId, [purchaseId])).get(purchaseId);
+    const next = normalizeVendorBillPayload(
+      {
+        ...(existing || {}),
+        billNo: req.body?.billNo,
+        dueDate: req.body?.dueDate || null,
+        note: req.body?.note || "",
+        attachments: req.body?.attachments || [],
+        status: existing?.status && existing.status !== "REJECTED" ? existing.status : "DRAFT",
+        rejectionReason: "",
+        rejectedAt: null,
+        rejectedByUserId: null,
+        updatedAt: new Date().toISOString(),
+      },
+      { branchId, purchaseId, status: "DRAFT" }
+    );
+    const created = await prisma.auditLog.create({
+      data: {
+        userId: req.user?.id || null,
+        action: "VENDOR_BILL_RECORD",
+        entity: "Purchase",
+        entityId: purchaseId,
+        payload: next,
+      },
+    });
+    res.json({ id: created.id, ...next });
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.submitVendorBillApproval = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const purchaseId = Number(req.params.id);
+    if (Number.isNaN(purchaseId)) return res.status(400).json({ error: "Invalid purchase id" });
+    const purchase = await prisma.purchase.findFirst({ where: { id: purchaseId, branchId }, select: { id: true, total: true } });
+    if (!purchase) return res.status(404).json({ error: "Purchase not found" });
+    const existing = (await getVendorBillLogsByPurchaseIds(branchId, [purchaseId])).get(purchaseId);
+    if (!existing) return res.status(400).json({ error: "Save vendor bill first" });
+    if (!existing.attachments?.length) return res.status(400).json({ error: "At least one attachment is required" });
+    const openApproval = await prisma.auditLog.findFirst({
+      where: {
+        action: "APPROVAL_VENDOR_BILL",
+        entity: "Purchase",
+        entityId: purchaseId,
+      },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, payload: true },
+    });
+    const latestStatus = String(openApproval?.payload?.status || "").toUpperCase();
+    if (latestStatus === "PENDING") {
+      return res.status(400).json({ error: "Vendor bill approval already pending" });
+    }
+    const approval = await prisma.auditLog.create({
+      data: {
+        userId: req.user?.id || null,
+        action: "APPROVAL_VENDOR_BILL",
+        entity: "Purchase",
+        entityId: purchaseId,
+        payload: {
+          branchId,
+          status: "PENDING",
+          reason: "Vendor bill approval required",
+          amount: Number(purchase.total || 0),
+          request: {
+            purchaseId,
+            billNo: existing.billNo || null,
+            dueDate: existing.dueDate || null,
+            note: existing.note || "",
+            attachments: existing.attachments || [],
+          },
+        },
+      },
+    });
+    const next = normalizeVendorBillPayload(
+      {
+        ...existing,
+        status: "SUBMITTED",
+        submittedAt: new Date().toISOString(),
+        submittedByUserId: req.user?.id || null,
+        linkedApprovalEventId: approval.id,
+        updatedAt: new Date().toISOString(),
+      },
+      { branchId, purchaseId, status: "SUBMITTED" }
+    );
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user?.id || null,
+        action: "VENDOR_BILL_RECORD",
+        entity: "Purchase",
+        entityId: purchaseId,
+        payload: next,
+      },
+    });
+    res.status(201).json({ message: "Vendor bill submitted for approval", approvalEventId: approval.id, vendorBill: next });
   } catch (error) {
     if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
@@ -437,7 +1078,14 @@ exports.receivePurchaseInStages = async (req, res) => {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     if (Number.isNaN(purchaseId)) return res.status(400).json({ error: "Invalid purchase id" });
     if (!items.length) return res.status(400).json({ error: "Receiving items required" });
-    await ensureOpenFiscalPeriod(branchId);
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      roleName: req.user?.role?.name || "",
+      actionName: "purchase.receive",
+      overrideReason: req.body?.overrideReason,
+      overrideRefNo: req.body?.overrideRefNo,
+    });
     const purchase = await prisma.purchase.findFirst({
       where: { id: purchaseId, branchId },
       include: { items: true },
@@ -458,12 +1106,28 @@ exports.receivePurchaseInStages = async (req, res) => {
         return res.status(400).json({ error: `Receiving qty exceeds remaining for product ${line.productId}` });
       }
     }
+    const purchaseCreateLog = await prisma.auditLog.findFirst({
+      where: {
+        action: "PURCHASE_CREATE",
+        entity: "Purchase",
+        entityId: purchaseId,
+      },
+      orderBy: { createdAt: "desc" },
+      select: { payload: true },
+    });
+    const landedLines = Array.isArray(purchaseCreateLog?.payload?.landedCostAllocation?.lines)
+      ? purchaseCreateLog.payload.landedCostAllocation.lines
+      : [];
+    const landedByProduct = new Map(
+      landedLines.map((line) => [Number(line.productId), Number(line.landedUnitCost || 0)])
+    );
     await prisma.$transaction(async (tx) => {
       for (const line of requested) {
         const ordered = itemByProduct.get(Number(line.productId));
+        const landedUnitCost = Number(landedByProduct.get(Number(line.productId)) || ordered?.cost || 0);
         await tx.product.update({
           where: { id: Number(line.productId) },
-          data: { stock: { increment: Number(line.qty || 0) }, price: Number(ordered?.cost || 0) },
+          data: { stock: { increment: Number(line.qty || 0) }, price: landedUnitCost },
         });
         await tx.stockLedger.create({
           data: {
@@ -472,7 +1136,7 @@ exports.receivePurchaseInStages = async (req, res) => {
             refType: "PURCHASE_GRN",
             refId: purchaseId,
             inQty: Number(line.qty || 0),
-            unitCost: Number(ordered?.cost || 0),
+            unitCost: landedUnitCost,
           },
         });
       }
@@ -593,7 +1257,14 @@ exports.createPurchaseReturn = async (req, res) => {
       return res.status(400).json({ error: "Return items required" });
     }
 
-    await ensureOpenFiscalPeriod(branchId);
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      roleName: req.user?.role?.name || "",
+      actionName: "purchase.return",
+      overrideReason: req.body?.overrideReason,
+      overrideRefNo: req.body?.overrideRefNo,
+    });
 
     const purchase = await prisma.purchase.findFirst({
       where: { id: purchaseId, branchId },
@@ -1193,7 +1864,14 @@ exports.exportPurchasePlanPDF = async (req, res) => {
 exports.createSplitPurchasesFromPlan = async (req, res) => {
   try {
     const branchId = req.branchId;
-    await ensureOpenFiscalPeriod(branchId);
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      roleName: req.user?.role?.name || "",
+      actionName: "purchase.plan.split_execute",
+      overrideReason: req.body?.overrideReason,
+      overrideRefNo: req.body?.overrideRefNo,
+    });
     const payload = await buildPurchasePlanSuggestion(branchId, req.body || req.query || {});
     const reviewedRows = Array.isArray(req.body?.rows) ? req.body.rows : null;
     const rows = reviewedRows
@@ -1417,7 +2095,14 @@ exports.approvePurchasePlanApproval = async (req, res) => {
     if (String(req.body?.managerApprovalPin || "") !== getManagerApprovalPin()) {
       return res.status(403).json({ error: "Manager approval PIN required" });
     }
-    await ensureOpenFiscalPeriod(branchId);
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      roleName: req.user?.role?.name || "",
+      actionName: "purchase.plan.approval_execute",
+      overrideReason: req.body?.overrideReason,
+      overrideRefNo: req.body?.overrideRefNo,
+    });
     const rows = Array.isArray(row.payload?.rows) ? row.payload.rows : [];
     if (!rows.length) return res.status(400).json({ error: "No rows found in approval request" });
     const createdPurchaseIds = await createPurchasesFromPlanRows({
@@ -1631,7 +2316,14 @@ exports.payPurchaseLoan = async (req, res) => {
     const note = req.body?.note != null ? String(req.body.note).slice(0, 500) : null;
     const fundingCode = resolveFundingAccountCode(method, req.body?.fundingAccountCode);
 
-    await ensureOpenFiscalPeriod(branchId);
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      roleName: req.user?.role?.name || "",
+      actionName: "purchase.loan.payment",
+      overrideReason: req.body?.overrideReason,
+      overrideRefNo: req.body?.overrideRefNo,
+    });
 
     const result = await prisma.$transaction(async (tx) => {
       const purchase = await tx.purchase.findFirst({
@@ -1695,6 +2387,215 @@ exports.payPurchaseLoan = async (req, res) => {
       },
     });
 
+    res.status(201).json(result.purchase);
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getPurchasePaymentSchedule = async (req, res) => {
+  try {
+    const payload = await buildPurchaseSchedulePayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.runPurchaseScheduleAutomation = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const result = await runPurchaseScheduleReminderAutomationInternal({
+      branchId,
+      userId: req.user?.id || null,
+    });
+    res.json({
+      message: "Purchase payment schedule automation completed",
+      ...result,
+    });
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.runPurchaseScheduleAutomationCron = async (req, res) => {
+  try {
+    const token = String(req.headers["x-automation-token"] || req.query?.token || "").trim();
+    const expected = String(process.env.PURCHASE_SCHEDULE_AUTOMATION_TOKEN || "").trim();
+    if (!expected) return res.status(503).json({ error: "PURCHASE_SCHEDULE_AUTOMATION_TOKEN is not configured" });
+    if (!token || token !== expected) return res.status(401).json({ error: "Invalid automation token" });
+    const branchIdRaw = Number(req.query?.branchId || req.body?.branchId || 0);
+    if (!Number.isFinite(branchIdRaw) || branchIdRaw <= 0) {
+      return res.status(400).json({ error: "branchId is required for cron automation" });
+    }
+    const result = await runPurchaseScheduleReminderAutomationInternal({
+      branchId: branchIdRaw,
+      userId: null,
+    });
+    res.json({
+      message: "Purchase schedule cron automation completed",
+      branchId: branchIdRaw,
+      ...result,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportPurchasePaymentScheduleCSV = async (req, res) => {
+  try {
+    const payload = await buildPurchaseSchedulePayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((row) => ({
+      purchase_id: row.purchaseId,
+      supplier: row.supplierName,
+      financing_source: row.financingSource,
+      schedule_key: row.entryKey,
+      due_date: row.dueDate,
+      amount: Number(row.amount || 0).toFixed(2),
+      paid_amount: Number(row.paidAmount || 0).toFixed(2),
+      outstanding: Number(row.outstanding || 0).toFixed(2),
+      days_past_due: Number(row.daysPastDue || 0),
+      reminder_count: Number(row.reminderCount || 0),
+      status: row.status,
+    }));
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="purchase-payment-schedule.csv"');
+    res.send(toCSV(rows));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportPurchasePaymentSchedulePDF = async (req, res) => {
+  try {
+    const payload = await buildPurchaseSchedulePayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((row) => ({
+      purchaseId: row.purchaseId,
+      supplierName: row.supplierName,
+      dueDate: row.dueDate,
+      outstanding: Number(row.outstanding || 0).toFixed(2),
+      daysPastDue: Number(row.daysPastDue || 0),
+      status: row.status,
+    }));
+    const doc = new PDFDocument({ margin: 40, size: "A4", bufferPages: true });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="purchase-payment-schedule.pdf"');
+    doc.pipe(res);
+    doc.fontSize(14).font("Helvetica-Bold").text("Purchase Payment Schedule & Aging", { align: "center" });
+    doc.moveDown(0.8);
+    doc.fontSize(9).font("Helvetica");
+    const s = payload.summary || {};
+    doc.text(
+      `Open Lines: ${Number(s.openLineCount || 0)} | Outstanding: ${Number(s.outstandingTotal || 0).toFixed(2)} | Overdue: ${Number(
+        s.overdueCount || 0
+      )}`
+    );
+    doc.text(
+      `Aging -> Current: ${Number(s?.aging?.current || 0).toFixed(2)} | 1-30: ${Number(s?.aging?.d1_30 || 0).toFixed(2)} | 31-60: ${Number(
+        s?.aging?.d31_60 || 0
+      ).toFixed(2)} | 61-90: ${Number(s?.aging?.d61_90 || 0).toFixed(2)} | 90+: ${Number(s?.aging?.d90_plus || 0).toFixed(2)}`
+    );
+    doc.moveDown(0.8);
+    const cols = ["Purchase", "Supplier", "Due", "Outstanding", "DPD", "Status"];
+    const keys = ["purchaseId", "supplierName", "dueDate", "outstanding", "daysPastDue", "status"];
+    const startX = 40;
+    const width = 515;
+    const colW = width / cols.length;
+    let y = doc.y;
+    doc.fontSize(9).font("Helvetica-Bold");
+    cols.forEach((c, i) => doc.text(c, startX + i * colW, y, { width: colW }));
+    y += 14;
+    doc.font("Helvetica");
+    rows.forEach((r) => {
+      if (y > 760) {
+        doc.addPage();
+        y = 50;
+      }
+      keys.forEach((k, i) => doc.text(String(r[k] ?? ""), startX + i * colW, y, { width: colW }));
+      y += 14;
+    });
+    doc.end();
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.payPurchaseScheduleEntry = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const purchaseId = Number(req.params.id);
+    const entryKey = String(req.params.entryKey || "").trim();
+    const amount = Number(req.body?.amount || 0);
+    const method = req.body?.method != null ? String(req.body.method) : "Cash";
+    const note = req.body?.note != null ? String(req.body.note).slice(0, 500) : null;
+    if (Number.isNaN(purchaseId)) return res.status(400).json({ error: "Invalid purchase id" });
+    if (!entryKey) return res.status(400).json({ error: "Invalid schedule entry key" });
+    if (!(amount > 0)) return res.status(400).json({ error: "Amount must be greater than zero" });
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      roleName: req.user?.role?.name || "",
+      actionName: "purchase.schedule.payment",
+      overrideReason: req.body?.overrideReason,
+      overrideRefNo: req.body?.overrideRefNo,
+    });
+    const existing = (await readLatestScheduleLogByPurchaseIds(branchId, [purchaseId])).get(purchaseId)?.payload || null;
+    if (!existing) return res.status(404).json({ error: "Payment schedule not found" });
+    const entries = Array.isArray(existing.entries) ? existing.entries : [];
+    const idx = entries.findIndex((x) => String(x.key || "") === entryKey);
+    if (idx < 0) return res.status(404).json({ error: "Schedule entry not found" });
+    const entry = entries[idx];
+    const outstanding = Math.max(0, Number(entry.amount || 0) - Number(entry.paidAmount || 0));
+    if (!(outstanding > 0)) return res.status(400).json({ error: "Schedule entry already settled" });
+    if (amount > outstanding + 0.005) return res.status(400).json({ error: "Payment exceeds schedule outstanding amount" });
+    const result = await prisma.$transaction(async (tx) =>
+      applyPurchaseDuePayment({
+        tx,
+        branchId,
+        purchaseId,
+        amount,
+        method,
+        note,
+        actorUserId: req.user?.id || null,
+      })
+    );
+    const nextEntries = [...entries];
+    const nextPaid = Number((Number(entry.paidAmount || 0) + amount).toFixed(2));
+    const nextOutstanding = Math.max(0, Number((Number(entry.amount || 0) - nextPaid).toFixed(2)));
+    nextEntries[idx] = {
+      ...entry,
+      paidAmount: nextPaid,
+      status: nextOutstanding <= 0 ? "PAID" : "PARTIAL",
+      paidAt: nextOutstanding <= 0 ? new Date().toISOString() : entry.paidAt || null,
+    };
+    await writeScheduleLog({
+      branchId,
+      purchaseId,
+      userId: req.user?.id || null,
+      schedule: {
+        ...existing,
+        entries: nextEntries,
+        status: nextEntries.every((x) => Number(x.amount || 0) <= Number(x.paidAmount || 0)) ? "CLOSED" : "ACTIVE",
+      },
+    });
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "PURCHASE_SCHEDULE_PAYMENT",
+      entity: "Purchase",
+      entityId: purchaseId,
+      payload: {
+        branchId,
+        entryKey,
+        amount,
+        method,
+        note: note || null,
+        fundingAccountCode: result.fundingCode,
+        remainingDue: Number(result.purchase.dueAmount || 0),
+      },
+    });
     res.status(201).json(result.purchase);
   } catch (error) {
     if (respondFiscalBlocked(res, error)) return;

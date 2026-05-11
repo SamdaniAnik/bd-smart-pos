@@ -45,14 +45,34 @@ function Settings() {
   const [editingBranchId, setEditingBranchId] = useState(null);
   const [settingsTab, setSettingsTab] = useState("general");
   const [submittingBranch, setSubmittingBranch] = useState(false);
+  const [featureReadiness, setFeatureReadiness] = useState({
+    loading: false,
+    error: "",
+    data: null,
+  });
 
   const loadBranches = async () => {
     const res = await api.get("/branches");
     setBranches(res.data);
   };
 
+  const loadFeatureReadiness = async () => {
+    setFeatureReadiness((p) => ({ ...p, loading: true, error: "" }));
+    try {
+      const res = await api.get("/master/feature-readiness");
+      setFeatureReadiness({ loading: false, error: "", data: res.data || null });
+    } catch (err) {
+      setFeatureReadiness({
+        loading: false,
+        error: err?.response?.data?.error || tt("settingsFeatureReadinessLoadFailed"),
+        data: null,
+      });
+    }
+  };
+
   useEffect(() => {
     loadBranches();
+    loadFeatureReadiness();
   }, []);
 
   const save = () => {
@@ -266,6 +286,49 @@ function Settings() {
             {tt("settingsOpen")}
           </button>
         </div>
+      </div>
+      <div className="page-card" style={{ marginTop: 16 }}>
+        <h4 style={{ marginTop: 0 }}>{tt("settingsFeatureReadinessTitle")}</h4>
+        <p className="text-muted" style={{ marginTop: 0, fontSize: 12 }}>
+          {tt("settingsFeatureReadinessHelp")}
+        </p>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span
+            className="badge"
+            style={{
+              background: featureReadiness.data?.ok ? "#dcfce7" : "#fef3c7",
+              color: featureReadiness.data?.ok ? "#166534" : "#92400e",
+              border: "1px solid " + (featureReadiness.data?.ok ? "#86efac" : "#fcd34d"),
+            }}
+          >
+            {featureReadiness.data?.ok ? tt("settingsFeatureReady") : tt("settingsFeaturePartial")}
+          </span>
+          <button type="button" className="btn-secondary btn-sm" onClick={loadFeatureReadiness} disabled={featureReadiness.loading}>
+            {featureReadiness.loading ? tt("settingsLoading") : tt("settingsRefreshReadiness")}
+          </button>
+        </div>
+        {featureReadiness.error ? (
+          <p style={{ color: "#b42318", margin: 0 }}>{featureReadiness.error}</p>
+        ) : null}
+        {featureReadiness.data ? (
+          <ul style={{ margin: "8px 0 0 18px", padding: 0 }}>
+            <li>
+              {tt("settingsProductColumnsReady")}:{" "}
+              {featureReadiness.data?.productMaster?.productColumnsReady ? tt("settingsYes") : tt("settingsNo")}
+            </li>
+            <li>
+              {tt("settingsBarcodeAliasTableReady")}:{" "}
+              {featureReadiness.data?.productMaster?.productBarcodeAliasTableReady ? tt("settingsYes") : tt("settingsNo")}
+            </li>
+            {Array.isArray(featureReadiness.data?.productMaster?.missingProductColumns) &&
+            featureReadiness.data.productMaster.missingProductColumns.length > 0 ? (
+              <li>
+                {tt("settingsMissingColumns")}:{" "}
+                {featureReadiness.data.productMaster.missingProductColumns.join(", ")}
+              </li>
+            ) : null}
+          </ul>
+        ) : null}
       </div>
       </>
       ) : null}

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
-import { notifyPermissionRequired } from "../utils/notify";
+import { notifyPermissionRequired, notifySuccess } from "../utils/notify";
 import { getLang, t } from "../i18n";
 
 function RoleManagement() {
@@ -40,6 +40,7 @@ function RoleManagement() {
     branchId: "",
     language: "en",
   });
+  const [overrideQuotaDraft, setOverrideQuotaDraft] = useState({});
 
   const load = useCallback(async () => {
     const [rolesRes, permissionsRes, usersRes, branchesRes, templateRes] = await Promise.all([
@@ -49,11 +50,13 @@ function RoleManagement() {
       api.get("/branches"),
       api.get("/rbac/roles/templates"),
     ]);
+    const quotaRes = await api.get("/rbac/override-quotas");
     setRoles(rolesRes.data);
     setPermissions(permissionsRes.data);
     setUsers(usersRes.data);
     setBranches(branchesRes.data);
     setTemplates(templateRes.data || {});
+    setOverrideQuotaDraft(quotaRes.data?.map || {});
     setMatrixDraft({});
   }, []);
 
@@ -161,6 +164,38 @@ function RoleManagement() {
     return map;
   }, [roles]);
 
+  const financialLockRoleRows = useMemo(() => {
+    const managePerm = (permissions || []).find((p) => String(p.code) === "financial.lock.manage");
+    const overridePerm = (permissions || []).find((p) => String(p.code) === "financial.lock.override");
+    const manageId = Number(managePerm?.id || 0);
+    const overrideId = Number(overridePerm?.id || 0);
+    return (roles || []).map((role) => {
+      const set = rolePermissionSetByRoleId.get(Number(role.id)) || new Set();
+      return {
+        roleId: role.id,
+        roleName: role.name,
+        canManageLock: manageId ? set.has(manageId) : false,
+        canOverrideLock: overrideId ? set.has(overrideId) : false,
+      };
+    });
+  }, [roles, permissions, rolePermissionSetByRoleId]);
+
+  const financialLockUserRows = useMemo(() => {
+    const byRoleId = new Map(financialLockRoleRows.map((r) => [Number(r.roleId), r]));
+    return (users || [])
+      .map((u) => {
+        const policy = byRoleId.get(Number(u.roleId));
+        return {
+          id: u.id,
+          name: u.name || "-",
+          roleName: u.role?.name || "-",
+          canManageLock: Boolean(policy?.canManageLock),
+          canOverrideLock: Boolean(policy?.canOverrideLock),
+        };
+      })
+      .filter((u) => u.canManageLock || u.canOverrideLock);
+  }, [users, financialLockRoleRows]);
+
   const getMatrixCellChecked = useCallback(
     (roleId, permissionId) => {
       const key = `${roleId}:${permissionId}`;
@@ -191,6 +226,16 @@ function RoleManagement() {
     }
     if (!matrixDraftUpdates.length) return;
     await api.post("/rbac/permission-matrix/bulk-update", { updates: matrixDraftUpdates });
+    await load();
+  };
+
+  const saveOverrideQuotas = async () => {
+    if (!canManageRbac) {
+      notifyPermissionRequired(tt("rmNeedPermManage"));
+      return;
+    }
+    await api.post("/rbac/override-quotas", { map: overrideQuotaDraft });
+    notifySuccess("Override quotas updated.");
     await load();
   };
 
@@ -368,6 +413,102 @@ function RoleManagement() {
         </div>
         <div style={{ marginTop: 8, color: "var(--muted)" }}>
           {tt("rmTip")}
+        </div>
+      </div>
+      <div className="page-card" style={{ marginBottom: 12 }}>
+        <h4 style={{ marginTop: 0 }}>{tt("rmFinancialLockPolicyTitle")}</h4>
+        <p className="text-muted" style={{ marginTop: 0 }}>
+          {tt("rmFinancialLockPolicyDesc")}
+        </p>
+        <div className="quick-stats" style={{ marginBottom: 8 }}>
+          <div className="stat">
+            {tt("rmFinancialLockRolesManage")}{" "}
+            {financialLockRoleRows.filter((r) => r.canManageLock).length}
+          </div>
+          <div className="stat">
+            {tt("rmFinancialLockRolesOverride")}{" "}
+            {financialLockRoleRows.filter((r) => r.canOverrideLock).length}
+          </div>
+          <div className="stat">
+            {tt("rmFinancialLockUsersOverride")}{" "}
+            {financialLockUserRows.filter((u) => u.canOverrideLock).length}
+          </div>
+        </div>
+        <DataTable
+          title={tt("rmFinancialLockRoleTable")}
+          allowExport={false}
+          rows={financialLockRoleRows.map((r) => ({
+            ...r,
+            canManageLockLabel: r.canManageLock ? tt("rmYes") : tt("rmNo"),
+            canOverrideLockLabel: r.canOverrideLock ? tt("rmYes") : tt("rmNo"),
+          }))}
+          searchableKeys={["roleName"]}
+          columns={[
+            { key: "roleId", label: tt("colId") },
+            { key: "roleName", label: tt("rmRole") },
+            { key: "canManageLockLabel", label: "financial.lock.manage" },
+            { key: "canOverrideLockLabel", label: "financial.lock.override" },
+          ]}
+        />
+        <DataTable
+          title={tt("rmFinancialLockUserTable")}
+          allowExport={false}
+          rows={financialLockUserRows.map((u) => ({
+            ...u,
+            canManageLockLabel: u.canManageLock ? tt("rmYes") : tt("rmNo"),
+            canOverrideLockLabel: u.canOverrideLock ? tt("rmYes") : tt("rmNo"),
+          }))}
+          searchableKeys={["name", "roleName"]}
+          columns={[
+            { key: "id", label: tt("colId") },
+            { key: "name", label: tt("colName") },
+            { key: "roleName", label: tt("rmRole") },
+            { key: "canManageLockLabel", label: "financial.lock.manage" },
+            { key: "canOverrideLockLabel", label: "financial.lock.override" },
+          ]}
+        />
+        <div className="page-card" style={{ marginTop: 10 }}>
+          <h4 style={{ marginTop: 0 }}>Override quota by role (monthly)</h4>
+          <p className="text-muted" style={{ marginTop: 0 }}>
+            Set max number of fiscal lock override actions per role per month.
+          </p>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{tt("rmRole")}</th>
+                <th>Monthly quota</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(roles || []).map((role) => {
+                const key = String(role.name || "").toLowerCase();
+                const value = overrideQuotaDraft[key] != null ? overrideQuotaDraft[key] : "";
+                return (
+                  <tr key={`quota-row-${role.id}`}>
+                    <td>{role.name}</td>
+                    <td style={{ maxWidth: 180 }}>
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={value}
+                        disabled={!canManageRbac}
+                        onChange={(e) =>
+                          setOverrideQuotaDraft((prev) => ({
+                            ...prev,
+                            [key]: Number(e.target.value || 0),
+                          }))
+                        }
+                      />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          <button type="button" onClick={saveOverrideQuotas} disabled={!canManageRbac}>
+            Save override quotas
+          </button>
         </div>
       </div>
 

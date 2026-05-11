@@ -244,24 +244,35 @@ exports.deleteSupplier = async (req, res) => {
 exports.createCustomer = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const { name, phone, address, creditLimit, birthDate, marketingOptIn } = req.body;
+    const { name, phone, address, creditLimit, birthDate, marketingOptIn, priceTier } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Customer name must be at least 2 characters" });
     }
-    const customer = await prisma.customer.create({
-      data: {
-        branchId,
-        name: String(name).trim(),
-        phone: phone || null,
-        address: address || null,
-        creditLimit:
-          creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
-            ? Number(creditLimit)
-            : 0,
-        birthDate: birthDate ? new Date(birthDate) : null,
-        marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
-      },
-    });
+    const normalizedPriceTier = ["RETAIL", "WHOLESALE", "DEALER"].includes(String(priceTier || "").toUpperCase())
+      ? String(priceTier).toUpperCase()
+      : "RETAIL";
+    const baseData = {
+      branchId,
+      name: String(name).trim(),
+      phone: phone || null,
+      address: address || null,
+      creditLimit:
+        creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
+          ? Number(creditLimit)
+          : 0,
+      birthDate: birthDate ? new Date(birthDate) : null,
+      marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
+      priceTier: normalizedPriceTier,
+    };
+    let customer;
+    try {
+      customer = await prisma.customer.create({ data: baseData });
+    } catch (e) {
+      if (e.code !== "P2022") throw e;
+      const fallback = { ...baseData };
+      delete fallback.priceTier;
+      customer = await prisma.customer.create({ data: fallback });
+    }
     res.status(201).json(customer);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -593,26 +604,215 @@ exports.updateCustomer = async (req, res) => {
       return res.status(404).json({ error: "Customer not found" });
     }
 
-    const { name, phone, address, creditLimit, birthDate, marketingOptIn } = req.body;
+    const { name, phone, address, creditLimit, birthDate, marketingOptIn, priceTier } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Customer name must be at least 2 characters" });
     }
 
-    const customer = await prisma.customer.update({
-      where: { id },
-      data: {
-        name: String(name).trim(),
-        phone: phone || null,
-        address: address || null,
-        creditLimit:
-          creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
-            ? Number(creditLimit)
-            : 0,
-        birthDate: birthDate ? new Date(birthDate) : null,
-        marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
+    const normalizedPriceTier = ["RETAIL", "WHOLESALE", "DEALER"].includes(String(priceTier || "").toUpperCase())
+      ? String(priceTier).toUpperCase()
+      : "RETAIL";
+    const baseData = {
+      name: String(name).trim(),
+      phone: phone || null,
+      address: address || null,
+      creditLimit:
+        creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
+          ? Number(creditLimit)
+          : 0,
+      birthDate: birthDate ? new Date(birthDate) : null,
+      marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
+      priceTier: normalizedPriceTier,
+    };
+    let customer;
+    try {
+      customer = await prisma.customer.update({
+        where: { id },
+        data: baseData,
+      });
+    } catch (e) {
+      if (e.code !== "P2022") throw e;
+      const fallback = { ...baseData };
+      delete fallback.priceTier;
+      customer = await prisma.customer.update({
+        where: { id },
+        data: fallback,
+      });
+    }
+    res.json(customer);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getFeatureReadiness = async (_req, res) => {
+  try {
+    const tableRows = await prisma.$queryRawUnsafe("SHOW TABLES LIKE 'ProductBarcode'");
+    const priceListTableRows = await prisma.$queryRawUnsafe("SHOW TABLES LIKE 'ProductPriceList'");
+    const productCols = await prisma.$queryRawUnsafe("SHOW COLUMNS FROM `Product`");
+    const customerCols = await prisma.$queryRawUnsafe("SHOW COLUMNS FROM `Customer`");
+    const colSet = new Set((productCols || []).map((c) => String(c.Field || "")));
+    const customerColSet = new Set((customerCols || []).map((c) => String(c.Field || "")));
+    const required = [
+      "size",
+      "color",
+      "brand",
+      "model",
+      "specification",
+      "barcode",
+      "imageUrl",
+    ];
+    const missing = required.filter((c) => !colSet.has(c));
+    const customerRequired = ["priceTier"];
+    const missingCustomer = customerRequired.filter((c) => !customerColSet.has(c));
+    res.json({
+      ok:
+        missing.length === 0 &&
+        missingCustomer.length === 0 &&
+        Array.isArray(tableRows) &&
+        tableRows.length > 0 &&
+        Array.isArray(priceListTableRows) &&
+        priceListTableRows.length > 0,
+      productMaster: {
+        productColumnsReady: missing.length === 0,
+        missingProductColumns: missing,
+        productBarcodeAliasTableReady: Array.isArray(tableRows) && tableRows.length > 0,
+        productPriceListTableReady: Array.isArray(priceListTableRows) && priceListTableRows.length > 0,
+        customerColumnsReady: missingCustomer.length === 0,
+        missingCustomerColumns: missingCustomer,
       },
     });
-    res.json(customer);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.listProductCategories = async (req, res) => {
+  try {
+    const rows = await prisma.productCategory.findMany({
+      where: { branchId: req.branchId },
+      orderBy: [{ name: "asc" }, { id: "asc" }],
+      take: 300,
+    });
+    res.json(
+      rows.map((row) => ({
+        ...row,
+        attributeSet: Array.isArray(row.attributeSet) ? row.attributeSet : [],
+        minMarginPct:
+          row.minMarginPct != null && Number.isFinite(Number(row.minMarginPct))
+            ? Number(row.minMarginPct)
+            : null,
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.createProductCategory = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const name = String(req.body?.name || "").trim();
+    const minMarginPctRaw = req.body?.minMarginPct;
+    const minMarginPct =
+      minMarginPctRaw != null && String(minMarginPctRaw).trim() !== ""
+        ? Number(minMarginPctRaw)
+        : null;
+    if (!name) return res.status(400).json({ error: "Category name is required" });
+    if (minMarginPct != null && (!Number.isFinite(minMarginPct) || minMarginPct < 0 || minMarginPct > 99.99)) {
+      return res.status(400).json({ error: "minMarginPct must be between 0 and 99.99" });
+    }
+    const attributeSet = Array.isArray(req.body?.attributeSet)
+      ? req.body.attributeSet
+          .map((x) => String(x || "").trim())
+          .filter(Boolean)
+          .slice(0, 30)
+      : [];
+    const existing = await prisma.productCategory.findFirst({
+      where: { branchId, name: { equals: name } },
+      select: { id: true },
+    });
+    if (existing) return res.status(409).json({ error: "Category already exists" });
+    const row = await prisma.productCategory.create({
+      data: {
+        branchId,
+        name,
+        attributeSet,
+        minMarginPct: minMarginPct != null ? Number(minMarginPct) : null,
+      },
+    });
+    res.status(201).json(row);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.updateProductCategory = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid category id" });
+    const existing = await prisma.productCategory.findFirst({ where: { id, branchId } });
+    if (!existing) return res.status(404).json({ error: "Category not found" });
+    const name = String(req.body?.name || existing.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Category name is required" });
+    const minMarginPctRaw = req.body?.minMarginPct;
+    const minMarginPct =
+      minMarginPctRaw != null && String(minMarginPctRaw).trim() !== ""
+        ? Number(minMarginPctRaw)
+        : null;
+    if (minMarginPct != null && (!Number.isFinite(minMarginPct) || minMarginPct < 0 || minMarginPct > 99.99)) {
+      return res.status(400).json({ error: "minMarginPct must be between 0 and 99.99" });
+    }
+    const attributeSet = Array.isArray(req.body?.attributeSet)
+      ? req.body.attributeSet
+          .map((x) => String(x || "").trim())
+          .filter(Boolean)
+          .slice(0, 30)
+      : Array.isArray(existing.attributeSet)
+        ? existing.attributeSet
+        : [];
+    const dup = await prisma.productCategory.findFirst({
+      where: {
+        branchId,
+        name: { equals: name },
+        NOT: { id },
+      },
+      select: { id: true },
+    });
+    if (dup) return res.status(409).json({ error: "Category already exists" });
+    const row = await prisma.productCategory.update({
+      where: { id },
+      data: {
+        name,
+        attributeSet,
+        minMarginPct: minMarginPct != null ? Number(minMarginPct) : null,
+      },
+    });
+    res.json(row);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.deleteProductCategory = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid category id" });
+    const existing = await prisma.productCategory.findFirst({ where: { id, branchId } });
+    if (!existing) return res.status(404).json({ error: "Category not found" });
+    const linkedCount = await prisma.product.count({
+      where: {
+        branchId,
+        OR: [{ categoryId: id }, { category: existing.name }],
+      },
+    });
+    if (linkedCount > 0) {
+      return res.status(409).json({ error: "Cannot delete category with linked products" });
+    }
+    await prisma.productCategory.delete({ where: { id } });
+    res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

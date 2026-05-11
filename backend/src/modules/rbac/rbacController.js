@@ -38,9 +38,32 @@ const roleTemplates = {
     "costcenter.manage",
     "pettycash.view",
     "pettycash.manage",
+    "financial.lock.manage",
+    "financial.lock.maturity.view",
   ],
   Admin: ["*"],
 };
+
+async function getLatestOverrideQuotaConfig() {
+  const latest = await prisma.auditLog.findFirst({
+    where: {
+      action: "FINANCIAL_OVERRIDE_QUOTA_CONFIG",
+      entity: "System",
+    },
+    orderBy: { createdAt: "desc" },
+    select: { payload: true },
+  });
+  const map = latest?.payload?.map;
+  if (!map || typeof map !== "object") return {};
+  const normalized = {};
+  for (const [k, v] of Object.entries(map)) {
+    const key = String(k || "").trim().toLowerCase();
+    const value = Number(v);
+    if (!key || !Number.isFinite(value)) continue;
+    normalized[key] = Math.max(0, Math.floor(value));
+  }
+  return normalized;
+}
 
 exports.getRoles = async (_req, res) => {
   try {
@@ -69,6 +92,18 @@ exports.createRole = async (req, res) => {
 
 exports.getPermissions = async (_req, res) => {
   try {
+    for (const code of [
+      "financial.lock.manage",
+      "financial.lock.override",
+      "financial.lock.maturity.view",
+      "financial.lock.maturity.override",
+    ]) {
+      await prisma.permission.upsert({
+        where: { code },
+        update: {},
+        create: { code },
+      });
+    }
     const permissions = await prisma.permission.findMany({ orderBy: { code: "asc" } });
     res.json(permissions);
   } catch (error) {
@@ -251,6 +286,44 @@ exports.bulkUpdatePermissionMatrix = async (req, res) => {
       payload: { updatesCount: updates.length },
     });
     res.json({ message: "Permission matrix updated", updatesCount: updates.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getOverrideQuotas = async (_req, res) => {
+  try {
+    const map = await getLatestOverrideQuotaConfig();
+    res.json({ map });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.updateOverrideQuotas = async (req, res) => {
+  try {
+    const incoming = req.body?.map;
+    if (!incoming || typeof incoming !== "object") {
+      return res.status(400).json({ error: "map object is required" });
+    }
+    const nextMap = {};
+    for (const [roleName, quota] of Object.entries(incoming)) {
+      const key = String(roleName || "").trim().toLowerCase();
+      const value = Number(quota);
+      if (!key) continue;
+      if (!Number.isFinite(value) || value < 0) {
+        return res.status(400).json({ error: `Invalid quota for role ${roleName}` });
+      }
+      nextMap[key] = Math.floor(value);
+    }
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "FINANCIAL_OVERRIDE_QUOTA_CONFIG",
+      entity: "System",
+      entityId: null,
+      payload: { map: nextMap },
+    });
+    res.json({ message: "Override quotas updated", map: nextMap });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

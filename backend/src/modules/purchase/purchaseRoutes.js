@@ -22,6 +22,14 @@ const {
   exportPurchaseGrnHistoryPDF,
   getOutstandingPurchaseLoans,
   payPurchaseLoan,
+  upsertVendorBillRecord,
+  submitVendorBillApproval,
+  getPurchasePaymentSchedule,
+  runPurchaseScheduleAutomation,
+  payPurchaseScheduleEntry,
+  runPurchaseScheduleAutomationCron,
+  exportPurchasePaymentScheduleCSV,
+  exportPurchasePaymentSchedulePDF,
 } = require("./purchaseController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -42,9 +50,17 @@ router.get("/returns", requireAuth, requirePermission("purchase.view"), getPurch
 router.get("/returns/export.csv", requireAuth, requirePermission("purchase.view"), exportPurchaseReturnsCSV);
 router.get("/returns/export.pdf", requireAuth, requirePermission("purchase.view"), exportPurchaseReturnsPDF);
 router.get("/outstanding-loans", requireAuth, requirePermission("purchase.view"), getOutstandingPurchaseLoans);
+router.get("/payment-schedule", requireAuth, requirePermission("purchase.view"), getPurchasePaymentSchedule);
+router.post("/payment-schedule/automation/run", requireAuth, requirePermission("purchase.create"), runPurchaseScheduleAutomation);
+router.get("/payment-schedule/export.csv", requireAuth, requirePermission("purchase.view"), exportPurchasePaymentScheduleCSV);
+router.get("/payment-schedule/export.pdf", requireAuth, requirePermission("purchase.view"), exportPurchasePaymentSchedulePDF);
+router.post("/payment-schedule/automation/cron", runPurchaseScheduleAutomationCron);
 router.get("/:id", requireAuth, requirePermission("purchase.view"), getPurchaseDetails);
 router.post("/", requireAuth, requirePermission("purchase.create"), createPurchase);
 router.post("/:id/loan-payment", requireAuth, requirePermission("purchase.create"), payPurchaseLoan);
+router.post("/:id/payment-schedule/:entryKey/pay", requireAuth, requirePermission("purchase.create"), payPurchaseScheduleEntry);
+router.put("/:id/vendor-bill", requireAuth, requirePermission("purchase.create"), upsertVendorBillRecord);
+router.post("/:id/vendor-bill/submit", requireAuth, requirePermission("purchase.create"), submitVendorBillApproval);
 router.post("/:id/receive", requireAuth, requirePermission("purchase.create"), receivePurchaseInStages);
 router.get("/:id/grn-history/export.csv", requireAuth, requirePermission("purchase.view"), exportPurchaseGrnHistoryCSV);
 router.get("/:id/grn-history/export.pdf", requireAuth, requirePermission("purchase.view"), exportPurchaseGrnHistoryPDF);

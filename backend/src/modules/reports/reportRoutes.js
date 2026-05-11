@@ -21,6 +21,14 @@ const {
   exportChequeLedgerCSV,
   exportChequeLedgerPDF,
   getHqBranchSummary,
+  getAdvancedMarginAnalytics,
+  exportAdvancedMarginAnalyticsCSV,
+  exportAdvancedMarginAnalyticsPDF,
+  getAdvancedMarginTrend,
+  getTaxRiskDashboard,
+  exportTaxRiskDashboardCSV,
+  exportTaxRiskDashboardPDF,
+  getTaxFilingPrevalidation,
 } = require("./reportController");
 const { requireAuth, requirePermission, requireAnyPermission } = require("../../middleware/auth");
 
@@ -48,5 +56,13 @@ router.get("/audit-activity", requireAuth, requirePermission("report.view"), get
 router.get("/cheque-ledger", requireAuth, requirePermission("report.view"), getChequeLedger);
 router.get("/cheque-ledger/export.csv", requireAuth, requirePermission("report.view"), exportChequeLedgerCSV);
 router.get("/cheque-ledger/export.pdf", requireAuth, requirePermission("report.view"), exportChequeLedgerPDF);
+router.get("/advanced-margin", requireAuth, requirePermission("report.view"), getAdvancedMarginAnalytics);
+router.get("/advanced-margin/export.csv", requireAuth, requirePermission("report.view"), exportAdvancedMarginAnalyticsCSV);
+router.get("/advanced-margin/export.pdf", requireAuth, requirePermission("report.view"), exportAdvancedMarginAnalyticsPDF);
+router.get("/advanced-margin/trend", requireAuth, requirePermission("report.view"), getAdvancedMarginTrend);
+router.get("/tax-risk", requireAuth, requirePermission("report.view"), getTaxRiskDashboard);
+router.get("/tax-risk/export.csv", requireAuth, requirePermission("report.view"), exportTaxRiskDashboardCSV);
+router.get("/tax-risk/export.pdf", requireAuth, requirePermission("report.view"), exportTaxRiskDashboardPDF);
+router.get("/tax-filing/prevalidate", requireAuth, requirePermission("report.view"), getTaxFilingPrevalidation);
 
 module.exports = router;

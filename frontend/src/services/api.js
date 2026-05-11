@@ -23,9 +23,34 @@ function getApiErrorMessage(error) {
   return "Request failed";
 }
 
+/** Paths where 401 means bad credentials / validation, not an expired session. */
+const AUTH_401_NO_SESSION_REDIRECT = ["/auth/login", "/auth/register"];
+
+let sessionInvalidRedirectScheduled = false;
+
+function clearSessionAndReload() {
+  if (sessionInvalidRedirectScheduled) return;
+  sessionInvalidRedirectScheduled = true;
+  localStorage.removeItem("bd_pos_token");
+  localStorage.removeItem("bd_pos_permissions");
+  localStorage.removeItem("bd_pos_user");
+  window.location.reload();
+}
+
+function shouldRedirect401OnResponse(error) {
+  if (error?.response?.status !== 401) return false;
+  if (error?.config?.skipAuthSessionRedirect) return false;
+  const url = String(error?.config?.url || "");
+  return !AUTH_401_NO_SESSION_REDIRECT.some((p) => url.includes(p));
+}
+
 api.interceptors.response.use(
   (response) => response,
   (error) => {
+    if (shouldRedirect401OnResponse(error)) {
+      clearSessionAndReload();
+      return Promise.reject(error);
+    }
     const method = String(error?.config?.method || "").toLowerCase();
     const shouldToast =
       ["post", "put", "patch", "delete"].includes(method) &&

@@ -14,11 +14,21 @@ model Product {
   taxProfileId         Int?
   name                 String
   nameBn               String?
+  unitPrice            Float               @default(0)
   price                Float
   stock                Int                 @default(0)
   reorderLevel         Int                 @default(0)
   category             String?
   sku                  String?
+  barcode              String?
+  imageUrl             String?
+  size                 String?
+  color                String?
+  brand                String?
+  model                String?
+  specification        String?
+  attributeValues      Json?
+  imageGallery         Json?
   hsCode               String?
   unitOfMeasure        String?             @default("PCS")
   vatRate              Float               @default(0)
@@ -32,6 +42,8 @@ model Product {
   updatedAt            DateTime            @updatedAt
   saleItems            SaleItem[]
   variants             ProductVariant[]
+  barcodes             ProductBarcode[]
+  priceLists           ProductPriceList[]
   branch               Branch              @relation(fields: [branchId], references: [id])
   categoryRef          ProductCategory?    @relation(fields: [categoryId], references: [id])
   taxProfile           TaxProfile?         @relation(fields: [taxProfileId], references: [id])
@@ -44,7 +56,42 @@ model Product {
   inventoryBatches     InventoryBatch[]
 
   @@unique([branchId, sku])
+  @@unique([branchId, barcode])
   @@index([branchId, hsCode])
+}
+
+model ProductPriceList {
+  id            Int       @id @default(autoincrement())
+  branchId      Int
+  productId     Int
+  priceType     String
+  amount        Float
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+  note          String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  branch        Branch    @relation(fields: [branchId], references: [id])
+  product       Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([branchId, productId, priceType, effectiveFrom])
+}
+
+model ProductBarcode {
+  id        Int      @id @default(autoincrement())
+  branchId  Int
+  productId Int
+  productVariantId Int?
+  barcode   String
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  branch    Branch   @relation(fields: [branchId], references: [id])
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productVariant ProductVariant? @relation(fields: [productVariantId], references: [id], onDelete: SetNull)
+
+  @@unique([branchId, barcode])
+  @@index([branchId, productId])
 }
 
 model ProductVariant {
@@ -56,6 +103,7 @@ model ProductVariant {
   barcode       String?
   stock         Int        @default(0)
   priceOverride Float?
+  imageUrl      String?
   sortOrder     Int        @default(0)
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
@@ -130,6 +178,7 @@ model Customer {
   address            String?
   birthDate          DateTime?
   marketingOptIn     Boolean          @default(true)
+  priceTier          String           @default("RETAIL")
   balance            Float            @default(0)
   creditLimit        Float            @default(0) // 0 = unlimited; >0 = max outstanding balance
   storedValueBalance Float            @default(0)
@@ -706,6 +755,9 @@ model Purchase {
   branchId            Int
   supplierId          Int
   invoiceNo           String?
+  transportationCost  Float            @default(0)
+  bribesCost          Float            @default(0)
+  extraOtherCost      Float            @default(0)
   total               Float
   paidAmount          Float            @default(0)
   dueAmount           Float            @default(0)
@@ -767,6 +819,8 @@ model ProductCategory {
   id       Int       @id @default(autoincrement())
   branchId Int
   name     String
+  attributeSet Json?
+  minMarginPct Float?
   products Product[]
 }
 

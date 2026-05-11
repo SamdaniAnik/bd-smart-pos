@@ -35,6 +35,10 @@ const permissionCodes = [
   "costcenter.manage",
   "pettycash.view",
   "pettycash.manage",
+  "financial.lock.manage",
+  "financial.lock.override",
+  "financial.lock.maturity.view",
+  "financial.lock.maturity.override",
 ];
 
 const accountDefaults = [

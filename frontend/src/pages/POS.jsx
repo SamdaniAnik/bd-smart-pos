@@ -62,7 +62,29 @@ function getCartLineBaseUnitPrice(item) {
   ) {
     return Number(item.matchedVariant.priceOverride);
   }
+  if (item.tierPriceResolved != null && item.tierPriceResolved !== "") {
+    return Number(item.tierPriceResolved);
+  }
   return Number(item.price || 0);
+}
+
+function resolveTierPrice(product, tier = "RETAIL", asOf = new Date()) {
+  const list = Array.isArray(product?.priceLists) ? product.priceLists : [];
+  const target = String(tier || "RETAIL").toUpperCase();
+  const date = asOf instanceof Date ? asOf : new Date(asOf);
+  const active = list
+    .filter((r) => String(r?.priceType || "").toUpperCase() === target)
+    .filter((r) => {
+      const from = r?.effectiveFrom ? new Date(r.effectiveFrom) : null;
+      const to = r?.effectiveTo ? new Date(r.effectiveTo) : null;
+      if (!from || Number.isNaN(from.getTime())) return false;
+      if (date < from) return false;
+      if (to && !Number.isNaN(to.getTime()) && date > to) return false;
+      return true;
+    })
+    .sort((a, b) => new Date(b.effectiveFrom).getTime() - new Date(a.effectiveFrom).getTime());
+  if (!active.length) return null;
+  return Number(active[0].amount || 0);
 }
 
 function maxQtyOrWeightForCartLine(item) {
@@ -185,6 +207,7 @@ function POS() {
   const [cart, setCart] = useState([]);
   const [variantChoiceByProduct, setVariantChoiceByProduct] = useState({});
   const [paymentMethod, setPaymentMethod] = useState("Cash");
+  const [priceTier, setPriceTier] = useState("RETAIL");
   const [paidAmount, setPaidAmount] = useState("");
   const [paymentBreakdown, setPaymentBreakdown] = useState([{ method: "Cash", amount: "", channel: "" }]);
   const [discountType, setDiscountType] = useState("AMOUNT");
@@ -254,7 +277,7 @@ function POS() {
     queryKey: ["pos", "products"],
     queryFn: async () => {
       try {
-        const res = await api.get("/products?include=variants");
+        const res = await api.get("/products?include=variants,pricelists");
         if (Array.isArray(res.data)) {
           writeJsonStorage(PRODUCTS_OFFLINE_CACHE_KEY, {
             data: res.data,
@@ -684,6 +707,12 @@ function POS() {
       weightKg: product.sellByWeight ? Math.min(1, Math.max(0.001, Number(product.stockKg || 1))) : undefined,
       variantId,
       matchedVariant,
+      selectedPriceTier: priceTier,
+      tierPriceResolved:
+        matchedVariant && matchedVariant.priceOverride != null && matchedVariant.priceOverride !== ""
+          ? null
+          : resolveTierPrice(product, priceTier, new Date()),
+      originalBasePrice: Number(product.price || 0),
       overridePrice: "",
     };
 
@@ -706,6 +735,28 @@ function POS() {
       );
     });
   };
+
+  const applyPriceTierToCart = useCallback(
+    (tier) => {
+      const normalizedTier = ["RETAIL", "WHOLESALE", "DEALER"].includes(String(tier || "").toUpperCase())
+        ? String(tier).toUpperCase()
+        : "RETAIL";
+      setCart((prev) =>
+        prev.map((item) => {
+          if (item.variantId && item.matchedVariant && item.matchedVariant.priceOverride != null && item.matchedVariant.priceOverride !== "") {
+            return { ...item, selectedPriceTier: normalizedTier, tierPriceResolved: null };
+          }
+          const resolved = resolveTierPrice(item, normalizedTier, new Date());
+          return {
+            ...item,
+            selectedPriceTier: normalizedTier,
+            tierPriceResolved: resolved,
+          };
+        })
+      );
+    },
+    [setCart]
+  );
 
   const handleBarcodeAdd = async (e) => {
     e.preventDefault();
@@ -1139,6 +1190,14 @@ function POS() {
     return () => clearTimeout(timer);
   }, [customer.phone]);
 
+  useEffect(() => {
+    if (!customerLoyalty) return;
+    const custTier = String(customerLoyalty.priceTier || "RETAIL").toUpperCase();
+    if (!["RETAIL", "WHOLESALE", "DEALER"].includes(custTier)) return;
+    setPriceTier(custTier);
+    applyPriceTierToCart(custTier);
+  }, [customerLoyalty?.id, customerLoyalty?.priceTier, applyPriceTierToCart]);
+
   const handleCheckout = async () => {
     if (fiscalBlocked) {
       notifyActionRequired(fiscalGateData?.message || tt("posNotifyFiscalCheckout"));
@@ -1177,6 +1236,7 @@ function POS() {
       setApprovalReason("");
       setPaymentChannel("");
       setCustomer({ name: "", phone: "" });
+      setPriceTier("RETAIL");
       setBuyerBinOrNidNote("");
       setCouponCode("");
       setGiftCardCode("");
@@ -1247,6 +1307,7 @@ function POS() {
         setApprovalReason("");
         setPaymentChannel("");
         setCustomer({ name: "", phone: "" });
+        setPriceTier("RETAIL");
         setBuyerBinOrNidNote("");
         setCouponCode("");
         setGiftCardCode("");
@@ -1284,6 +1345,7 @@ function POS() {
       setManagerApprovalPin("");
       setPaymentChannel("");
       setCustomer({ name: "", phone: "" });
+      setPriceTier("RETAIL");
       setBuyerBinOrNidNote("");
       setCouponCode("");
       setGiftCardCode("");
@@ -1768,6 +1830,9 @@ function POS() {
       name: String(payload.customer?.name || ""),
       phone: String(payload.customer?.phone || ""),
     });
+    if (!String(payload.customer?.phone || "").trim()) {
+      setPriceTier("RETAIL");
+    }
     setDiscountType(String(payload.discountType || "AMOUNT").toUpperCase() === "PERCENT" ? "PERCENT" : "AMOUNT");
     setDiscountValue(String(Number(payload.discountValue || 0)));
     setManagerApprovalPin(String(payload.managerApprovalPin || ""));
@@ -2667,6 +2732,21 @@ function POS() {
         </header>
 
         <form onSubmit={handleBarcodeAdd} className="pos-barcode-form">
+          <select
+            className="form-select-sm"
+            value={priceTier}
+            onChange={(e) => {
+              const nextTier = e.target.value;
+              setPriceTier(nextTier);
+              applyPriceTierToCart(nextTier);
+            }}
+            style={{ maxWidth: 150 }}
+            title={tt("posPriceTierTitle")}
+          >
+            <option value="RETAIL">{tt("prodPriceTypeRetail")}</option>
+            <option value="WHOLESALE">{tt("prodPriceTypeWholesale")}</option>
+            <option value="DEALER">{tt("prodPriceTypeDealer")}</option>
+          </select>
           <input
             ref={barcodeInputRef}
             placeholder={tt("posBarcodePlaceholder")}
@@ -3544,6 +3624,9 @@ function POS() {
               {tt("posLoyaltyRewards")} · {Number(customerLoyalty.loyaltyPoints || 0).toFixed(0)} {tt("posPtsAbbr")} ·{" "}
               {customerLoyalty.loyaltyTier || "—"}
             </strong>
+            <p>
+              <strong>{tt("custPriceTier")}</strong> {String(customerLoyalty.priceTier || "RETAIL").toUpperCase()}
+            </p>
             <p>
               <strong>{tt("posWalletLabel")}</strong> {formatBDT(Number(customerLoyalty.storedValueBalance || 0))}
             </p>

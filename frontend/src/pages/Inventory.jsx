@@ -96,6 +96,8 @@ function Inventory() {
   });
   const [editingReasonId, setEditingReasonId] = useState(null);
   const [inventoryTab, setInventoryTab] = useState("overview");
+  const [focusWorstMarginImpact, setFocusWorstMarginImpact] = useState(false);
+  const [selectedImpactSku, setSelectedImpactSku] = useState("");
 
   const load = useCallback(async () => {
     const [
@@ -579,6 +581,50 @@ function Inventory() {
     }
   };
 
+  const calcMarginPct = (row) => {
+    const unit = Number(row?.unitPrice || 0);
+    const selling = Number(row?.price || 0);
+    if (selling <= 0) return 0;
+    return ((selling - unit) / selling) * 100;
+  };
+
+  const formatMarginImpact = (row) => {
+    const base = Number(row?.baseMarginPct || 0);
+    const landed = Number(row?.landedMarginPct || 0);
+    const impact = Number(row?.marginImpactPct || 0);
+    const sign = impact > 0 ? "+" : "";
+    return `${base.toFixed(2)}% -> ${landed.toFixed(2)}% (${sign}${impact.toFixed(2)}%)`;
+  };
+
+  const marginImpactRows = (rows = []) => {
+    const normalized = Array.isArray(rows) ? rows : [];
+    if (!focusWorstMarginImpact) return normalized;
+    return normalized
+      .filter((row) => Number(row?.marginImpactPct || 0) < 0)
+      .sort((a, b) => Number(a?.marginImpactPct || 0) - Number(b?.marginImpactPct || 0));
+  };
+
+  const topWorstMarginImpactRows = useMemo(
+    () =>
+      (Array.isArray(intelligenceRows) ? intelligenceRows : [])
+        .filter((row) => Number(row?.marginImpactPct || 0) < 0)
+        .sort((a, b) => Number(a?.marginImpactPct || 0) - Number(b?.marginImpactPct || 0))
+        .slice(0, 10),
+    [intelligenceRows]
+  );
+
+  const displayedIntelligenceRows = useMemo(() => {
+    const rows = marginImpactRows(intelligenceRows);
+    if (!selectedImpactSku) return rows;
+    return rows.filter((row) => String(row?.sku || "").trim() === selectedImpactSku);
+  }, [intelligenceRows, selectedImpactSku, focusWorstMarginImpact]);
+
+  const displayedLowStockRows = useMemo(() => {
+    const rows = marginImpactRows(lowStockRows);
+    if (!selectedImpactSku) return rows;
+    return rows.filter((row) => String(row?.sku || "").trim() === selectedImpactSku);
+  }, [lowStockRows, selectedImpactSku, focusWorstMarginImpact]);
+
   return (
     <div className="page-stack">
       <div className="page-header">
@@ -732,9 +778,44 @@ function Inventory() {
         />
         {tt("invLowStockOnly")}
       </label>
+      <label style={{ display: "inline-flex", alignItems: "center", gap: 6, margin: "4px 0 8px 12px" }}>
+        <input
+          type="checkbox"
+          checked={focusWorstMarginImpact}
+          onChange={(e) => setFocusWorstMarginImpact(e.target.checked)}
+        />
+        {tt("invFocusWorstMarginImpact")}
+      </label>
+      {selectedImpactSku ? (
+        <div style={{ margin: "0 0 8px 0" }}>
+          <button type="button" className="btn-secondary btn-sm" onClick={() => setSelectedImpactSku("")}>
+            {tt("invClearImpactFilter")}
+          </button>
+        </div>
+      ) : null}
+      <div className="page-card" style={{ marginBottom: 10 }}>
+        <div style={{ fontWeight: 600, marginBottom: 6 }}>{tt("invTopWorstMarginImpactTitle")}</div>
+        {topWorstMarginImpactRows.length ? (
+          <div className="quick-stats">
+            {topWorstMarginImpactRows.map((row) => (
+              <button
+                key={`worst-impact-${row.id}-${row.sku || "na"}`}
+                type="button"
+                className="stat-chip"
+                onClick={() => setSelectedImpactSku(String(row.sku || "").trim())}
+                title={tt("invClickToFilter")}
+              >
+                {(row.sku || tt("noData")).toString()} · {Number(row.marginImpactPct || 0).toFixed(2)}%
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="text-muted">{tt("invTopWorstMarginImpactEmpty")}</div>
+        )}
+      </div>
       <DataTable
         title={tt("invDtIntelligence")}
-        rows={intelligenceRows.map((row) => ({
+        rows={displayedIntelligenceRows.map((row) => ({
           ...row,
           lastSoldAtLabel: row.lastSoldAt ? new Date(row.lastSoldAt).toLocaleDateString() : "-",
         }))}
@@ -743,6 +824,10 @@ function Inventory() {
           { key: "name", label: tt("invColProduct") },
           { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
           { key: "category", label: tt("prodLblCategory"), render: (v) => v || "-" },
+          { key: "unitPrice", label: tt("prodLblUnitPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "price", label: tt("prodLblSellingPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "profitMargin", label: tt("prodLblProfitMargin"), render: (_, row) => `${calcMarginPct(row).toFixed(2)}%` },
+          { key: "marginImpactPct", label: tt("prodLblLandedVsBaseMarginImpact"), render: (_, row) => formatMarginImpact(row) },
           { key: "stock", label: tt("prodLblStock") },
           { key: "soldQty", label: tt("invColSoldQty") },
           { key: "avgDailySold", label: tt("invColAvgDay"), render: (v) => Number(v || 0).toFixed(2) },
@@ -792,12 +877,16 @@ function Inventory() {
       />
       <DataTable
         title={tt("invDtLowStock")}
-        rows={lowStockRows}
+        rows={displayedLowStockRows}
         searchableKeys={["name", "sku", "category"]}
         columns={[
           { key: "name", label: tt("invColProduct") },
           { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
           { key: "category", label: tt("prodLblCategory"), render: (v) => v || "-" },
+          { key: "unitPrice", label: tt("prodLblUnitPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "price", label: tt("prodLblSellingPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "profitMargin", label: tt("prodLblProfitMargin"), render: (_, row) => `${calcMarginPct(row).toFixed(2)}%` },
+          { key: "marginImpactPct", label: tt("prodLblLandedVsBaseMarginImpact"), render: (_, row) => formatMarginImpact(row) },
           { key: "stock", label: tt("prodLblStock") },
           { key: "reorderLevel", label: tt("prodLblReorder") },
           { key: "shortageQty", label: tt("dashShortQty") },

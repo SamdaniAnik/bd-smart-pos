@@ -136,6 +136,34 @@ function Reports() {
     onlyMismatched: false,
   });
   const [reportsTab, setReportsTab] = useState("overview");
+  const [marginThresholdPct, setMarginThresholdPct] = useState(5);
+  const [advancedMargin, setAdvancedMargin] = useState({
+    summary: { skuCount: 0, soldSkuCount: 0, erosionAlertCount: 0, totalRevenue: 0, totalLandedCogs: 0, totalGrossProfit: 0 },
+    categoryRows: [],
+    rows: [],
+  });
+  const [advancedMarginTrend, setAdvancedMarginTrend] = useState({ months: 12, rows: [] });
+  const [taxRisk, setTaxRisk] = useState({
+    summary: {
+      vatSalesCount: 0,
+      vatZeroSalesCount: 0,
+      withholdingVoucherCount: 0,
+      withholdingHighRiskCount: 0,
+      salesHighRiskCount: 0,
+      totalOutputVat: 0,
+      totalTaxableSales: 0,
+    },
+    withholdingRows: [],
+    salesRows: [],
+  });
+  const [taxRiskMinScore, setTaxRiskMinScore] = useState(0);
+  const [taxPrevalidation, setTaxPrevalidation] = useState({
+    summary: { salesRows: 0, paymentVouchers: 0, warningCount: 0 },
+    warnings: [],
+    readyForExport: false,
+  });
+  const [focusWorstMarginImpact, setFocusWorstMarginImpact] = useState(false);
+  const [selectedImpactProductId, setSelectedImpactProductId] = useState(null);
   const todayPeriodKey = (() => {
     const now = new Date();
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
@@ -331,7 +359,9 @@ function Reports() {
       if (stockValuationFilter.category) stockQuery.set("category", stockValuationFilter.category);
       if (stockValuationFilter.warehouseId) stockQuery.set("warehouseId", stockValuationFilter.warehouseId);
       const stockSuffix = stockQuery.toString() ? `?${stockQuery.toString()}` : "";
-      const [agingRes, stockRes, settlementRes, loyaltyRes, vatSummaryRes, vatRegisterRes, shrinkageRes, staffKpiRes, auditTrailRes, chequeLedgerRes, warehouseRes] =
+      const taxRiskQuery = new URLSearchParams(settlementQuery.toString());
+      if (Number(taxRiskMinScore || 0) > 0) taxRiskQuery.set("minRiskScore", String(taxRiskMinScore));
+      const [agingRes, stockRes, settlementRes, loyaltyRes, vatSummaryRes, vatRegisterRes, shrinkageRes, staffKpiRes, auditTrailRes, chequeLedgerRes, warehouseRes, marginRes, marginTrendRes, taxRiskRes, taxPrecheckRes] =
         await Promise.all([
         api.get("/reports/aging"),
         api.get(`/reports/stock-valuation${stockSuffix}`),
@@ -355,6 +385,17 @@ function Reports() {
           }`
         ),
         api.get("/warehouses"),
+        api.get(`/reports/advanced-margin${(() => {
+          const q = new URLSearchParams();
+          if (settlementRange.from) q.set("from", settlementRange.from);
+          if (settlementRange.to) q.set("to", settlementRange.to);
+          q.set("erosionThresholdPct", String(marginThresholdPct || 5));
+          const s = q.toString();
+          return s ? `?${s}` : "";
+        })()}`),
+        api.get("/reports/advanced-margin/trend?months=12"),
+        api.get(`/reports/tax-risk${taxRiskQuery.toString() ? `?${taxRiskQuery.toString()}` : ""}`),
+        api.get(`/reports/tax-filing/prevalidate${taxRiskQuery.toString() ? `?${taxRiskQuery.toString()}` : ""}`),
       ]);
       setAging(agingRes.data);
       setStockValuation(stockRes.data);
@@ -378,6 +419,36 @@ function Reports() {
           rows: [],
         }
       );
+      setAdvancedMargin(
+        marginRes.data || {
+          summary: { skuCount: 0, soldSkuCount: 0, erosionAlertCount: 0, totalRevenue: 0, totalLandedCogs: 0, totalGrossProfit: 0 },
+          categoryRows: [],
+          rows: [],
+        }
+      );
+      setAdvancedMarginTrend(marginTrendRes.data || { months: 12, rows: [] });
+      setTaxRisk(
+        taxRiskRes.data || {
+          summary: {
+            vatSalesCount: 0,
+            vatZeroSalesCount: 0,
+            withholdingVoucherCount: 0,
+            withholdingHighRiskCount: 0,
+            salesHighRiskCount: 0,
+            totalOutputVat: 0,
+            totalTaxableSales: 0,
+          },
+          withholdingRows: [],
+          salesRows: [],
+        }
+      );
+      setTaxPrevalidation(
+        taxPrecheckRes.data || {
+          summary: { salesRows: 0, paymentVouchers: 0, warningCount: 0 },
+          warnings: [],
+          readyForExport: false,
+        }
+      );
     };
     load();
   }, [
@@ -392,6 +463,8 @@ function Reports() {
     stockValuationFilter.asOf,
     stockValuationFilter.category,
     stockValuationFilter.warehouseId,
+    marginThresholdPct,
+    taxRiskMinScore,
   ]);
 
   const exportCSV = async (url, filename) => {
@@ -506,6 +579,43 @@ function Reports() {
     await exportCSV(`${url}${suffix}`, filename);
   };
 
+  const exportAdvancedMargin = async (type) => {
+    const query = new URLSearchParams();
+    if (settlementRange.from) query.set("from", settlementRange.from);
+    if (settlementRange.to) query.set("to", settlementRange.to);
+    query.set("erosionThresholdPct", String(marginThresholdPct || 5));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const endpoints = {
+      csv: ["/reports/advanced-margin/export.csv", "advanced-margin-analytics.csv"],
+      pdf: ["/reports/advanced-margin/export.pdf", "advanced-margin-analytics.pdf"],
+    };
+    const [url, filename] = endpoints[type];
+    await exportCSV(`${url}${suffix}`, filename);
+  };
+
+  const exportTaxRisk = async (type) => {
+    const query = new URLSearchParams();
+    if (settlementRange.from) query.set("from", settlementRange.from);
+    if (settlementRange.to) query.set("to", settlementRange.to);
+    if (Number(taxRiskMinScore || 0) > 0) query.set("minRiskScore", String(taxRiskMinScore));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const endpoints = {
+      csv: ["/reports/tax-risk/export.csv", "tax-risk-dashboard.csv"],
+      pdf: ["/reports/tax-risk/export.pdf", "tax-risk-dashboard.pdf"],
+    };
+    const [url, filename] = endpoints[type];
+    await exportCSV(`${url}${suffix}`, filename);
+  };
+
+  const marginTrendMax = useMemo(
+    () =>
+      Math.max(
+        1,
+        ...(advancedMarginTrend.rows || []).map((row) => Math.abs(Number(row.marginImpactPct || 0)))
+      ),
+    [advancedMarginTrend.rows]
+  );
+
   const setSettlementPresetRange = (preset) => {
     const now = new Date();
     if (preset === "today") {
@@ -526,6 +636,26 @@ function Reports() {
     }
     setSettlementRange({ from: "", to: "" });
   };
+
+  const filteredStockValuationRows = useMemo(() => {
+    const rows = Array.isArray(stockValuation.rows) ? stockValuation.rows : [];
+    const impacted = !focusWorstMarginImpact
+      ? rows
+      : rows
+      .filter((row) => Number(row?.marginImpactPct || 0) < 0)
+      .sort((a, b) => Number(a?.marginImpactPct || 0) - Number(b?.marginImpactPct || 0));
+    if (!selectedImpactProductId) return impacted;
+    return impacted.filter((row) => Number(row?.productId || 0) === Number(selectedImpactProductId));
+  }, [stockValuation.rows, focusWorstMarginImpact, selectedImpactProductId]);
+
+  const topWorstValuationImpactRows = useMemo(
+    () =>
+      (Array.isArray(stockValuation.rows) ? stockValuation.rows : [])
+        .filter((row) => Number(row?.marginImpactPct || 0) < 0)
+        .sort((a, b) => Number(a?.marginImpactPct || 0) - Number(b?.marginImpactPct || 0))
+        .slice(0, 10),
+    [stockValuation.rows]
+  );
 
   return (
     <div className="page-stack">
@@ -573,6 +703,15 @@ function Reports() {
           >
             {tt("repTabFinance")}
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={reportsTab === "margin"}
+            className={`pos-tab ${reportsTab === "margin" ? "pos-tab-active" : ""}`}
+            onClick={() => setReportsTab("margin")}
+          >
+            {tt("repTabMargin")}
+          </button>
         </div>
       </div>
       <details className="page-card" style={{ marginBottom: 12 }}>
@@ -591,10 +730,14 @@ function Reports() {
             <button onClick={() => exportLoyaltyRedemption("pdf")}>{tt("repBtnLoyaltyPdf")}</button>
             <button onClick={() => exportVatSalesRegister("csv")}>{tt("repBtnVatRegisterCsv")}</button>
             <button onClick={() => exportVatSalesRegister("pdf")}>{tt("repBtnVatRegisterPdf")}</button>
+            <button onClick={() => exportTaxRisk("csv")}>{tt("repBtnTaxRiskCsv")}</button>
+            <button onClick={() => exportTaxRisk("pdf")}>{tt("repBtnTaxRiskPdf")}</button>
             <button onClick={() => exportShrinkageControl("csv")}>{tt("repBtnShrinkageCsv")}</button>
             <button onClick={() => exportShrinkageControl("pdf")}>{tt("repBtnShrinkagePdf")}</button>
             <button onClick={() => exportChequeLedger("csv")}>{tt("repBtnChequeCsv")}</button>
             <button onClick={() => exportChequeLedger("pdf")}>{tt("repBtnChequePdf")}</button>
+            <button onClick={() => exportAdvancedMargin("csv")}>{tt("repBtnMarginCsv")}</button>
+            <button onClick={() => exportAdvancedMargin("pdf")}>{tt("repBtnMarginPdf")}</button>
           </div>
         ) : (
           <div className="text-muted" style={{ marginTop: 10 }}>{tt("repPermExportAdvanced")}</div>
@@ -732,6 +875,110 @@ function Reports() {
         <div className="stat">{tt("repInputVatTracked")}: {bdt(vatSummary.inputVatTracked)}</div>
         <div className="stat">{tt("repNetVatPayable")}: {bdt(vatSummary.netVatPayable)}</div>
       </div>
+      <div className="page-card" style={{ marginBottom: "12px" }}>
+        <h4 style={{ marginTop: 0 }}>{tt("repTaxRiskTitle")}</h4>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 13 }}>{tt("repTaxRiskMinScore")}</label>
+          <input
+            type="number"
+            min="0"
+            step="0.5"
+            value={taxRiskMinScore}
+            onChange={(e) => setTaxRiskMinScore(Number(e.target.value || 0))}
+            placeholder={tt("repTaxRiskMinScore")}
+            style={{ width: 120 }}
+          />
+          <span style={{ fontSize: 12, color: "#475569" }}>{tt("repTaxRiskQuickThresholds")}</span>
+          {[5, 7, 10].map((value) => (
+            <button
+              key={value}
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => setTaxRiskMinScore(value)}
+              style={{
+                background: Number(taxRiskMinScore || 0) === value ? "#1d4ed8" : undefined,
+                color: Number(taxRiskMinScore || 0) === value ? "#fff" : undefined,
+              }}
+            >
+              {`>=${value}`}
+            </button>
+          ))}
+          <button type="button" className="btn-secondary btn-sm" onClick={() => setTaxRiskMinScore(0)}>
+            {tt("repTaxRiskClearThreshold")}
+          </button>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <button type="button" className="btn-secondary btn-sm" onClick={() => exportTaxRisk("csv")}>
+            {tt("repBtnTaxRiskCsv")}
+          </button>
+          <button type="button" className="btn-secondary btn-sm" onClick={() => exportTaxRisk("pdf")}>
+            {tt("repBtnTaxRiskPdf")}
+          </button>
+        </div>
+        <div className="quick-stats">
+          <div className="stat">{tt("repTaxRiskVatSales")}: {Number(taxRisk.summary?.vatSalesCount || 0)}</div>
+          <div className="stat">{tt("repTaxRiskVatZero")}: {Number(taxRisk.summary?.vatZeroSalesCount || 0)}</div>
+          <div className="stat">{tt("repTaxRiskWithholding")}: {Number(taxRisk.summary?.withholdingVoucherCount || 0)}</div>
+          <div className="stat">{tt("repTaxRiskWithholdingHigh")}: {Number(taxRisk.summary?.withholdingHighRiskCount || 0)}</div>
+          <div className="stat">{tt("repTaxRiskSalesHigh")}: {Number(taxRisk.summary?.salesHighRiskCount || 0)}</div>
+        </div>
+      </div>
+      <div className="page-card" style={{ marginBottom: "12px" }}>
+        <h4 style={{ marginTop: 0 }}>Tax filing workspace pre-validation</h4>
+        <p className="text-muted" style={{ marginTop: 0, fontSize: 12 }}>
+          Pre-check Mushak and withholding completeness before export.
+        </p>
+        <div className="quick-stats" style={{ marginBottom: 8 }}>
+          <div className="stat">Sales rows: {Number(taxPrevalidation.summary?.salesRows || 0)}</div>
+          <div className="stat">Payment vouchers: {Number(taxPrevalidation.summary?.paymentVouchers || 0)}</div>
+          <div className="stat">Warnings: {Number(taxPrevalidation.summary?.warningCount || 0)}</div>
+          <div className="stat" style={{ background: taxPrevalidation.readyForExport ? "#dcfce7" : "#fee2e2" }}>
+            {taxPrevalidation.readyForExport ? "Ready for export" : "Needs fix"}
+          </div>
+        </div>
+        <DataTable
+          title=""
+          rows={(taxPrevalidation.warnings || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+          searchableKeys={["key", "severity"]}
+          allowExport={false}
+          columns={[
+            { key: "rowNo", label: "ID" },
+            { key: "key", label: "Check" },
+            { key: "count", label: "Count" },
+            { key: "severity", label: "Severity" },
+          ]}
+        />
+      </div>
+      <DataTable
+        title={tt("repTaxRiskWithholdingTitle")}
+        rows={(taxRisk.withholdingRows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+        searchableKeys={["supplierName", "taxCategory", "mushak66DocumentNo"]}
+        columns={[
+          { key: "rowNo", label: tt("colId") },
+          { key: "supplierName", label: tt("purColSupplier") },
+          { key: "taxCategory", label: tt("repTaxCategory") },
+          { key: "amount", label: tt("receiptAmount"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "aitAmount", label: "AIT", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "vdsAmount", label: "VDS", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "mushak66DocumentNo", label: "Mushak 6.6", render: (v) => v || "-" },
+          { key: "riskScore", label: tt("repRiskScore"), render: (v) => Number(v || 0).toFixed(2) },
+        ]}
+      />
+      <DataTable
+        title={tt("repTaxRiskSalesTitle")}
+        rows={(taxRisk.salesRows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+        searchableKeys={["invoiceNo", "customer", "date"]}
+        columns={[
+          { key: "rowNo", label: tt("colId") },
+          { key: "invoiceNo", label: tt("receiptInvoice") },
+          { key: "date", label: tt("receiptDate") },
+          { key: "customer", label: tt("salesCustomer"), render: (v) => v || "-" },
+          { key: "taxableAmount", label: tt("repTaxableSales"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "vatAmount", label: tt("repOutputVat"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "impliedVatRatePct", label: tt("repTaxRiskImpliedVat"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+          { key: "riskScore", label: tt("repRiskScore"), render: (v) => Number(v || 0).toFixed(2) },
+        ]}
+      />
 
       <div className="page-card" style={{ marginBottom: "12px" }}>
         <h4 style={{ marginTop: 0 }}>{tt("repMushak63Title")}</h4>
@@ -1489,18 +1736,156 @@ function Reports() {
           Reset Valuation Filters
         </button>
       </div>
+      <label style={{ display: "inline-flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <input
+          type="checkbox"
+          checked={focusWorstMarginImpact}
+          onChange={(e) => setFocusWorstMarginImpact(e.target.checked)}
+        />
+        {tt("repFocusWorstMarginImpact")}
+      </label>
+      {selectedImpactProductId ? (
+        <div style={{ marginBottom: 8 }}>
+          <button type="button" className="btn-secondary btn-sm" onClick={() => setSelectedImpactProductId(null)}>
+            {tt("repClearImpactFilter")}
+          </button>
+        </div>
+      ) : null}
+      <div className="page-card" style={{ marginBottom: 10 }}>
+        <div style={{ fontWeight: 600, marginBottom: 6 }}>{tt("repTopWorstMarginImpactTitle")}</div>
+        {topWorstValuationImpactRows.length ? (
+          <div className="quick-stats">
+            {topWorstValuationImpactRows.map((row) => (
+              <button
+                key={`rep-worst-impact-${row.productId}-${row.name}`}
+                type="button"
+                className="stat-chip"
+                onClick={() => setSelectedImpactProductId(Number(row.productId))}
+                title={tt("repClickToFilter")}
+              >
+                {row.name} · {Number(row.marginImpactPct || 0).toFixed(2)}%
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="text-muted">{tt("repTopWorstMarginImpactEmpty")}</div>
+        )}
+      </div>
       <div>Total Value: ৳{Number(stockValuation.totalValue || 0).toFixed(2)}</div>
       <DataTable
-        rows={stockValuation.rows.map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+        rows={filteredStockValuationRows.map((row, idx) => ({ rowNo: idx + 1, ...row }))}
         searchableKeys={["name"]}
         columns={[
           { key: "rowNo", label: "ID" },
           { key: "name", label: "Product" },
           { key: "stock", label: "Stock" },
           { key: "unitCost", label: "Unit Cost", render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "sellingPrice", label: tt("prodLblSellingPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "profitMargin", label: tt("prodLblProfitMargin"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+          {
+            key: "marginImpactPct",
+            label: tt("prodLblLandedVsBaseMarginImpact"),
+            render: (_, row) => {
+              const base = Number(row?.baseMarginPct || 0);
+              const landed = Number(row?.landedMarginPct || 0);
+              const impact = Number(row?.marginImpactPct || 0);
+              const sign = impact > 0 ? "+" : "";
+              return `${base.toFixed(2)}% -> ${landed.toFixed(2)}% (${sign}${impact.toFixed(2)}%)`;
+            },
+          },
           { key: "valuation", label: "Valuation", render: (v) => `৳${Number(v).toFixed(2)}` },
         ]}
       />
+        </div>
+      ) : null}
+      {reportsTab === "margin" ? (
+        <div className="pos-tab-panel">
+          <div className="form-grid" style={{ marginBottom: "12px" }}>
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              value={marginThresholdPct}
+              onChange={(e) => setMarginThresholdPct(Number(e.target.value || 0))}
+              placeholder={tt("repPhMarginThreshold")}
+            />
+            <button type="button" className="btn-secondary" onClick={() => exportAdvancedMargin("csv")}>
+              {tt("repBtnMarginCsv")}
+            </button>
+            <button type="button" className="btn-secondary" onClick={() => exportAdvancedMargin("pdf")}>
+              {tt("repBtnMarginPdf")}
+            </button>
+          </div>
+          <div className="quick-stats" style={{ marginBottom: "12px" }}>
+            <div className="stat">{tt("repMarginSkuCount")}: {Number(advancedMargin.summary?.skuCount || 0)}</div>
+            <div className="stat">{tt("repMarginSoldSkuCount")}: {Number(advancedMargin.summary?.soldSkuCount || 0)}</div>
+            <div className="stat">{tt("repMarginAlerts")}: {Number(advancedMargin.summary?.erosionAlertCount || 0)}</div>
+            <div className="stat">{tt("repMarginRevenue")}: {bdt(advancedMargin.summary?.totalRevenue || 0)}</div>
+            <div className="stat">{tt("repMarginLandedCogs")}: {bdt(advancedMargin.summary?.totalLandedCogs || 0)}</div>
+            <div className="stat">{tt("repMarginGrossProfit")}: {bdt(advancedMargin.summary?.totalGrossProfit || 0)}</div>
+          </div>
+          <div className="page-card" style={{ marginBottom: "12px" }}>
+            <h4 style={{ marginTop: 0 }}>{tt("repMarginTrendTitle")}</h4>
+            <div style={{ display: "grid", gap: 6 }}>
+              {(advancedMarginTrend.rows || []).map((row) => {
+                const value = Number(row.marginImpactPct || 0);
+                const widthPct = Math.max(4, (Math.abs(value) / marginTrendMax) * 100);
+                return (
+                  <div key={row.monthKey} style={{ display: "grid", gridTemplateColumns: "90px 1fr 90px", gap: 8, alignItems: "center" }}>
+                    <div style={{ fontSize: 12 }}>{row.monthKey}</div>
+                    <div style={{ height: 10, background: "#e5e7eb", borderRadius: 999 }}>
+                      <div
+                        style={{
+                          height: "100%",
+                          width: `${widthPct}%`,
+                          borderRadius: 999,
+                          background: value < 0 ? "#dc2626" : "#16a34a",
+                        }}
+                      />
+                    </div>
+                    <div style={{ textAlign: "right", fontSize: 12 }}>{value.toFixed(2)}%</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <DataTable
+            title={tt("repMarginCategoryTitle")}
+            rows={(advancedMargin.categoryRows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["category"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "category", label: tt("prodLblCategory") },
+              { key: "soldQty", label: tt("invColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+              { key: "revenue", label: tt("repMarginRevenue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "landedCogs", label: tt("repMarginLandedCogs"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "realizedGrossProfit", label: tt("repMarginGrossProfit"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "marginImpactPct", label: tt("repMarginImpactPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+              { key: "realizedMarginPct", label: tt("repMarginRealizedPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+            ]}
+          />
+          <DataTable
+            title={tt("repMarginProductTitle")}
+            rows={(advancedMargin.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["name", "sku", "category"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "name", label: tt("invColProduct") },
+              { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
+              { key: "category", label: tt("prodLblCategory"), render: (v) => v || "-" },
+              { key: "soldQty", label: tt("invColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+              { key: "avgSellingPrice", label: tt("repMarginAvgSell"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "baseUnitCost", label: tt("repMarginBaseCost"), render: (v) => `৳${Number(v || 0).toFixed(4)}` },
+              { key: "landedUnitCost", label: tt("repMarginLandedCost"), render: (v) => `৳${Number(v || 0).toFixed(4)}` },
+              { key: "marginImpactPct", label: tt("repMarginImpactPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+              { key: "realizedMarginPct", label: tt("repMarginRealizedPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+              {
+                key: "erosionAlert",
+                label: tt("repMarginAlert"),
+                render: (v) => (v ? <span className="badge badge-danger">{tt("repMarginAlertYes")}</span> : <span className="badge badge-success">{tt("repMarginAlertNo")}</span>),
+              },
+            ]}
+          />
         </div>
       ) : null}
     </div>

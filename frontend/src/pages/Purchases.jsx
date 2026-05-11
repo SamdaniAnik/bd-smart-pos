@@ -8,6 +8,7 @@ import { getStoredPermissions, hasPermission } from "../utils/permissions";
 import { createSearchSelectStyles } from "../utils/selectStyles";
 import {
   notifyActionRequired,
+  notifyError,
   notifyPermissionRequired,
   notifySuccess,
 } from "../utils/notify";
@@ -49,6 +50,9 @@ function Purchases() {
     supplierId: "",
     invoiceNo: "",
     paidAmount: "",
+    transportationCost: "",
+    bribesCost: "",
+    extraOtherCost: "",
     financingSource: "SUPPLIER_CREDIT",
     loanReference: "",
     loanNote: "",
@@ -90,6 +94,38 @@ function Purchases() {
   const [purchasesTab, setPurchasesTab] = useState("create");
   const [submittingPurchase, setSubmittingPurchase] = useState(false);
   const [submittingReturn, setSubmittingReturn] = useState(false);
+  const [paymentSchedule, setPaymentSchedule] = useState({
+    summary: {
+      purchaseCount: 0,
+      lineCount: 0,
+      openLineCount: 0,
+      outstandingTotal: 0,
+      overdueCount: 0,
+      remindersDue: 0,
+      aging: { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0 },
+    },
+    rows: [],
+  });
+  const [vendorBillModal, setVendorBillModal] = useState({
+    open: false,
+    purchaseId: null,
+    supplierName: "",
+    total: 0,
+    status: "DRAFT",
+    billNo: "",
+    dueDate: "",
+    note: "",
+    attachments: [],
+    loading: false,
+  });
+  const [overrideMeta, setOverrideMeta] = useState({ reason: "", refNo: "" });
+  const overridePayload = useMemo(
+    () => ({
+      overrideReason: String(overrideMeta.reason || "").trim() || undefined,
+      overrideRefNo: String(overrideMeta.refNo || "").trim() || undefined,
+    }),
+    [overrideMeta.reason, overrideMeta.refNo]
+  );
 
   const branchIdForFiscal = typeof window !== "undefined" ? localStorage.getItem("bd_pos_branch_id") || "1" : "1";
   const { data: fiscalGateData } = useQuery({
@@ -106,7 +142,7 @@ function Purchases() {
     if (returnRange.from) query.set("from", returnRange.from);
     if (returnRange.to) query.set("to", returnRange.to);
     const returnsUrl = query.toString() ? `/purchases/returns?${query.toString()}` : "/purchases/returns";
-    const [purchaseRes, returnsRes, supplierRes, productRes, optimizationRes, approvalsRes, supplierScorecardRes] = await Promise.all([
+    const [purchaseRes, returnsRes, supplierRes, productRes, optimizationRes, approvalsRes, supplierScorecardRes, scheduleRes] = await Promise.all([
       api.get("/purchases"),
       api.get(returnsUrl),
       api.get("/master/suppliers"),
@@ -114,6 +150,7 @@ function Purchases() {
       api.get(`/purchases/optimization?days=${optimizationDays}&leadDays=${optimizationLeadDays}`),
       api.get("/purchases/plan-approvals"),
       api.get(`/purchases/supplier-scorecards?days=${Number(supplierScorecardDays || 60)}`),
+      api.get("/purchases/payment-schedule"),
     ]);
     setPurchases(purchaseRes.data);
     setPurchaseReturns(returnsRes.data);
@@ -124,6 +161,20 @@ function Purchases() {
     setSupplierScorecards(
       supplierScorecardRes.data || {
         summary: { supplierCount: 0, avgScore: 0, highRiskSuppliers: 0, totalSpend: 0 },
+        rows: [],
+      }
+    );
+    setPaymentSchedule(
+      scheduleRes.data || {
+        summary: {
+          purchaseCount: 0,
+          lineCount: 0,
+          openLineCount: 0,
+          outstandingTotal: 0,
+          overdueCount: 0,
+          remindersDue: 0,
+          aging: { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0 },
+        },
         rows: [],
       }
     );
@@ -320,6 +371,9 @@ function Purchases() {
         supplierId: Number(form.supplierId),
         invoiceNo: form.invoiceNo || null,
         paidAmount: Number(form.paidAmount || 0),
+        transportationCost: Number(form.transportationCost || 0),
+        bribesCost: Number(form.bribesCost || 0),
+        extraOtherCost: Number(form.extraOtherCost || 0),
         financingSource: form.financingSource || "SUPPLIER_CREDIT",
         loanReference: form.financingSource === "BANK_LOAN" ? form.loanReference?.trim() || null : null,
         loanNote: form.financingSource === "BANK_LOAN" ? form.loanNote?.trim() || null : null,
@@ -327,11 +381,15 @@ function Purchases() {
           form.financingSource === "BANK_LOAN" && form.loanMaturityDate ? form.loanMaturityDate : null,
         items: lines,
         deferStockPosting: Boolean(form.deferStockPosting),
+        ...overridePayload,
       });
       setForm({
         supplierId: "",
         invoiceNo: "",
         paidAmount: "",
+        transportationCost: "",
+        bribesCost: "",
+        extraOtherCost: "",
         financingSource: "SUPPLIER_CREDIT",
         loanReference: "",
         loanNote: "",
@@ -399,6 +457,7 @@ function Purchases() {
           ),
           vatType: String(item.vatType || "EXCLUSIVE").toUpperCase(),
         })),
+        ...overridePayload,
       });
     }
 
@@ -492,6 +551,7 @@ function Purchases() {
       leadDays: Number(optimizationLeadDays || 7),
       budget: Number(planBudget || 0),
       rows: includedRows,
+      ...overridePayload,
     });
     notifySuccess(tt("purSuccessSplitFromPlan"));
     setPlanData({
@@ -530,7 +590,10 @@ function Purchases() {
     }
     const pin = window.prompt(tt("purPromptManagerPin"));
     if (!pin) return;
-    await api.post(`/purchases/plan-approvals/${Number(approvalId)}/approve`, { managerApprovalPin: pin });
+    await api.post(`/purchases/plan-approvals/${Number(approvalId)}/approve`, {
+      managerApprovalPin: pin,
+      ...overridePayload,
+    });
     notifySuccess(tt("purSuccessApprovalCreated"));
     await load();
   };
@@ -637,6 +700,7 @@ function Purchases() {
             cost: Number(returnForm.cost),
           },
         ],
+        ...overridePayload,
       });
       setReturnForm({ purchaseId: "", productId: "", qty: "", cost: "", reason: "" });
       await load();
@@ -719,7 +783,7 @@ function Purchases() {
       notifyActionRequired(tt("purNotifyReceiveQty"));
       return;
     }
-    await api.post(`/purchases/${purchaseId}/receive`, { items });
+    await api.post(`/purchases/${purchaseId}/receive`, { items, ...overridePayload });
     const detail = await api.get(`/purchases/${purchaseId}`);
     setGrnReceiveQtyByProduct(
       Object.fromEntries((detail.data?.receiving?.rows || []).map((line) => [String(line.productId), 0]))
@@ -751,6 +815,174 @@ function Purchases() {
     URL.revokeObjectURL(blobUrl);
   };
 
+  const runScheduleAutomation = async () => {
+    if (!canManagePurchases) {
+      notifyPermissionRequired(tt("purNeedPermCreate"));
+      return;
+    }
+    await api.post("/purchases/payment-schedule/automation/run");
+    notifySuccess(tt("purScheduleAutomationDone"));
+    await load();
+  };
+
+  const exportPaymentSchedule = async (format) => {
+    if (!canExportReports) {
+      notifyPermissionRequired(tt("purNeedPermExportPlan"));
+      return;
+    }
+    const url = `/purchases/payment-schedule/export.${format}`;
+    const filename = format === "csv" ? "purchase-payment-schedule.csv" : "purchase-payment-schedule.pdf";
+    const res = await api.get(url, { responseType: "blob" });
+    const blobUrl = URL.createObjectURL(new Blob([res.data]));
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(blobUrl);
+  };
+
+  const payScheduleEntry = async (row) => {
+    if (!canManagePurchases) {
+      notifyPermissionRequired(tt("purNeedPermCreate"));
+      return;
+    }
+    const amountRaw = window.prompt(
+      tt("purPromptSchedulePayAmount"),
+      String(Number(row.outstanding || 0).toFixed(2))
+    );
+    if (!amountRaw) return;
+    const amount = Number(amountRaw);
+    if (!(amount > 0)) {
+      notifyError(tt("purErrInvalidPayAmount"));
+      return;
+    }
+    const method = (window.prompt(tt("purPromptPayMethod"), "Cash") || "Cash").trim() || "Cash";
+    const note = window.prompt(tt("purPromptPayNote"), "") || "";
+    await api.post(
+      `/purchases/${Number(row.purchaseId)}/payment-schedule/${encodeURIComponent(row.entryKey)}/pay`,
+      { amount, method, note, ...overridePayload }
+    );
+    notifySuccess(tt("purSchedulePaymentPosted"));
+    await load();
+  };
+
+  const openVendorBillModal = (row) => {
+    const vendorBill = row.vendorBill || {};
+    setVendorBillModal({
+      open: true,
+      purchaseId: Number(row.id),
+      supplierName: row.supplierName || row.supplier?.name || "-",
+      total: Number(row.total || 0),
+      status: String(vendorBill.status || "DRAFT"),
+      billNo: String(vendorBill.billNo || ""),
+      dueDate: vendorBill.dueDate ? String(vendorBill.dueDate).slice(0, 10) : "",
+      note: String(vendorBill.note || ""),
+      attachments: Array.isArray(vendorBill.attachments) ? vendorBill.attachments : [],
+      loading: false,
+    });
+  };
+
+  const closeVendorBillModal = () => {
+    setVendorBillModal({
+      open: false,
+      purchaseId: null,
+      supplierName: "",
+      total: 0,
+      status: "DRAFT",
+      billNo: "",
+      dueDate: "",
+      note: "",
+      attachments: [],
+      loading: false,
+    });
+  };
+
+  const addVendorBillAttachment = () => {
+    setVendorBillModal((prev) => ({
+      ...prev,
+      attachments: [...(prev.attachments || []), { name: "", url: "", mimeType: "", size: 0, note: "" }],
+    }));
+  };
+
+  const updateVendorBillAttachment = (idx, patch) => {
+    setVendorBillModal((prev) => ({
+      ...prev,
+      attachments: (prev.attachments || []).map((att, i) => (i === idx ? { ...att, ...patch } : att)),
+    }));
+  };
+
+  const removeVendorBillAttachment = (idx) => {
+    setVendorBillModal((prev) => ({
+      ...prev,
+      attachments: (prev.attachments || []).filter((_, i) => i !== idx),
+    }));
+  };
+
+  const saveVendorBillRecord = async () => {
+    if (!vendorBillModal.purchaseId) return;
+    setVendorBillModal((prev) => ({ ...prev, loading: true }));
+    try {
+      const validUrl = (value) => {
+        try {
+          const url = new URL(String(value || "").trim());
+          return ["http:", "https:"].includes(url.protocol);
+        } catch {
+          return false;
+        }
+      };
+      const malformed = (vendorBillModal.attachments || []).find(
+        (x) => String(x.name || "").trim() && String(x.url || "").trim() && !validUrl(x.url)
+      );
+      if (malformed) {
+        notifyError(tt("purInvalidAttachmentUrl"));
+        return;
+      }
+      const payload = {
+        billNo: vendorBillModal.billNo || "",
+        dueDate: vendorBillModal.dueDate || null,
+        note: vendorBillModal.note || "",
+        attachments: (vendorBillModal.attachments || []).filter(
+          (x) => String(x.name || "").trim() && String(x.url || "").trim()
+        ),
+      };
+      await api.put(`/purchases/${Number(vendorBillModal.purchaseId)}/vendor-bill`, payload);
+      notifySuccess(tt("purBillSaved"));
+      await load();
+      setVendorBillModal((prev) => ({ ...prev, status: "DRAFT" }));
+    } finally {
+      setVendorBillModal((prev) => ({ ...prev, loading: false }));
+    }
+  };
+
+  const submitVendorBillForApproval = async () => {
+    if (!vendorBillModal.purchaseId) return;
+    setVendorBillModal((prev) => ({ ...prev, loading: true }));
+    try {
+      await saveVendorBillRecord();
+      const res = await api.post(`/purchases/${Number(vendorBillModal.purchaseId)}/vendor-bill/submit`);
+      notifySuccess(tt("purBillSubmitted"));
+      if (res?.data?.approvalEventId) {
+        localStorage.setItem("bd_pos_approval_focus_id", String(res.data.approvalEventId));
+      }
+      await load();
+      setVendorBillModal((prev) => ({ ...prev, status: "SUBMITTED" }));
+    } finally {
+      setVendorBillModal((prev) => ({ ...prev, loading: false }));
+    }
+  };
+
+  const openAttachment = (url) => {
+    const raw = String(url || "").trim();
+    if (!raw) return;
+    try {
+      const parsed = new URL(raw);
+      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid protocol");
+      window.open(parsed.toString(), "_blank", "noopener,noreferrer");
+    } catch {
+      notifyError(tt("purInvalidAttachmentUrl"));
+    }
+  };
+
   return (
     <div className="page-stack">
       <div className="page-header">
@@ -765,6 +997,21 @@ function Purchases() {
           <p>{fiscalGateData?.message || tt("posFiscalNoPeriod")}</p>
         </div>
       ) : null}
+      <div className="page-card" style={{ marginBottom: 10 }}>
+        <h4 style={{ marginTop: 0, marginBottom: 8 }}>Override control (Procurement & Payables)</h4>
+        <div className="form-grid">
+          <input
+            value={overrideMeta.reason}
+            onChange={(e) => setOverrideMeta((p) => ({ ...p, reason: e.target.value }))}
+            placeholder="Override reason (required if period locked)"
+          />
+          <input
+            value={overrideMeta.refNo}
+            onChange={(e) => setOverrideMeta((p) => ({ ...p, refNo: e.target.value }))}
+            placeholder="Ticket / reference no. (required if period locked)"
+          />
+        </div>
+      </div>
       <div className="pos-tabs">
         <div className="pos-tablist" role="tablist" aria-label={tt("purchasesTabsAria")}>
           <button
@@ -1209,6 +1456,30 @@ function Purchases() {
             onChange={(e) => setForm({ ...form, paidAmount: e.target.value })}
           />
         </label>
+        <input
+          placeholder={tt("purPhTransportationCost")}
+          type="number"
+          min={0}
+          step="0.01"
+          value={form.transportationCost}
+          onChange={(e) => setForm({ ...form, transportationCost: e.target.value })}
+        />
+        <input
+          placeholder={tt("purPhBribesCost")}
+          type="number"
+          min={0}
+          step="0.01"
+          value={form.bribesCost}
+          onChange={(e) => setForm({ ...form, bribesCost: e.target.value })}
+        />
+        <input
+          placeholder={tt("purPhExtraOtherCost")}
+          type="number"
+          min={0}
+          step="0.01"
+          value={form.extraOtherCost}
+          onChange={(e) => setForm({ ...form, extraOtherCost: e.target.value })}
+        />
         <Select
           className="form-select-sm"
           value={productOptions.find((opt) => opt.value === String(form.productId)) || null}
@@ -1377,6 +1648,67 @@ function Purchases() {
       </div>
       ) : null}
       {purchasesTab === "history" ? (
+        <div className="page-card" style={{ marginBottom: 10 }}>
+          <h4 style={{ marginTop: 0 }}>{tt("purPaymentScheduleTitle")}</h4>
+          <div className="quick-stats" style={{ marginBottom: 8 }}>
+            <div className="stat">{tt("purScheduleOpenLines")} {Number(paymentSchedule.summary?.openLineCount || 0)}</div>
+            <div className="stat">{tt("purScheduleOutstanding")} ৳{Number(paymentSchedule.summary?.outstandingTotal || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purScheduleOverdue")} {Number(paymentSchedule.summary?.overdueCount || 0)}</div>
+            <div className="stat">{tt("purScheduleRemindersDue")} {Number(paymentSchedule.summary?.remindersDue || 0)}</div>
+            <div className="stat">{tt("purAgingCurrent")} ৳{Number(paymentSchedule.summary?.aging?.current || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purAging1to30")} ৳{Number(paymentSchedule.summary?.aging?.d1_30 || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purAging31to60")} ৳{Number(paymentSchedule.summary?.aging?.d31_60 || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purAging61to90")} ৳{Number(paymentSchedule.summary?.aging?.d61_90 || 0).toFixed(2)}</div>
+            <div className="stat">{tt("purAging90Plus")} ৳{Number(paymentSchedule.summary?.aging?.d90_plus || 0).toFixed(2)}</div>
+          </div>
+          <button type="button" className="btn-secondary btn-sm" onClick={runScheduleAutomation} disabled={!canManagePurchases}>
+            {tt("purBtnRunScheduleAutomation")}
+          </button>
+          <button type="button" className="btn-secondary btn-sm" onClick={() => exportPaymentSchedule("csv")} disabled={!canExportReports} style={{ marginLeft: 6 }}>
+            {tt("purBtnExportScheduleCsv")}
+          </button>
+          <button type="button" className="btn-secondary btn-sm" onClick={() => exportPaymentSchedule("pdf")} disabled={!canExportReports} style={{ marginLeft: 6 }}>
+            {tt("purBtnExportSchedulePdf")}
+          </button>
+        </div>
+      ) : null}
+      {purchasesTab === "history" ? (
+        <DataTable
+          title={tt("purDtPaymentSchedule")}
+          rows={(paymentSchedule.rows || []).map((row, idx) => ({
+            rowNo: idx + 1,
+            ...row,
+            dueDateLabel: row.dueDate ? new Date(row.dueDate).toLocaleDateString() : "-",
+          }))}
+          searchableKeys={["supplierName", "entryKey", "status", "financingSource"]}
+          columns={[
+            { key: "rowNo", label: tt("colId") },
+            { key: "purchaseId", label: tt("purColPurchaseId") },
+            { key: "supplierName", label: tt("purColSupplier") },
+            { key: "entryKey", label: tt("purColScheduleKey") },
+            { key: "dueDateLabel", label: tt("purColScheduleDueDate") },
+            { key: "amount", label: tt("receiptAmount"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "paidAmount", label: tt("dashPaid"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "outstanding", label: tt("dashDue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            { key: "daysPastDue", label: tt("purColDaysPastDue"), render: (v) => Number(v || 0) },
+            { key: "reminderCount", label: tt("purColReminderCount"), render: (v) => Number(v || 0) },
+            { key: "status", label: tt("colStatus") },
+            {
+              key: "actions",
+              label: tt("colActions"),
+              render: (_, row) =>
+                Number(row.outstanding || 0) > 0 ? (
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => payScheduleEntry(row)} disabled={!canManagePurchases}>
+                    {tt("purBtnPaySchedule")}
+                  </button>
+                ) : (
+                  "-"
+                ),
+            },
+          ]}
+        />
+      ) : null}
+      {purchasesTab === "history" ? (
       <DataTable
         title={tt("purDtPurchaseHistory")}
         rows={purchases.map((p) => ({
@@ -1388,6 +1720,7 @@ function Purchases() {
           grossAmount: Number(p.vatBreakdown?.grossAmount || p.total || 0).toFixed(2),
           receiveStatus: p.receiving?.status || "PENDING",
           remainingQty: Number(p.receiving?.remainingQtyTotal || 0),
+          vendorBillStatus: String(p.vendorBill?.status || "DRAFT"),
           financeLabel: String(p.financingSource || "SUPPLIER_CREDIT").toUpperCase() === "BANK_LOAN" ? tt("purFinanceLoan") : tt("purFinanceCredit"),
         }))}
         searchableKeys={["supplierName", "invoiceNo", "createdAtLabel", "financeLabel"]}
@@ -1408,10 +1741,14 @@ function Purchases() {
           { key: "invoiceNo", label: tt("receiptInvoice"), render: (v) => v || "-" },
           { key: "financeLabel", label: tt("purColFinance"), render: (v) => v || "-" },
           { key: "total", label: tt("receiptTotal"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "transportationCost", label: tt("purColTransportationCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "bribesCost", label: tt("purColBribesCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "extraOtherCost", label: tt("purColExtraOtherCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           { key: "taxableAmount", label: tt("purColTaxable"), render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "inputVat", label: tt("purColInputVat"), render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "grossAmount", label: tt("purColGross"), render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "receiveStatus", label: tt("purColReceiveStatus"), render: (v) => v || "-" },
+          { key: "vendorBillStatus", label: tt("purColVendorBillStatus"), render: (v) => v || "DRAFT" },
           { key: "remainingQty", label: tt("purColPendingQty"), render: (v) => Number(v || 0) },
           { key: "paidAmount", label: tt("dashPaid"), render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "dueAmount", label: tt("dashDue"), render: (v) => `৳${Number(v).toFixed(2)}` },
@@ -1419,9 +1756,14 @@ function Purchases() {
             key: "actions",
             label: tt("colActions"),
             render: (_, row) => (
-              <button type="button" className="btn-secondary btn-sm" onClick={() => openPurchaseDetails(row)}>
-                {tt("purBtnDetails")}
-              </button>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => openPurchaseDetails(row)}>
+                  {tt("purBtnDetails")}
+                </button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => openVendorBillModal(row)}>
+                  {tt("purBtnVendorBill")}
+                </button>
+              </div>
             ),
           },
         ]}
@@ -1539,6 +1881,10 @@ function Purchases() {
                   <div className="stat">{tt("purColGross")}: ৳{Number(purchaseDetailsModal.data?.vatBreakdown?.grossAmount || 0).toFixed(2)}</div>
                   <div className="stat">{tt("purMdlReceive")} {purchaseDetailsModal.data?.receiving?.status || "-"}</div>
                   <div className="stat">{tt("purMdlPendingQty")} {Number(purchaseDetailsModal.data?.receiving?.remainingQtyTotal || 0)}</div>
+                  <div className="stat">{tt("purMdlTransportationCost")} ৳{Number(purchaseDetailsModal.data?.transportationCost || 0).toFixed(2)}</div>
+                  <div className="stat">{tt("purMdlBribesCost")} ৳{Number(purchaseDetailsModal.data?.bribesCost || 0).toFixed(2)}</div>
+                  <div className="stat">{tt("purMdlExtraOtherCost")} ৳{Number(purchaseDetailsModal.data?.extraOtherCost || 0).toFixed(2)}</div>
+                  <div className="stat">{tt("purMdlLandedTotal")} ৳{Number(purchaseDetailsModal.data?.landedCostAllocation?.landedTotal || purchaseDetailsModal.data?.total || 0).toFixed(2)}</div>
                 </div>
                 <DataTable
                   title={tt("purDtVatTrace")}
@@ -1558,6 +1904,9 @@ function Purchases() {
                     { key: "taxableAmount", label: tt("purColTaxable"), render: (v) => `৳${Number(v).toFixed(2)}` },
                     { key: "vatAmount", label: tt("receiptVat"), render: (v) => `৳${Number(v).toFixed(2)}` },
                     { key: "grossAmount", label: tt("purColGross"), render: (v) => `৳${Number(v).toFixed(2)}` },
+                    { key: "allocatedExtraCost", label: tt("purColAllocatedExtra"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+                    { key: "landedUnitCost", label: tt("purColLandedUnitCost"), render: (v) => `৳${Number(v || 0).toFixed(4)}` },
+                    { key: "landedLineTotal", label: tt("purColLandedLineTotal"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
                   ]}
                 />
                 <DataTable
@@ -1626,6 +1975,96 @@ function Purchases() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      ) : null}
+      {vendorBillModal.open ? (
+        <div className="shortcuts-overlay" onClick={closeVendorBillModal}>
+          <div className="shortcuts-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 900 }}>
+            <div className="shortcuts-modal-head">
+              <h3>{tt("purVendorBillTitle")}</h3>
+              <button type="button" className="btn-secondary btn-sm" onClick={closeVendorBillModal}>
+                {tt("ksClose")}
+              </button>
+            </div>
+            <div className="quick-stats" style={{ marginBottom: 8 }}>
+              <div className="stat">{tt("purMdlPurchaseId")} {vendorBillModal.purchaseId}</div>
+              <div className="stat">{tt("purMdlSupplier")} {vendorBillModal.supplierName}</div>
+              <div className="stat">{tt("receiptTotal")} ৳{Number(vendorBillModal.total || 0).toFixed(2)}</div>
+              <div className="stat">{tt("purColVendorBillStatus")} {vendorBillModal.status || "DRAFT"}</div>
+            </div>
+            <div className="form-grid" style={{ marginBottom: 10 }}>
+              <input
+                placeholder={tt("purPhBillNo")}
+                value={vendorBillModal.billNo}
+                onChange={(e) => setVendorBillModal((prev) => ({ ...prev, billNo: e.target.value }))}
+              />
+              <input
+                type="date"
+                value={vendorBillModal.dueDate}
+                onChange={(e) => setVendorBillModal((prev) => ({ ...prev, dueDate: e.target.value }))}
+              />
+              <input
+                placeholder={tt("purPhNoteOptional")}
+                value={vendorBillModal.note}
+                onChange={(e) => setVendorBillModal((prev) => ({ ...prev, note: e.target.value }))}
+                style={{ gridColumn: "1 / -1" }}
+              />
+            </div>
+            <div className="page-card" style={{ marginBottom: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>{tt("purVendorBillAttachments")}</div>
+              {(vendorBillModal.attachments || []).map((att, idx) => (
+                <div key={`vb-att-${idx}`} className="form-grid" style={{ marginBottom: 6 }}>
+                  <input
+                    placeholder={tt("purPhAttachmentName")}
+                    value={att.name || ""}
+                    onChange={(e) => updateVendorBillAttachment(idx, { name: e.target.value })}
+                  />
+                  <input
+                    placeholder={tt("purPhAttachmentUrl")}
+                    value={att.url || ""}
+                    onChange={(e) => updateVendorBillAttachment(idx, { url: e.target.value })}
+                  />
+                  <input
+                    placeholder={tt("purPhAttachmentType")}
+                    value={att.mimeType || ""}
+                    onChange={(e) => updateVendorBillAttachment(idx, { mimeType: e.target.value })}
+                  />
+                  <input
+                    placeholder={tt("purPhNoteOptional")}
+                    value={att.note || ""}
+                    onChange={(e) => updateVendorBillAttachment(idx, { note: e.target.value })}
+                  />
+                  <button type="button" className="btn-danger btn-sm" onClick={() => removeVendorBillAttachment(idx)}>
+                    {tt("purRemove")}
+                  </button>
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => openAttachment(att.url)}>
+                    {tt("purBtnOpenAttachment")}
+                  </button>
+                </div>
+              ))}
+              <button type="button" className="btn-secondary btn-sm" onClick={addVendorBillAttachment}>
+                {tt("purBtnAddAttachment")}
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={saveVendorBillRecord}
+                disabled={vendorBillModal.loading}
+              >
+                {tt("purBtnSaveVendorBill")}
+              </button>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={submitVendorBillForApproval}
+                disabled={vendorBillModal.loading}
+              >
+                {tt("purBtnSubmitVendorBillApproval")}
+              </button>
+            </div>
           </div>
         </div>
       ) : null}

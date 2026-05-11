@@ -1096,7 +1096,11 @@ exports.checkout = async (req, res) => {
     ) {
       return res.status(400).json({ error: "Cannot settle a quote and held cart on the same sale" });
     }
-    await ensureOpenFiscalPeriod(branchId);
+    await ensureOpenFiscalPeriod(branchId, new Date(), {
+      permissions: req.permissions,
+      userId: req.user?.id || null,
+      actionName: "sale.create",
+    });
 
     const productIds = [...new Set(cart.map((item) => Number(item.id)))];
     const dbProducts = await prisma.product.findMany({ where: { id: { in: productIds }, branchId } });

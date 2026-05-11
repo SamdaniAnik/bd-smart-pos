@@ -19,6 +19,11 @@ const {
   runCustomerRetentionAutomation,
   getCustomerRetentionAutomationHistory,
   getCustomerAccountStatementPdf,
+  getFeatureReadiness,
+  listProductCategories,
+  createProductCategory,
+  updateProductCategory,
+  deleteProductCategory,
 } = require("./masterController");
 const { requireAuth, requirePermission } = require("../../middleware/auth");
 
@@ -63,5 +68,10 @@ router.get(
 );
 router.get("/customers/:id", requireAuth, requirePermission("customer.view"), getCustomerDetails);
 router.put("/customers/:id", requireAuth, requirePermission("customer.create"), updateCustomer);
+router.get("/feature-readiness", requireAuth, requirePermission("rbac.manage"), getFeatureReadiness);
+router.get("/product-categories", requireAuth, requirePermission("product.view"), listProductCategories);
+router.post("/product-categories", requireAuth, requirePermission("product.create"), createProductCategory);
+router.put("/product-categories/:id", requireAuth, requirePermission("product.create"), updateProductCategory);
+router.delete("/product-categories/:id", requireAuth, requirePermission("product.create"), deleteProductCategory);
 
 module.exports = router;

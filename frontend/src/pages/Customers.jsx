@@ -26,6 +26,7 @@ function Customers() {
     creditLimit: "0",
     birthDate: "",
     marketingOptIn: true,
+    priceTier: "RETAIL",
   });
   const [editingId, setEditingId] = useState(null);
   const [selected, setSelected] = useState(null);
@@ -52,7 +53,7 @@ function Customers() {
       } else {
         await api.post("/master/customers", form);
       }
-      setForm({ name: "", phone: "", address: "", creditLimit: "0", birthDate: "", marketingOptIn: true });
+      setForm({ name: "", phone: "", address: "", creditLimit: "0", birthDate: "", marketingOptIn: true, priceTier: "RETAIL" });
       setEditingId(null);
       setSelected(null);
       await load();
@@ -71,6 +72,7 @@ function Customers() {
       creditLimit: String(row.creditLimit ?? 0),
       birthDate: row.birthDate ? String(row.birthDate).slice(0, 10) : "",
       marketingOptIn: row.marketingOptIn == null ? true : Boolean(row.marketingOptIn),
+      priceTier: row.priceTier || "RETAIL",
     });
   };
 
@@ -81,7 +83,7 @@ function Customers() {
 
   const cancelEdit = () => {
     setEditingId(null);
-    setForm({ name: "", phone: "", address: "", creditLimit: "0", birthDate: "", marketingOptIn: true });
+    setForm({ name: "", phone: "", address: "", creditLimit: "0", birthDate: "", marketingOptIn: true, priceTier: "RETAIL" });
   };
 
   const downloadAccountStatementPdf = async () => {
@@ -141,6 +143,15 @@ function Customers() {
           />
           {tt("custMarketingOptIn")}
         </label>
+        <select
+          className="form-select-sm"
+          value={form.priceTier}
+          onChange={(e) => setForm({ ...form, priceTier: e.target.value })}
+        >
+          <option value="RETAIL">{tt("prodPriceTypeRetail")}</option>
+          <option value="WHOLESALE">{tt("prodPriceTypeWholesale")}</option>
+          <option value="DEALER">{tt("prodPriceTypeDealer")}</option>
+        </select>
         <SubmitButton loading={submitting} loadingLabel={editingId ? tt("settingsUpdating") : tt("settingsSaving")}>
           {editingId ? tt("custBtnUpdate") : tt("custBtnAdd")}
         </SubmitButton>
@@ -165,6 +176,7 @@ function Customers() {
                 <p><strong>{tt("colAddress")}:</strong> {selected.address || "-"}</p>
                 <p><strong>{tt("custBirthDate")}:</strong> {selected.birthDate ? new Date(selected.birthDate).toLocaleDateString() : "-"}</p>
                 <p><strong>{tt("custMarketing")}:</strong> {selected.marketingOptIn ? tt("custOptedIn") : tt("custOptedOut")}</p>
+                <p><strong>{tt("custPriceTier")}:</strong> {selected.priceTier || "RETAIL"}</p>
                 <p><strong>{tt("dashDue")}:</strong> ৳{due.toFixed(2)}</p>
                 <p><strong>{tt("custCreditLimit")}:</strong> ৳{creditLimit.toFixed(2)} {creditLimit <= 0 ? `(${tt("custNoLimit")})` : ""}</p>
                 {creditLimit > 0 ? (
@@ -199,6 +211,7 @@ function Customers() {
           { key: "address", label: tt("colAddress"), render: (v) => v || "-" },
           { key: "birthDate", label: tt("custBirthDate"), render: (v) => (v ? new Date(v).toLocaleDateString() : "-") },
           { key: "marketingOptIn", label: tt("custMarketing"), render: (v) => (v ? tt("custYes") : tt("custNo")) },
+          { key: "priceTier", label: tt("custPriceTier"), render: (v) => v || "RETAIL" },
           { key: "balance", label: tt("dashDue"), render: (v) => `৳${Number(v).toFixed(2)}` },
           {
             key: "creditLimit",

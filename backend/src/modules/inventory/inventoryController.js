@@ -76,6 +76,36 @@ function clean(value, max = 120) {
   return String(value || "").trim().slice(0, max);
 }
 
+function calcMarginPct(sellingPrice, unitCost) {
+  const selling = Number(sellingPrice || 0);
+  const cost = Number(unitCost || 0);
+  if (!(selling > 0)) return 0;
+  return ((selling - cost) / selling) * 100;
+}
+
+async function getLatestLandedCostByProduct(branchId) {
+  const logs = await prisma.auditLog.findMany({
+    where: { action: "PURCHASE_CREATE", entity: "Purchase" },
+    orderBy: { createdAt: "desc" },
+    take: 5000,
+  });
+  const map = new Map();
+  for (const log of logs) {
+    const payload = log.payload || {};
+    if (Number(payload.branchId || 0) !== Number(branchId)) continue;
+    const lines = Array.isArray(payload?.landedCostAllocation?.lines) ? payload.landedCostAllocation.lines : [];
+    for (const line of lines) {
+      const productId = Number(line?.productId || 0);
+      if (!productId || map.has(productId)) continue;
+      map.set(productId, {
+        baseUnitCost: Number(line?.baseUnitCost || 0),
+        landedUnitCost: Number(line?.landedUnitCost || 0),
+      });
+    }
+  }
+  return map;
+}
+
 async function getReasonMap(tx, branchId) {
   const rows = await tx.inventoryAdjustReason.findMany({ where: { branchId } });
   return new Map(rows.map((x) => [String(x.code).toUpperCase(), x]));
@@ -934,6 +964,7 @@ exports.getLowStockAlerts = async (req, res) => {
     const branchId = req.branchId;
     const q = String(req.query.q || "").trim();
     const onlyCritical = String(req.query.onlyCritical || "").toLowerCase() === "true";
+    const landedByProduct = await getLatestLandedCostByProduct(branchId);
     const products = await prisma.product.findMany({
       where: {
         branchId,
@@ -959,6 +990,12 @@ exports.getLowStockAlerts = async (req, res) => {
         const stock = p.sellByWeight ? Number(p.stockKg || 0) : Number(p.stock || 0);
         const shortageQty = Math.max(0, reorderLevel - stock);
         const status = stock <= 0 ? "OUT" : stock <= reorderLevel ? "LOW" : "OK";
+        const landedInfo = landedByProduct.get(Number(p.id)) || null;
+        const baseUnitCost = Number(landedInfo?.baseUnitCost || p.unitPrice || 0);
+        const landedUnitCost = Number(landedInfo?.landedUnitCost || baseUnitCost);
+        const sellingPrice = Number(p.price || 0);
+        const baseMarginPct = calcMarginPct(sellingPrice, baseUnitCost);
+        const landedMarginPct = calcMarginPct(sellingPrice, landedUnitCost);
         return {
           ...p,
           kind: p.sellByWeight ? "WEIGHT" : "SIMPLE",
@@ -966,6 +1003,11 @@ exports.getLowStockAlerts = async (req, res) => {
           status,
           shortageQty,
           severityScore: reorderLevel > 0 ? shortageQty / reorderLevel : 0,
+          baseUnitCost: Number(baseUnitCost.toFixed(4)),
+          landedUnitCost: Number(landedUnitCost.toFixed(4)),
+          baseMarginPct: Number(baseMarginPct.toFixed(2)),
+          landedMarginPct: Number(landedMarginPct.toFixed(2)),
+          marginImpactPct: Number((landedMarginPct - baseMarginPct).toFixed(2)),
         };
       })
       .filter((p) => (onlyCritical ? p.status !== "OK" : true));
@@ -977,7 +1019,7 @@ exports.getLowStockAlerts = async (req, res) => {
         product: { hasVariants: true, reorderLevel: { gt: 0 } },
       },
       include: {
-        product: { select: { id: true, name: true, sku: true, reorderLevel: true, price: true, category: true } },
+        product: { select: { id: true, name: true, sku: true, reorderLevel: true, price: true, unitPrice: true, category: true } },
       },
       orderBy: [{ stock: "asc" }, { id: "asc" }],
       take: 500,
@@ -988,6 +1030,12 @@ exports.getLowStockAlerts = async (req, res) => {
         const stock = Number(v.stock || 0);
         const shortageQty = Math.max(0, reorderLevel - stock);
         const status = stock <= 0 ? "OUT" : stock <= reorderLevel ? "LOW" : "OK";
+        const landedInfo = landedByProduct.get(Number(v.productId)) || null;
+        const baseUnitCost = Number(landedInfo?.baseUnitCost || v.product?.unitPrice || 0);
+        const landedUnitCost = Number(landedInfo?.landedUnitCost || baseUnitCost);
+        const sellingPrice = Number(v.product?.price || 0);
+        const baseMarginPct = calcMarginPct(sellingPrice, baseUnitCost);
+        const landedMarginPct = calcMarginPct(sellingPrice, landedUnitCost);
         const baseName = String(v.product?.name || "").trim() || "Product";
         const vlabel = String(v.label || "").trim();
         return {
@@ -999,11 +1047,17 @@ exports.getLowStockAlerts = async (req, res) => {
           sku: v.sku || v.product?.sku || null,
           category: v.product?.category || "",
           price: Number(v.product?.price || 0),
+          unitPrice: Number(v.product?.unitPrice || 0),
           stock,
           reorderLevel,
           status,
           shortageQty,
           severityScore: reorderLevel > 0 ? shortageQty / reorderLevel : 0,
+          baseUnitCost: Number(baseUnitCost.toFixed(4)),
+          landedUnitCost: Number(landedUnitCost.toFixed(4)),
+          baseMarginPct: Number(baseMarginPct.toFixed(2)),
+          landedMarginPct: Number(landedMarginPct.toFixed(2)),
+          marginImpactPct: Number((landedMarginPct - baseMarginPct).toFixed(2)),
         };
       })
       .filter((p) => (onlyCritical ? p.status !== "OK" : true));
@@ -1051,11 +1105,13 @@ exports.getInventoryIntelligence = async (req, res) => {
         stock: true,
         reorderLevel: true,
         price: true,
+        unitPrice: true,
       },
       orderBy: { name: "asc" },
       take: 2000,
     });
     const productIds = products.map((p) => p.id);
+    const landedByProduct = await getLatestLandedCostByProduct(branchId);
     if (!productIds.length) {
       return res.json({
         summary: { fastMovingCount: 0, slowMovingCount: 0, deadStockCount: 0, suggestedReorderCount: 0 },
@@ -1142,6 +1198,12 @@ exports.getInventoryIntelligence = async (req, res) => {
         ? Math.floor((now.getTime() - new Date(lastSoldAt).getTime()) / (24 * 60 * 60 * 1000))
         : null;
       const deadStock = daysSinceLastSale == null ? Number(p.stock || 0) > 0 : daysSinceLastSale >= deadDays;
+      const landedInfo = landedByProduct.get(Number(p.id)) || null;
+      const baseUnitCost = Number(landedInfo?.baseUnitCost || p.unitPrice || 0);
+      const landedUnitCost = Number(landedInfo?.landedUnitCost || baseUnitCost);
+      const sellingPrice = Number(p.price || 0);
+      const baseMarginPct = calcMarginPct(sellingPrice, baseUnitCost);
+      const landedMarginPct = calcMarginPct(sellingPrice, landedUnitCost);
       return {
         ...p,
         soldQty,
@@ -1154,6 +1216,11 @@ exports.getInventoryIntelligence = async (req, res) => {
         daysSinceLastSale,
         deadStock,
         reorderSuggestionQty,
+        baseUnitCost: Number(baseUnitCost.toFixed(4)),
+        landedUnitCost: Number(landedUnitCost.toFixed(4)),
+        baseMarginPct: Number(baseMarginPct.toFixed(2)),
+        landedMarginPct: Number(landedMarginPct.toFixed(2)),
+        marginImpactPct: Number((landedMarginPct - baseMarginPct).toFixed(2)),
       };
     });
 

@@ -94,6 +94,259 @@ function buildSaleWhere(branchId, from, to) {
   return where;
 }
 
+function calcMarginPct(sellingPrice, unitCost) {
+  const selling = Number(sellingPrice || 0);
+  const cost = Number(unitCost || 0);
+  if (!(selling > 0)) return 0;
+  return ((selling - cost) / selling) * 100;
+}
+
+async function getLatestLandedCostByProduct(branchId) {
+  const logs = await prisma.auditLog.findMany({
+    where: { action: "PURCHASE_CREATE", entity: "Purchase" },
+    orderBy: { createdAt: "desc" },
+    take: 5000,
+  });
+  const map = new Map();
+  for (const log of logs) {
+    const payload = log.payload || {};
+    if (Number(payload.branchId || 0) !== Number(branchId)) continue;
+    const lines = Array.isArray(payload?.landedCostAllocation?.lines) ? payload.landedCostAllocation.lines : [];
+    for (const line of lines) {
+      const productId = Number(line?.productId || 0);
+      if (!productId || map.has(productId)) continue;
+      map.set(productId, {
+        baseUnitCost: Number(line?.baseUnitCost || 0),
+        landedUnitCost: Number(line?.landedUnitCost || 0),
+      });
+    }
+  }
+  return map;
+}
+
+async function buildAdvancedMarginPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query || {});
+  const thresholdPctRaw = Number(query.erosionThresholdPct || 5);
+  const erosionThresholdPct = Number.isFinite(thresholdPctRaw) && thresholdPctRaw >= 0 ? thresholdPctRaw : 5;
+  const landedByProduct = await getLatestLandedCostByProduct(branchId);
+  const products = await prisma.product.findMany({
+    where: { branchId },
+    select: { id: true, name: true, sku: true, category: true, price: true, unitPrice: true, stock: true },
+    orderBy: { name: "asc" },
+    take: 5000,
+  });
+  const productIds = products.map((p) => p.id);
+  const saleItems = productIds.length
+    ? await prisma.saleItem.findMany({
+        where: {
+          productId: { in: productIds },
+          sale: {
+            branchId,
+            ...(from || to
+              ? {
+                  createdAt: {
+                    ...(from ? { gte: from } : {}),
+                    ...(to ? { lte: to } : {}),
+                  },
+                }
+              : {}),
+          },
+        },
+        select: { productId: true, qty: true, price: true },
+      })
+    : [];
+  const salesByProduct = new Map();
+  for (const row of saleItems) {
+    const pid = Number(row.productId || 0);
+    if (!pid) continue;
+    if (!salesByProduct.has(pid)) salesByProduct.set(pid, { qty: 0, revenue: 0 });
+    const current = salesByProduct.get(pid);
+    current.qty += Number(row.qty || 0);
+    current.revenue += Number(row.qty || 0) * Number(row.price || 0);
+    salesByProduct.set(pid, current);
+  }
+  const rows = products.map((p) => {
+    const landedInfo = landedByProduct.get(Number(p.id)) || null;
+    const baseUnitCost = Number(landedInfo?.baseUnitCost || p.unitPrice || p.price || 0);
+    const landedUnitCost = Number(landedInfo?.landedUnitCost || baseUnitCost);
+    const sales = salesByProduct.get(Number(p.id)) || { qty: 0, revenue: 0 };
+    const soldQty = Number(sales.qty || 0);
+    const fallbackSelling = Number(p.price || 0);
+    const realizedAvgSellingPrice = soldQty > 0 ? Number(sales.revenue || 0) / soldQty : fallbackSelling;
+    const baseMarginPct = calcMarginPct(realizedAvgSellingPrice, baseUnitCost);
+    const landedMarginPct = calcMarginPct(realizedAvgSellingPrice, landedUnitCost);
+    const marginImpactPct = landedMarginPct - baseMarginPct;
+    const realizedRevenue = Number(sales.revenue || 0);
+    const landedCogs = soldQty * landedUnitCost;
+    const realizedGrossProfit = realizedRevenue - landedCogs;
+    const realizedMarginPct = realizedRevenue > 0 ? (realizedGrossProfit / realizedRevenue) * 100 : landedMarginPct;
+    return {
+      productId: p.id,
+      name: p.name,
+      sku: p.sku || "",
+      category: p.category || "",
+      stock: Number(p.stock || 0),
+      soldQty: Number(soldQty.toFixed(2)),
+      avgSellingPrice: Number(realizedAvgSellingPrice.toFixed(2)),
+      baseUnitCost: Number(baseUnitCost.toFixed(4)),
+      landedUnitCost: Number(landedUnitCost.toFixed(4)),
+      baseMarginPct: Number(baseMarginPct.toFixed(2)),
+      landedMarginPct: Number(landedMarginPct.toFixed(2)),
+      marginImpactPct: Number(marginImpactPct.toFixed(2)),
+      realizedRevenue: Number(realizedRevenue.toFixed(2)),
+      landedCogs: Number(landedCogs.toFixed(2)),
+      realizedGrossProfit: Number(realizedGrossProfit.toFixed(2)),
+      realizedMarginPct: Number(realizedMarginPct.toFixed(2)),
+      erosionAlert: Number(marginImpactPct.toFixed(2)) <= -erosionThresholdPct,
+    };
+  });
+  const categoryMap = new Map();
+  for (const row of rows) {
+    const key = row.category || "Uncategorized";
+    if (!categoryMap.has(key)) {
+      categoryMap.set(key, {
+        category: key,
+        soldQty: 0,
+        revenue: 0,
+        landedCogs: 0,
+        realizedGrossProfit: 0,
+        weightedBase: 0,
+        weightedLanded: 0,
+        weightedSelling: 0,
+      });
+    }
+    const agg = categoryMap.get(key);
+    agg.soldQty += Number(row.soldQty || 0);
+    agg.revenue += Number(row.realizedRevenue || 0);
+    agg.landedCogs += Number(row.landedCogs || 0);
+    agg.realizedGrossProfit += Number(row.realizedGrossProfit || 0);
+    agg.weightedBase += Number(row.baseUnitCost || 0) * Number(row.soldQty || 0);
+    agg.weightedLanded += Number(row.landedUnitCost || 0) * Number(row.soldQty || 0);
+    agg.weightedSelling += Number(row.avgSellingPrice || 0) * Number(row.soldQty || 0);
+    categoryMap.set(key, agg);
+  }
+  const categoryRows = [...categoryMap.values()].map((row) => {
+    const avgSelling = row.soldQty > 0 ? row.weightedSelling / row.soldQty : 0;
+    const avgBase = row.soldQty > 0 ? row.weightedBase / row.soldQty : 0;
+    const avgLanded = row.soldQty > 0 ? row.weightedLanded / row.soldQty : 0;
+    const baseMarginPct = calcMarginPct(avgSelling, avgBase);
+    const landedMarginPct = calcMarginPct(avgSelling, avgLanded);
+    const marginImpactPct = landedMarginPct - baseMarginPct;
+    const realizedMarginPct = row.revenue > 0 ? (row.realizedGrossProfit / row.revenue) * 100 : 0;
+    return {
+      category: row.category,
+      soldQty: Number(row.soldQty.toFixed(2)),
+      revenue: Number(row.revenue.toFixed(2)),
+      landedCogs: Number(row.landedCogs.toFixed(2)),
+      realizedGrossProfit: Number(row.realizedGrossProfit.toFixed(2)),
+      baseMarginPct: Number(baseMarginPct.toFixed(2)),
+      landedMarginPct: Number(landedMarginPct.toFixed(2)),
+      marginImpactPct: Number(marginImpactPct.toFixed(2)),
+      realizedMarginPct: Number(realizedMarginPct.toFixed(2)),
+      erosionAlert: Number(marginImpactPct.toFixed(2)) <= -erosionThresholdPct,
+    };
+  });
+  const summary = {
+    skuCount: rows.length,
+    soldSkuCount: rows.filter((x) => Number(x.soldQty || 0) > 0).length,
+    erosionAlertCount: rows.filter((x) => x.erosionAlert).length,
+    totalRevenue: Number(rows.reduce((sum, x) => sum + Number(x.realizedRevenue || 0), 0).toFixed(2)),
+    totalLandedCogs: Number(rows.reduce((sum, x) => sum + Number(x.landedCogs || 0), 0).toFixed(2)),
+    totalGrossProfit: Number(rows.reduce((sum, x) => sum + Number(x.realizedGrossProfit || 0), 0).toFixed(2)),
+  };
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    erosionThresholdPct,
+    summary,
+    categoryRows: categoryRows.sort((a, b) => Number(a.marginImpactPct || 0) - Number(b.marginImpactPct || 0)),
+    rows: rows.sort((a, b) => Number(a.marginImpactPct || 0) - Number(b.marginImpactPct || 0)),
+  };
+}
+
+async function buildAdvancedMarginTrendPayload(branchId, query = {}) {
+  const monthsRaw = Number(query.months || 12);
+  const months = Number.isFinite(monthsRaw) ? Math.min(Math.max(monthsRaw, 3), 24) : 12;
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const from = new Date(monthStart.getFullYear(), monthStart.getMonth() - (months - 1), 1);
+  const landedByProduct = await getLatestLandedCostByProduct(branchId);
+  const products = await prisma.product.findMany({
+    where: { branchId },
+    select: { id: true, price: true, unitPrice: true },
+    take: 5000,
+  });
+  const costMap = new Map(
+    products.map((p) => {
+      const landed = landedByProduct.get(Number(p.id)) || null;
+      const baseUnitCost = Number(landed?.baseUnitCost || p.unitPrice || p.price || 0);
+      const landedUnitCost = Number(landed?.landedUnitCost || baseUnitCost);
+      return [Number(p.id), { baseUnitCost, landedUnitCost }];
+    })
+  );
+  const saleItems = await prisma.saleItem.findMany({
+    where: {
+      sale: {
+        branchId,
+        createdAt: { gte: from, lte: now },
+      },
+    },
+    select: {
+      productId: true,
+      qty: true,
+      price: true,
+      sale: { select: { createdAt: true } },
+    },
+  });
+  const monthMap = new Map();
+  for (let i = 0; i < months; i += 1) {
+    const d = new Date(from.getFullYear(), from.getMonth() + i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    monthMap.set(key, {
+      monthKey: key,
+      revenue: 0,
+      baseCogs: 0,
+      landedCogs: 0,
+      soldQty: 0,
+    });
+  }
+  for (const row of saleItems) {
+    const createdAt = row.sale?.createdAt ? new Date(row.sale.createdAt) : null;
+    if (!createdAt) continue;
+    const key = `${createdAt.getFullYear()}-${String(createdAt.getMonth() + 1).padStart(2, "0")}`;
+    if (!monthMap.has(key)) continue;
+    const agg = monthMap.get(key);
+    const qty = Number(row.qty || 0);
+    const revenue = Number(row.qty || 0) * Number(row.price || 0);
+    const costs = costMap.get(Number(row.productId || 0)) || { baseUnitCost: 0, landedUnitCost: 0 };
+    agg.revenue += revenue;
+    agg.baseCogs += qty * Number(costs.baseUnitCost || 0);
+    agg.landedCogs += qty * Number(costs.landedUnitCost || 0);
+    agg.soldQty += qty;
+    monthMap.set(key, agg);
+  }
+  const rows = [...monthMap.values()].map((row) => {
+    const baseProfit = row.revenue - row.baseCogs;
+    const landedProfit = row.revenue - row.landedCogs;
+    const baseMarginPct = row.revenue > 0 ? (baseProfit / row.revenue) * 100 : 0;
+    const landedMarginPct = row.revenue > 0 ? (landedProfit / row.revenue) * 100 : 0;
+    return {
+      monthKey: row.monthKey,
+      soldQty: Number(row.soldQty.toFixed(2)),
+      revenue: Number(row.revenue.toFixed(2)),
+      baseCogs: Number(row.baseCogs.toFixed(2)),
+      landedCogs: Number(row.landedCogs.toFixed(2)),
+      baseMarginPct: Number(baseMarginPct.toFixed(2)),
+      landedMarginPct: Number(landedMarginPct.toFixed(2)),
+      marginImpactPct: Number((landedMarginPct - baseMarginPct).toFixed(2)),
+    };
+  });
+  return {
+    months,
+    rows,
+  };
+}
+
 async function getVatSalesRows(branchId, from, to) {
   const sales = await prisma.sale.findMany({
     where: buildSaleWhere(branchId, from, to),
@@ -419,6 +672,9 @@ exports.exportStockValuationCSV = async (req, res) => {
       category: p.category || "",
       stock: Number(p.stock || 0).toFixed(2),
       unit_cost: Number(p.unitCost || 0).toFixed(2),
+      base_margin_pct: Number(p.baseMarginPct || 0).toFixed(2),
+      landed_margin_pct: Number(p.landedMarginPct || 0).toFixed(2),
+      margin_impact_pct: Number(p.marginImpactPct || 0).toFixed(2),
       valuation: Number(p.valuation || 0).toFixed(2),
     }));
     const csv = toCSV(rows);
@@ -472,6 +728,9 @@ exports.exportStockValuationPDF = async (req, res) => {
       category: p.category || "-",
       stock: Number(p.stock || 0).toFixed(2),
       unitCost: Number(p.unitCost || 0).toFixed(2),
+      marginImpact: `${Number(p.baseMarginPct || 0).toFixed(2)}% -> ${Number(p.landedMarginPct || 0).toFixed(2)}% (${Number(
+        p.marginImpactPct || 0
+      ).toFixed(2)}%)`,
       valuation: Number(p.valuation || 0).toFixed(2),
     }));
     writePdfTableReport(
@@ -482,6 +741,7 @@ exports.exportStockValuationPDF = async (req, res) => {
         { key: "category", label: "Category" },
         { key: "stock", label: "Stock" },
         { key: "unitCost", label: "Unit Cost" },
+        { key: "marginImpact", label: "Landed vs Base Margin" },
         { key: "valuation", label: "Valuation" },
       ],
       rows
@@ -501,25 +761,43 @@ async function buildStockValuationPayload(branchId, query = {}) {
       branchId,
       ...(category ? { category: { contains: category } } : {}),
     },
-    select: { id: true, name: true, category: true, stock: true, price: true },
+    select: { id: true, name: true, category: true, stock: true, price: true, unitPrice: true },
     orderBy: { name: "asc" },
     take: 5000,
   });
   const productIds = products.map((p) => p.id);
+  const landedByProduct = await getLatestLandedCostByProduct(branchId);
   if (!productIds.length) {
     return { totalValue: 0, asOf: asOf ? asOf.toISOString().slice(0, 10) : null, category, warehouseId, rows: [] };
   }
 
   const shouldUseLedger = Boolean(asOf || warehouseId);
   if (!shouldUseLedger) {
-    const rows = products.map((p) => ({
-      productId: p.id,
-      name: p.name,
-      category: p.category || "",
-      stock: Number(p.stock || 0),
-      unitCost: Number(p.price || 0),
-      valuation: Number((Number(p.stock || 0) * Number(p.price || 0)).toFixed(2)),
-    }));
+    const rows = products.map((p) => {
+      const landedInfo = landedByProduct.get(Number(p.id)) || null;
+      const baseUnitCost = Number(landedInfo?.baseUnitCost || p.unitPrice || p.price || 0);
+      const landedUnitCost = Number(landedInfo?.landedUnitCost || baseUnitCost);
+      const unitCost = landedUnitCost;
+      const sellingPrice = Number(p.price || 0);
+      const baseMarginPct = calcMarginPct(sellingPrice, baseUnitCost);
+      const landedMarginPct = calcMarginPct(sellingPrice, landedUnitCost);
+      const profitMargin = landedMarginPct;
+      return {
+        productId: p.id,
+        name: p.name,
+        category: p.category || "",
+        stock: Number(p.stock || 0),
+        unitCost,
+        baseUnitCost: Number(baseUnitCost.toFixed(4)),
+        landedUnitCost: Number(landedUnitCost.toFixed(4)),
+        sellingPrice: Number(sellingPrice.toFixed(2)),
+        profitMargin: Number(profitMargin.toFixed(2)),
+        baseMarginPct: Number(baseMarginPct.toFixed(2)),
+        landedMarginPct: Number(landedMarginPct.toFixed(2)),
+        marginImpactPct: Number((landedMarginPct - baseMarginPct).toFixed(2)),
+        valuation: Number((Number(p.stock || 0) * unitCost).toFixed(2)),
+      };
+    });
     const totalValue = rows.reduce((sum, r) => sum + Number(r.valuation || 0), 0);
     return {
       totalValue: Number(totalValue.toFixed(2)),
@@ -554,10 +832,17 @@ async function buildStockValuationPayload(branchId, query = {}) {
   }
 
   const rows = products.map((p) => {
+    const landedInfo = landedByProduct.get(Number(p.id)) || null;
+    const baseUnitCost = Number(landedInfo?.baseUnitCost || p.unitPrice || p.price || 0);
+    const landedUnitCost = Number(landedInfo?.landedUnitCost || baseUnitCost);
     const current = agg.get(p.id) || { qty: 0, value: 0 };
     const qty = Number(current.qty || 0);
     const value = Number(current.value || 0);
-    const unitCost = qty > 0 ? value / qty : Number(p.price || 0);
+    const unitCost = qty > 0 ? value / qty : landedUnitCost;
+    const sellingPrice = Number(p.price || 0);
+    const baseMarginPct = calcMarginPct(sellingPrice, baseUnitCost);
+    const landedMarginPct = calcMarginPct(sellingPrice, unitCost);
+    const profitMargin = landedMarginPct;
     const valuation = qty > 0 ? value : 0;
     return {
       productId: p.id,
@@ -565,6 +850,13 @@ async function buildStockValuationPayload(branchId, query = {}) {
       category: p.category || "",
       stock: Number(qty.toFixed(2)),
       unitCost: Number(unitCost.toFixed(2)),
+      baseUnitCost: Number(baseUnitCost.toFixed(4)),
+      landedUnitCost: Number(unitCost.toFixed(4)),
+      sellingPrice: Number(sellingPrice.toFixed(2)),
+      profitMargin: Number(profitMargin.toFixed(2)),
+      baseMarginPct: Number(baseMarginPct.toFixed(2)),
+      landedMarginPct: Number(landedMarginPct.toFixed(2)),
+      marginImpactPct: Number((landedMarginPct - baseMarginPct).toFixed(2)),
       valuation: Number(valuation.toFixed(2)),
     };
   });
@@ -1346,3 +1638,345 @@ exports.getHqBranchSummary = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+exports.getAdvancedMarginAnalytics = async (req, res) => {
+  try {
+    const payload = await buildAdvancedMarginPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportAdvancedMarginAnalyticsCSV = async (req, res) => {
+  try {
+    const payload = await buildAdvancedMarginPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((row) => ({
+      product_id: row.productId,
+      product_name: row.name,
+      sku: row.sku || "",
+      category: row.category || "",
+      sold_qty: Number(row.soldQty || 0).toFixed(2),
+      avg_selling_price: Number(row.avgSellingPrice || 0).toFixed(2),
+      base_unit_cost: Number(row.baseUnitCost || 0).toFixed(4),
+      landed_unit_cost: Number(row.landedUnitCost || 0).toFixed(4),
+      base_margin_pct: Number(row.baseMarginPct || 0).toFixed(2),
+      landed_margin_pct: Number(row.landedMarginPct || 0).toFixed(2),
+      margin_impact_pct: Number(row.marginImpactPct || 0).toFixed(2),
+      realized_revenue: Number(row.realizedRevenue || 0).toFixed(2),
+      landed_cogs: Number(row.landedCogs || 0).toFixed(2),
+      realized_gross_profit: Number(row.realizedGrossProfit || 0).toFixed(2),
+      realized_margin_pct: Number(row.realizedMarginPct || 0).toFixed(2),
+      erosion_alert: row.erosionAlert ? "YES" : "NO",
+    }));
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="advanced-margin-analytics.csv"');
+    res.send(toCSV(rows));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportAdvancedMarginAnalyticsPDF = async (req, res) => {
+  try {
+    const payload = await buildAdvancedMarginPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((row) => ({
+      name: row.name,
+      sku: row.sku || "-",
+      soldQty: Number(row.soldQty || 0).toFixed(2),
+      impact: Number(row.marginImpactPct || 0).toFixed(2),
+      realizedMargin: Number(row.realizedMarginPct || 0).toFixed(2),
+      alert: row.erosionAlert ? "YES" : "NO",
+    }));
+    writePdfTableReport(
+      res,
+      "Advanced Margin Analytics",
+      [
+        { key: "name", label: "Product" },
+        { key: "sku", label: "SKU" },
+        { key: "soldQty", label: "Sold Qty" },
+        { key: "impact", label: "Margin Impact %" },
+        { key: "realizedMargin", label: "Realized Margin %" },
+        { key: "alert", label: "Alert" },
+      ],
+      rows
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getAdvancedMarginTrend = async (req, res) => {
+  try {
+    const payload = await buildAdvancedMarginTrendPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildTaxRiskDashboardPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query || {});
+  const minRiskScore = Number.isFinite(Number(query?.minRiskScore)) ? Number(query.minRiskScore) : 0;
+  const vatSummaryRows = await getVatSalesRows(branchId, from, to);
+  const vatSummary = {
+    salesCount: vatSummaryRows.length,
+    zeroVatSales: vatSummaryRows.filter((x) => Number(x.vatAmount || 0) <= 0).length,
+    outputVat: Number(vatSummaryRows.reduce((sum, x) => sum + Number(x.vatAmount || 0), 0).toFixed(2)),
+    taxableSales: Number(vatSummaryRows.reduce((sum, x) => sum + Number(x.taxableAmount || 0), 0).toFixed(2)),
+  };
+  const withholdingRows = await prisma.paymentVoucher.findMany({
+    where: {
+      branchId,
+      ...(from || to
+        ? {
+            createdAt: {
+              ...(from ? { gte: from } : {}),
+              ...(to ? { lte: to } : {}),
+            },
+          }
+        : {}),
+    },
+    include: { supplier: { select: { id: true, name: true, tinNumber: true, binNumber: true, taxCategory: true } } },
+    orderBy: { createdAt: "desc" },
+    take: 5000,
+  });
+  const withholdingRiskRows = (withholdingRows || []).map((row) => {
+    const amount = Number(row.amount || 0);
+    const aitAmount = Number(row.aitAmount || 0);
+    const vdsAmount = Number(row.vdsAmount || 0);
+    const taxDeducted = aitAmount + vdsAmount;
+    const hasTin = Boolean(String(row.supplier?.tinNumber || "").trim());
+    const hasBin = Boolean(String(row.supplier?.binNumber || "").trim());
+    const missingTaxIdentity = !hasTin || !hasBin;
+    const noMushak66 = taxDeducted > 0 && !String(row.mushak66DocumentNo || "").trim();
+    const suspiciousZeroTax = amount > 0 && taxDeducted <= 0;
+    const riskScore = Number(
+      (
+        (missingTaxIdentity ? 5 : 0) +
+        (noMushak66 ? 7 : 0) +
+        (suspiciousZeroTax ? 4 : 0) +
+        (taxDeducted > 5000 ? 2 : 0)
+      ).toFixed(2)
+    );
+    return {
+      voucherId: row.id,
+      createdAt: row.createdAt,
+      supplierName: row.supplier?.name || "-",
+      taxCategory: row.taxCategory || row.supplier?.taxCategory || "-",
+      amount: Number(amount.toFixed(2)),
+      aitAmount: Number(aitAmount.toFixed(2)),
+      vdsAmount: Number(vdsAmount.toFixed(2)),
+      mushak66DocumentNo: row.mushak66DocumentNo || "",
+      missingTaxIdentity,
+      noMushak66,
+      suspiciousZeroTax,
+      riskScore,
+    };
+  });
+  const highRiskWithholding = withholdingRiskRows.filter((x) => Number(x.riskScore || 0) >= 7);
+  const salesRiskRows = (vatSummaryRows || []).map((row) => {
+    const taxable = Number(row.taxableAmount || 0);
+    const vat = Number(row.vatAmount || 0);
+    const impliedRate = taxable > 0 ? (vat / taxable) * 100 : 0;
+    const suspiciousZeroVatLarge = taxable >= 10000 && vat <= 0;
+    const outlierVatRate = impliedRate > 0 && (impliedRate < 2 || impliedRate > 25);
+    const riskScore = Number(((suspiciousZeroVatLarge ? 6 : 0) + (outlierVatRate ? 5 : 0)).toFixed(2));
+    return {
+      saleId: row.saleId,
+      invoiceNo: row.invoiceNo,
+      date: row.date,
+      customer: row.customer,
+      taxableAmount: Number(taxable.toFixed(2)),
+      vatAmount: Number(vat.toFixed(2)),
+      impliedVatRatePct: Number(impliedRate.toFixed(2)),
+      suspiciousZeroVatLarge,
+      outlierVatRate,
+      riskScore,
+    };
+  });
+  const highRiskSales = salesRiskRows.filter((x) => Number(x.riskScore || 0) >= 5);
+  const summary = {
+    vatSalesCount: vatSummary.salesCount,
+    vatZeroSalesCount: vatSummary.zeroVatSales,
+    withholdingVoucherCount: withholdingRiskRows.length,
+    withholdingHighRiskCount: highRiskWithholding.length,
+    salesHighRiskCount: highRiskSales.length,
+    totalOutputVat: vatSummary.outputVat,
+    totalTaxableSales: vatSummary.taxableSales,
+  };
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    minRiskScore: Number(minRiskScore.toFixed(2)),
+    summary,
+    withholdingRows: withholdingRiskRows
+      .filter((x) => Number(x.riskScore || 0) >= minRiskScore)
+      .sort((a, b) => Number(b.riskScore || 0) - Number(a.riskScore || 0)),
+    salesRows: salesRiskRows
+      .filter((x) => Number(x.riskScore || 0) >= minRiskScore)
+      .sort((a, b) => Number(b.riskScore || 0) - Number(a.riskScore || 0)),
+  };
+}
+
+exports.getTaxRiskDashboard = async (req, res) => {
+  try {
+    const payload = await buildTaxRiskDashboardPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getTaxFilingPrevalidation = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const { from, to } = parseDateRange(req.query || {});
+    const salesRows = await getVatSalesRows(branchId, from, to);
+    const missingInvoiceNo = salesRows.filter((r) => !String(r.invoiceNo || "").trim()).length;
+    const missingCustomerName = salesRows.filter((r) => !String(r.customer || "").trim()).length;
+    const zeroVatLargeSales = salesRows.filter((r) => Number(r.taxableAmount || 0) >= 10000 && Number(r.vatAmount || 0) <= 0).length;
+    const vouchers = await prisma.paymentVoucher.findMany({
+      where: {
+        branchId,
+        ...(from || to
+          ? {
+              createdAt: {
+                ...(from ? { gte: from } : {}),
+                ...(to ? { lte: to } : {}),
+              },
+            }
+          : {}),
+      },
+      include: { supplier: { select: { tinNumber: true, binNumber: true } } },
+      take: 5000,
+      orderBy: { createdAt: "desc" },
+    });
+    const missingMushak66 = vouchers.filter(
+      (v) => Number(v.aitAmount || 0) + Number(v.vdsAmount || 0) > 0 && !String(v.mushak66DocumentNo || "").trim()
+    ).length;
+    const missingTinBin = vouchers.filter(
+      (v) => !String(v?.supplier?.tinNumber || "").trim() || !String(v?.supplier?.binNumber || "").trim()
+    ).length;
+    const warnings = [
+      { key: "missingInvoiceNo", count: missingInvoiceNo, severity: missingInvoiceNo > 0 ? "HIGH" : "OK" },
+      { key: "missingCustomerName", count: missingCustomerName, severity: missingCustomerName > 0 ? "MEDIUM" : "OK" },
+      { key: "zeroVatLargeSales", count: zeroVatLargeSales, severity: zeroVatLargeSales > 0 ? "HIGH" : "OK" },
+      { key: "missingMushak66", count: missingMushak66, severity: missingMushak66 > 0 ? "HIGH" : "OK" },
+      { key: "missingTinBin", count: missingTinBin, severity: missingTinBin > 0 ? "MEDIUM" : "OK" },
+    ];
+    res.json({
+      from: from ? from.toISOString().slice(0, 10) : null,
+      to: to ? to.toISOString().slice(0, 10) : null,
+      summary: {
+        salesRows: salesRows.length,
+        paymentVouchers: vouchers.length,
+        warningCount: warnings.reduce((s, w) => s + Number(w.count || 0), 0),
+      },
+      warnings,
+      readyForExport: warnings.every((w) => Number(w.count || 0) === 0),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportTaxRiskDashboardCSV = async (req, res) => {
+  try {
+    const payload = await buildTaxRiskDashboardPayload(req.branchId, req.query || {});
+    const rows = [
+      ...(payload.withholdingRows || []).map((row) => ({
+        section: "withholding",
+        ref_id: row.voucherId,
+        date: row.createdAt ? new Date(row.createdAt).toISOString().slice(0, 10) : "",
+        supplier_or_customer: row.supplierName || "",
+        invoice_no: "",
+        taxable_amount: "",
+        vat_amount: "",
+        implied_vat_rate_pct: "",
+        amount: Number(row.amount || 0).toFixed(2),
+        ait_amount: Number(row.aitAmount || 0).toFixed(2),
+        vds_amount: Number(row.vdsAmount || 0).toFixed(2),
+        tax_category: row.taxCategory || "",
+        mushak66_document_no: row.mushak66DocumentNo || "",
+        flags: [
+          row.missingTaxIdentity ? "MISSING_TIN_BIN" : "",
+          row.noMushak66 ? "MISSING_MUSHAK_6_6" : "",
+          row.suspiciousZeroTax ? "ZERO_WITHHOLDING" : "",
+        ]
+          .filter(Boolean)
+          .join("|"),
+        risk_score: Number(row.riskScore || 0).toFixed(2),
+      })),
+      ...(payload.salesRows || []).map((row) => ({
+        section: "sales_vat",
+        ref_id: row.saleId,
+        date: row.date || "",
+        supplier_or_customer: row.customer || "",
+        invoice_no: row.invoiceNo || "",
+        taxable_amount: Number(row.taxableAmount || 0).toFixed(2),
+        vat_amount: Number(row.vatAmount || 0).toFixed(2),
+        implied_vat_rate_pct: Number(row.impliedVatRatePct || 0).toFixed(2),
+        amount: "",
+        ait_amount: "",
+        vds_amount: "",
+        tax_category: "",
+        mushak66_document_no: "",
+        flags: [row.suspiciousZeroVatLarge ? "ZERO_VAT_LARGE_SALE" : "", row.outlierVatRate ? "OUTLIER_VAT_RATE" : ""]
+          .filter(Boolean)
+          .join("|"),
+        risk_score: Number(row.riskScore || 0).toFixed(2),
+      })),
+    ];
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="tax-risk-dashboard.csv"');
+    res.send(toCSV(rows));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportTaxRiskDashboardPDF = async (req, res) => {
+  try {
+    const payload = await buildTaxRiskDashboardPayload(req.branchId, req.query || {});
+    const rows = [
+      ...(payload.withholdingRows || []).slice(0, 80).map((row) => ({
+        section: "WITHHOLDING",
+        ref: row.voucherId,
+        subject: row.supplierName || "-",
+        score: Number(row.riskScore || 0).toFixed(2),
+        flags: [
+          row.missingTaxIdentity ? "TIN/BIN" : "",
+          row.noMushak66 ? "Mushak6.6" : "",
+          row.suspiciousZeroTax ? "ZeroTax" : "",
+        ]
+          .filter(Boolean)
+          .join(", "),
+      })),
+      ...(payload.salesRows || []).slice(0, 80).map((row) => ({
+        section: "SALES_VAT",
+        ref: row.invoiceNo || row.saleId,
+        subject: row.customer || "-",
+        score: Number(row.riskScore || 0).toFixed(2),
+        flags: [row.suspiciousZeroVatLarge ? "ZeroVATLarge" : "", row.outlierVatRate ? "OutlierRate" : ""]
+          .filter(Boolean)
+          .join(", "),
+      })),
+    ].sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+    writePdfTableReport(
+      res,
+      "Tax Risk Dashboard",
+      [
+        { key: "section", label: "Section" },
+        { key: "ref", label: "Reference" },
+        { key: "subject", label: "Party" },
+        { key: "score", label: "Risk Score" },
+        { key: "flags", label: "Flags" },
+      ],
+      rows
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+

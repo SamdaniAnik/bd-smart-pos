@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import { notifyActionRequired, notifySuccess } from "../utils/notify";
+import { getLang, t } from "../i18n";
 
 const STATUS_OPTIONS = ["", "PENDING", "DEPOSITED", "CLEARED", "BOUNCED", "CANCELLED"];
 const DIRECTION_OPTIONS = ["", "ISSUED", "RECEIVED"];
@@ -14,7 +15,7 @@ const STATUS_BADGE = {
   CANCELLED: { bg: "#f1f5f9", color: "#475569" },
 };
 
-function StatusBadge({ status }) {
+function StatusBadge({ status, label }) {
   const s = STATUS_BADGE[status] || { bg: "#f1f5f9", color: "#475569" };
   return (
     <span
@@ -27,7 +28,7 @@ function StatusBadge({ status }) {
         fontWeight: 600,
       }}
     >
-      {status}
+      {label || status}
     </span>
   );
 }
@@ -53,6 +54,18 @@ function emptyForm() {
 }
 
 export default function Cheques() {
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+
   const [tab, setTab] = useState("RECEIVED");
   const [rows, setRows] = useState([]);
   const [summary, setSummary] = useState({ grouped: [], upcoming: [], overdueDeposit: [] });
@@ -63,6 +76,34 @@ export default function Cheques() {
   const [actionData, setActionData] = useState({});
   const [details, setDetails] = useState(null);
   const [loading, setLoading] = useState(false);
+  const statusLabels = useMemo(
+    () => ({
+      PENDING: tt("chPending"),
+      DEPOSITED: tt("chDeposited"),
+      CLEARED: tt("chCleared"),
+      BOUNCED: tt("chBounced"),
+      CANCELLED: tt("chCancelled"),
+    }),
+    [tt]
+  );
+  const directionLabels = useMemo(
+    () => ({
+      RECEIVED: tt("chReceived"),
+      ISSUED: tt("chIssued"),
+    }),
+    [tt]
+  );
+  const linkedTypeLabels = useMemo(
+    () => ({
+      SALE: tt("chLinkedSale"),
+      PURCHASE: tt("chLinkedPurchase"),
+      EXPENSE: tt("chLinkedExpense"),
+      RECEIPT: tt("chLinkedReceipt"),
+      PAYMENT: tt("chLinkedPayment"),
+      OTHER: tt("chLinkedOther"),
+    }),
+    [tt]
+  );
 
   const load = async () => {
     setLoading(true);
@@ -106,7 +147,7 @@ export default function Cheques() {
   const submitCreate = async (e) => {
     e.preventDefault();
     if (!form.chequeNo || !form.bankName || !form.amount || !form.chequeDate) {
-      notifyActionRequired("cheque no, bank, amount and cheque date are required.");
+      notifyActionRequired(tt("chRequiredFields"));
       return;
     }
     const payload = {
@@ -120,7 +161,7 @@ export default function Cheques() {
     await api.post("/cheques", payload);
     setShowCreate(false);
     setForm(emptyForm());
-    notifySuccess("cheque registered.");
+    notifySuccess(tt("chRegistered"));
     load();
   };
 
@@ -143,7 +184,7 @@ export default function Cheques() {
     await api.post(url, body);
     setActionFor(null);
     setActionData({});
-    notifySuccess(`cheque ${action.toLowerCase()} done.`);
+    notifySuccess(tt("chActionDone", { action: action.toLowerCase() }));
     load();
   };
 
@@ -156,12 +197,12 @@ export default function Cheques() {
     <div className="page-stack">
       <div className="page-header">
         <div>
-          <div className="page-title">Cheque register</div>
-          <div className="page-subtitle">Issued and received cheques (incl. post-dated) through their full lifecycle</div>
+          <div className="page-title">{tt("cheques")}</div>
+          <div className="page-subtitle">{tt("chSubtitle")}</div>
         </div>
         <div className="page-actions">
           <button type="button" onClick={() => { setForm({ ...emptyForm(), direction: tab }); setShowCreate(true); }}>
-            + Register cheque
+            + {tt("chRegisterCheque")}
           </button>
         </div>
       </div>
@@ -174,17 +215,17 @@ export default function Cheques() {
           const bounced = d.BOUNCED || { count: 0, amount: 0 };
           return (
             <div key={dir} className="metric">
-              <div className="metric-label">{dir}</div>
+              <div className="metric-label">{dir === "RECEIVED" ? tt("chReceived") : tt("chIssued")}</div>
               <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 13 }}>
-                <span>Pending</span>
+                <span>{tt("chPending")}</span>
                 <strong>{pending.count} · {Number(pending.amount).toFixed(2)}</strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
-                <span>Cleared</span>
+                <span>{tt("chCleared")}</span>
                 <strong>{cleared.count} · {Number(cleared.amount).toFixed(2)}</strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#b91c1c" }}>
-                <span>Bounced</span>
+                <span>{tt("chBounced")}</span>
                 <strong>{bounced.count} · {Number(bounced.amount).toFixed(2)}</strong>
               </div>
             </div>
@@ -192,17 +233,17 @@ export default function Cheques() {
         })}
         {summary.overdueDeposit?.length > 0 ? (
           <div style={{ border: "1px solid #fecaca", borderRadius: 8, padding: 14, background: "#fef2f2" }}>
-            <div style={{ fontSize: 12, color: "#b91c1c", fontWeight: 600 }}>OVERDUE TO DEPOSIT</div>
+            <div style={{ fontSize: 12, color: "#b91c1c", fontWeight: 600 }}>{tt("chOverdueToDeposit")}</div>
             <div style={{ marginTop: 6, fontSize: 13 }}>
-              {summary.overdueDeposit.length} received cheque(s) past their date, still PENDING.
+              {tt("chOverdueToDepositText", { n: summary.overdueDeposit.length })}
             </div>
           </div>
         ) : null}
         {summary.upcoming?.length > 0 ? (
           <div style={{ border: "1px solid #fde68a", borderRadius: 8, padding: 14, background: "#fffbeb" }}>
-            <div style={{ fontSize: 12, color: "#92400e", fontWeight: 600 }}>UPCOMING (NEXT 14D)</div>
+            <div style={{ fontSize: 12, color: "#92400e", fontWeight: 600 }}>{tt("chUpcoming14d")}</div>
             <div style={{ marginTop: 6, fontSize: 13 }}>
-              {summary.upcoming.length} pending cheque(s) due to clear/deposit soon.
+              {tt("chUpcomingText", { n: summary.upcoming.length })}
             </div>
           </div>
         ) : null}
@@ -224,62 +265,66 @@ export default function Cheques() {
               cursor: "pointer",
             }}
           >
-            {d === "RECEIVED" ? "Received from customers" : "Issued to suppliers/payees"}
+            {d === "RECEIVED" ? tt("chReceivedFromCustomers") : tt("chIssuedToSuppliers")}
           </button>
         ))}
       </div>
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12, alignItems: "flex-end" }}>
         <label>
-          <div style={{ fontSize: 12, color: "#64748b" }}>Status</div>
+          <div style={{ fontSize: 12, color: "#64748b" }}>{tt("colStatus")}</div>
           <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters({ ...filters, status: e.target.value })}>
-            {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s || "All"}</option>)}
+            {STATUS_OPTIONS.map((s) => (
+              <option key={s} value={s}>
+                {s ? statusLabels[s] || s : tt("chAll")}
+              </option>
+            ))}
           </select>
         </label>
         <label>
-          <div style={{ fontSize: 12, color: "#64748b" }}>From</div>
+          <div style={{ fontSize: 12, color: "#64748b" }}>{tt("accFrom")}</div>
           <input type="date" value={filters.from} onChange={(e) => setFilters({ ...filters, from: e.target.value })} />
         </label>
         <label>
-          <div style={{ fontSize: 12, color: "#64748b" }}>To</div>
+          <div style={{ fontSize: 12, color: "#64748b" }}>{tt("accTo")}</div>
           <input type="date" value={filters.to} onChange={(e) => setFilters({ ...filters, to: e.target.value })} />
         </label>
         <label style={{ flex: 1, minWidth: 200 }}>
-          <div style={{ fontSize: 12, color: "#64748b" }}>Search</div>
+          <div style={{ fontSize: 12, color: "#64748b" }}>{tt("searchMenu")}</div>
           <input
-            placeholder="cheque no / bank / drawer / payee / notes"
+            placeholder={tt("chSearchPlaceholder")}
             value={filters.q}
             onChange={(e) => setFilters({ ...filters, q: e.target.value })}
           />
         </label>
-        <button type="button" onClick={load}>Apply</button>
+        <button type="button" onClick={load}>{tt("accApplyRange")}</button>
         <button
           type="button"
           className="btn-ghost"
           onClick={() => { setFilters({ status: "", from: "", to: "", q: "" }); setTimeout(load, 0); }}
         >
-          Reset
+          {tt("settingsCancel")}
         </button>
       </div>
 
       <table className="data-table" style={{ marginTop: 16 }}>
         <thead>
           <tr>
-            <th>Cheque #</th>
-            <th>Bank</th>
-            <th>{tab === "RECEIVED" ? "Drawer" : "Payee"}</th>
-            <th>Amount</th>
-            <th>Cheque date</th>
-            <th>Status</th>
-            <th>Linked</th>
+            <th>{tt("chChequeNoCol")}</th>
+            <th>{tt("chBank")}</th>
+            <th>{tab === "RECEIVED" ? tt("chDrawer") : tt("chPayee")}</th>
+            <th>{tt("accStatementAmount")}</th>
+            <th>{tt("chChequeDate")}</th>
+            <th>{tt("colStatus")}</th>
+            <th>{tt("chLinked")}</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
           {loading ? (
-            <tr><td colSpan={8} style={{ textAlign: "center", color: "#94a3b8" }}>Loading…</td></tr>
+            <tr><td colSpan={8} style={{ textAlign: "center", color: "#94a3b8" }}>{tt("dashUpdating")}</td></tr>
           ) : rows.length === 0 ? (
-            <tr><td colSpan={8} style={{ textAlign: "center", color: "#94a3b8" }}>No cheques in this view.</td></tr>
+            <tr><td colSpan={8} style={{ textAlign: "center", color: "#94a3b8" }}>{tt("chNoChequesView")}</td></tr>
           ) : rows.map((r) => (
             <tr key={r.id}>
               <td>
@@ -291,20 +336,20 @@ export default function Cheques() {
               <td>{tab === "RECEIVED" ? (r.drawerName || r.customer?.name || "—") : (r.payeeName || r.supplier?.name || "—")}</td>
               <td>{Number(r.amount || 0).toFixed(2)}</td>
               <td>{new Date(r.chequeDate).toLocaleDateString()}</td>
-              <td><StatusBadge status={r.status} /></td>
-              <td>{r.linkedType ? `${r.linkedType}#${r.linkedId || "?"}` : "—"}</td>
+              <td><StatusBadge status={r.status} label={statusLabels[r.status]} /></td>
+              <td>{r.linkedType ? `${linkedTypeLabels[r.linkedType] || r.linkedType}#${r.linkedId || "?"}` : "—"}</td>
               <td style={{ whiteSpace: "nowrap" }}>
                 {r.status === "PENDING" && r.direction === "RECEIVED" && (
-                  <button className="btn-secondary btn-sm" onClick={() => { setActionFor({ row: r, action: "DEPOSIT" }); setActionData({}); }}>Deposit</button>
+                  <button className="btn-secondary btn-sm" onClick={() => { setActionFor({ row: r, action: "DEPOSIT" }); setActionData({}); }}>{tt("chDeposit")}</button>
                 )}
                 {(r.status === "PENDING" || r.status === "DEPOSITED") && (
                   <>
-                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "CLEAR" }); setActionData({}); }}>Clear</button>
-                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "BOUNCE" }); setActionData({}); }}>Bounce</button>
+                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "CLEAR" }); setActionData({}); }}>{tt("chClear")}</button>
+                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "BOUNCE" }); setActionData({}); }}>{tt("chBounce")}</button>
                   </>
                 )}
                 {r.status === "PENDING" && (
-                  <button className="btn-ghost btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "CANCEL" }); setActionData({}); }}>Cancel</button>
+                  <button className="btn-ghost btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "CANCEL" }); setActionData({}); }}>{tt("settingsCancel")}</button>
                 )}
               </td>
             </tr>
@@ -313,126 +358,129 @@ export default function Cheques() {
       </table>
 
       {showCreate && (
-        <Modal onClose={() => setShowCreate(false)} title="Register new cheque">
+        <Modal onClose={() => setShowCreate(false)} title={tt("chRegisterNewCheque")}>
           <form onSubmit={submitCreate} className="form-grid" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12 }}>
             <label>
-              Direction
+              {tt("chDirection")}
               <select className="form-select-sm" value={form.direction} onChange={(e) => setForm({ ...form, direction: e.target.value })}>
-                {DIRECTION_OPTIONS.filter(Boolean).map((o) => <option key={o} value={o}>{o}</option>)}
+                {DIRECTION_OPTIONS.filter(Boolean).map((o) => <option key={o} value={o}>{directionLabels[o] || o}</option>)}
               </select>
             </label>
             <label>
-              Cheque no
+              {tt("chChequeNo")}
               <input value={form.chequeNo} onChange={(e) => setForm({ ...form, chequeNo: e.target.value })} required />
             </label>
             <label>
-              Bank
+              {tt("chBank")}
               <input value={form.bankName} onChange={(e) => setForm({ ...form, bankName: e.target.value })} required />
             </label>
             <label>
-              Bank branch
+              {tt("chBankBranch")}
               <input value={form.bankBranch} onChange={(e) => setForm({ ...form, bankBranch: e.target.value })} />
             </label>
             <label>
-              Account name
+              {tt("chAccountName")}
               <input value={form.accountName} onChange={(e) => setForm({ ...form, accountName: e.target.value })} />
             </label>
             <label>
-              Account no
+              {tt("chAccountNo")}
               <input value={form.accountNo} onChange={(e) => setForm({ ...form, accountNo: e.target.value })} />
             </label>
             {form.direction === "RECEIVED" ? (
               <>
                 <label>
-                  Drawer name (on cheque)
+                  {tt("chDrawerNameOnCheque")}
                   <input value={form.drawerName} onChange={(e) => setForm({ ...form, drawerName: e.target.value })} />
                 </label>
                 <label>
-                  Customer ID (optional)
+                  {tt("chCustomerIdOptional")}
                   <input value={form.customerId} onChange={(e) => setForm({ ...form, customerId: e.target.value })} />
                 </label>
               </>
             ) : (
               <>
                 <label>
-                  Payee name
+                  {tt("chPayeeName")}
                   <input value={form.payeeName} onChange={(e) => setForm({ ...form, payeeName: e.target.value })} />
                 </label>
                 <label>
-                  Supplier ID (optional)
+                  {tt("chSupplierIdOptional")}
                   <input value={form.supplierId} onChange={(e) => setForm({ ...form, supplierId: e.target.value })} />
                 </label>
               </>
             )}
             <label>
-              Amount (BDT)
+              {tt("chAmountBdt")}
               <input type="number" step="0.01" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} required />
             </label>
             <label>
-              Cheque date
+              {tt("chChequeDate")}
               <input type="date" value={form.chequeDate} onChange={(e) => setForm({ ...form, chequeDate: e.target.value })} required />
             </label>
             <label>
-              Linked document type
+              {tt("chLinkedDocumentType")}
               <select className="form-select-sm" value={form.linkedType} onChange={(e) => setForm({ ...form, linkedType: e.target.value })}>
-                {LINKED_TYPES.map((o) => <option key={o} value={o}>{o || "—"}</option>)}
+                {LINKED_TYPES.map((o) => <option key={o} value={o}>{o ? linkedTypeLabels[o] || o : "—"}</option>)}
               </select>
             </label>
             <label>
-              Linked document ID
+              {tt("chLinkedDocumentId")}
               <input value={form.linkedId} onChange={(e) => setForm({ ...form, linkedId: e.target.value })} />
             </label>
             <label style={{ gridColumn: "1 / -1" }}>
-              Notes
+              {tt("expDescription")}
               <input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
             </label>
             <div style={{ gridColumn: "1 / -1", display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button type="button" className="btn-ghost" onClick={() => setShowCreate(false)}>Cancel</button>
-              <button type="submit">Register cheque</button>
+              <button type="button" className="btn-ghost" onClick={() => setShowCreate(false)}>{tt("settingsCancel")}</button>
+              <button type="submit">{tt("chRegisterCheque")}</button>
             </div>
           </form>
         </Modal>
       )}
 
       {actionFor && (
-        <Modal onClose={() => setActionFor(null)} title={`${actionFor.action.toLowerCase().replace(/^./, (c) => c.toUpperCase())} cheque #${actionFor.row.chequeNo}`}>
+        <Modal
+          onClose={() => setActionFor(null)}
+          title={tt("chActionChequeTitle", { action: tt(`chAction${actionFor.action}`), no: actionFor.row.chequeNo })}
+        >
           <div style={{ display: "grid", gap: 10 }}>
             {actionFor.action === "DEPOSIT" && (
               <label>
-                Deposit date
+                {tt("chDepositDate")}
                 <input type="date" value={actionData.depositDate || ""} onChange={(e) => setActionData({ ...actionData, depositDate: e.target.value })} />
               </label>
             )}
             {actionFor.action === "CLEAR" && (
               <label>
-                Cleared date
+                {tt("chClearedDate")}
                 <input type="date" value={actionData.clearedDate || ""} onChange={(e) => setActionData({ ...actionData, clearedDate: e.target.value })} />
               </label>
             )}
             {actionFor.action === "BOUNCE" && (
               <>
                 <label>
-                  Bounce date
+                  {tt("chBounceDate")}
                   <input type="date" value={actionData.bounceDate || ""} onChange={(e) => setActionData({ ...actionData, bounceDate: e.target.value })} />
                 </label>
                 <label>
-                  Bounce reason
-                  <input value={actionData.bounceReason || ""} onChange={(e) => setActionData({ ...actionData, bounceReason: e.target.value })} placeholder="Insufficient funds, signature mismatch, etc." />
+                  {tt("chBounceReason")}
+                  <input value={actionData.bounceReason || ""} onChange={(e) => setActionData({ ...actionData, bounceReason: e.target.value })} placeholder={tt("chBounceReasonPlaceholder")} />
                 </label>
                 <label>
-                  Bounce fee charged (BDT)
+                  {tt("chBounceFeeCharged")}
                   <input type="number" step="0.01" value={actionData.bounceFee || ""} onChange={(e) => setActionData({ ...actionData, bounceFee: e.target.value })} />
                 </label>
               </>
             )}
             <label>
-              Notes
+              {tt("expDescription")}
               <input value={actionData.notes || ""} onChange={(e) => setActionData({ ...actionData, notes: e.target.value })} />
             </label>
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button type="button" className="btn-ghost" onClick={() => setActionFor(null)}>Close</button>
+              <button type="button" className="btn-ghost" onClick={() => setActionFor(null)}>{tt("fpClose")}</button>
               <button type="button" onClick={() => performTransition(actionFor.row, actionFor.action)}>
-                Confirm {actionFor.action.toLowerCase()}
+                {tt("chConfirmAction", { action: tt(`chAction${actionFor.action}`).toLowerCase() })}
               </button>
             </div>
           </div>
@@ -440,33 +488,33 @@ export default function Cheques() {
       )}
 
       {details && (
-        <Modal onClose={() => setDetails(null)} title={`Cheque #${details.chequeNo}`} wide>
+        <Modal onClose={() => setDetails(null)} title={`${tt("chCheque")} #${details.chequeNo}`} wide>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, fontSize: 13 }}>
-            <Field label="Direction" value={details.direction} />
-            <Field label="Status" value={<StatusBadge status={details.status} />} />
-            <Field label="Bank" value={`${details.bankName}${details.bankBranch ? ` (${details.bankBranch})` : ""}`} />
-            <Field label="Amount" value={Number(details.amount || 0).toFixed(2)} />
-            <Field label="Cheque date" value={new Date(details.chequeDate).toLocaleDateString()} />
-            <Field label="Deposit date" value={details.depositDate ? new Date(details.depositDate).toLocaleDateString() : "—"} />
-            <Field label="Cleared date" value={details.clearedDate ? new Date(details.clearedDate).toLocaleDateString() : "—"} />
-            <Field label="Bounced date" value={details.bounceDate ? new Date(details.bounceDate).toLocaleDateString() : "—"} />
-            <Field label="Drawer / Payee" value={details.direction === "RECEIVED" ? (details.drawerName || details.customer?.name || "—") : (details.payeeName || details.supplier?.name || "—")} />
-            <Field label="Account no" value={details.accountNo || "—"} />
-            <Field label="Linked" value={details.linkedType ? `${details.linkedType} #${details.linkedId || "?"}` : "—"} />
-            <Field label="Bounce reason" value={details.bounceReason || "—"} />
-            <Field label="Bounce fee" value={Number(details.bounceFee || 0).toFixed(2)} />
-            <Field label="Created by" value={details.creator?.name || "—"} />
-            <div style={{ gridColumn: "1 / -1" }}><Field label="Notes" value={details.notes || "—"} /></div>
+            <Field label={tt("chDirection")} value={directionLabels[details.direction] || details.direction} />
+            <Field label={tt("colStatus")} value={<StatusBadge status={details.status} label={statusLabels[details.status]} />} />
+            <Field label={tt("chBank")} value={`${details.bankName}${details.bankBranch ? ` (${details.bankBranch})` : ""}`} />
+            <Field label={tt("accStatementAmount")} value={Number(details.amount || 0).toFixed(2)} />
+            <Field label={tt("chChequeDate")} value={new Date(details.chequeDate).toLocaleDateString()} />
+            <Field label={tt("chDepositDate")} value={details.depositDate ? new Date(details.depositDate).toLocaleDateString() : "—"} />
+            <Field label={tt("chClearedDate")} value={details.clearedDate ? new Date(details.clearedDate).toLocaleDateString() : "—"} />
+            <Field label={tt("chBouncedDate")} value={details.bounceDate ? new Date(details.bounceDate).toLocaleDateString() : "—"} />
+            <Field label={tt("chDrawerPayee")} value={details.direction === "RECEIVED" ? (details.drawerName || details.customer?.name || "—") : (details.payeeName || details.supplier?.name || "—")} />
+            <Field label={tt("chAccountNo")} value={details.accountNo || "—"} />
+            <Field label={tt("chLinked")} value={details.linkedType ? `${linkedTypeLabels[details.linkedType] || details.linkedType} #${details.linkedId || "?"}` : "—"} />
+            <Field label={tt("chBounceReason")} value={details.bounceReason || "—"} />
+            <Field label={tt("chBounceFee")} value={Number(details.bounceFee || 0).toFixed(2)} />
+            <Field label={tt("expCreatedBy")} value={details.creator?.name || "—"} />
+            <div style={{ gridColumn: "1 / -1" }}><Field label={tt("expDescription")} value={details.notes || "—"} /></div>
           </div>
-          <h4 style={{ marginTop: 16, marginBottom: 6 }}>Status history</h4>
+          <h4 style={{ marginTop: 16, marginBottom: 6 }}>{tt("chStatusHistory")}</h4>
           <table className="data-table" style={{ fontSize: 12 }}>
             <thead>
               <tr>
-                <th>When</th>
-                <th>Event</th>
-                <th>From → To</th>
-                <th>By</th>
-                <th>Notes</th>
+                <th>{tt("chWhen")}</th>
+                <th>{tt("chEvent")}</th>
+                <th>{tt("chFromTo")}</th>
+                <th>{tt("chBy")}</th>
+                <th>{tt("expDescription")}</th>
               </tr>
             </thead>
             <tbody>

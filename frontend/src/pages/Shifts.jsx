@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
 import { notifyActionRequired } from "../utils/notify";
+import { getLang, t } from "../i18n";
 
 /** Bangladesh Taka denominations for drawer close counts */
 const BDT_DENOMINATIONS = [1000, 500, 200, 100, 50, 20, 10, 5, 2, 1];
@@ -22,6 +23,18 @@ function denomPayload(counts) {
 }
 
 function Shifts() {
+  const [uiLang, setUiLang] = useState(() => getLang());
+  useEffect(() => {
+    const sync = () => setUiLang(getLang());
+    window.addEventListener("bd_pos_lang_changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("bd_pos_lang_changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+
   const [currentShift, setCurrentShift] = useState(null);
   const [history, setHistory] = useState([]);
   const [openingCash, setOpeningCash] = useState("");
@@ -76,7 +89,7 @@ function Shifts() {
     const closingNum = Number(closingCash || 0);
     if (payload.length && Math.abs(counted - closingNum) > 0.02) {
       notifyActionRequired(
-        "Bill and coin counted total must match closing cash. Clear counts, sync from bills, or fix the mismatch."
+        tt("shMismatchCountedClosing")
       );
       return;
     }
@@ -111,65 +124,66 @@ function Shifts() {
       <div className="page-header">
         <div>
           <div className="page-title">Shift &amp; cash reconciliation</div>
-          <div className="page-subtitle">Open and close registers, reconcile cash, and review anomalies</div>
+          <div className="page-title">{tt("shTitle")}</div>
+          <div className="page-subtitle">{tt("shSubtitle")}</div>
         </div>
       </div>
       {currentShift ? (
         <div className="page-card" style={{ marginBottom: 12 }}>
-          <h4>Open Shift</h4>
-          <p><strong>Register:</strong> {currentShift.register?.name || "-"}</p>
-          <p><strong>Opened:</strong> {new Date(currentShift.openedAt).toLocaleString()}</p>
-          <p><strong>Opening Cash:</strong> ৳{Number(currentShift.openingCash || 0).toFixed(2)}</p>
-          <p><strong>Cash Sales:</strong> ৳{Number(currentShift.cashSales || 0).toFixed(2)}</p>
-          <p><strong>Cash In:</strong> ৳{Number(currentShift.cashIn || 0).toFixed(2)}</p>
-          <p><strong>Cash Out:</strong> ৳{Number(currentShift.cashOut || 0).toFixed(2)}</p>
-          <p><strong>Expected Cash:</strong> ৳{Number(currentShift.expectedCash || 0).toFixed(2)}</p>
+          <h4>{tt("shOpenShift")}</h4>
+          <p><strong>{tt("shRegister")}:</strong> {currentShift.register?.name || "-"}</p>
+          <p><strong>{tt("shOpened")}:</strong> {new Date(currentShift.openedAt).toLocaleString()}</p>
+          <p><strong>{tt("shOpeningCash")}:</strong> ৳{Number(currentShift.openingCash || 0).toFixed(2)}</p>
+          <p><strong>{tt("shCashSales")}:</strong> ৳{Number(currentShift.cashSales || 0).toFixed(2)}</p>
+          <p><strong>{tt("shCashIn")}:</strong> ৳{Number(currentShift.cashIn || 0).toFixed(2)}</p>
+          <p><strong>{tt("shCashOut")}:</strong> ৳{Number(currentShift.cashOut || 0).toFixed(2)}</p>
+          <p><strong>{tt("shExpectedCash")}:</strong> ৳{Number(currentShift.expectedCash || 0).toFixed(2)}</p>
           {currentAnomalies ? (
             <div className="page-card" style={{ marginBottom: 10, borderColor: "#334155" }}>
-              <h5 style={{ marginTop: 0, marginBottom: 6 }}>Shift Anomaly Alerts</h5>
+              <h5 style={{ marginTop: 0, marginBottom: 6 }}>{tt("shAnomalyAlerts")}</h5>
               <div className="quick-stats">
-                <div className="stat">Risk: {currentAnomalies.riskBand}</div>
-                <div className="stat">Score: {Number(currentAnomalies.anomalyScore || 0).toFixed(2)}</div>
-                <div className="stat">Discount%: {Number(currentAnomalies.discountPct || 0).toFixed(2)}%</div>
-                <div className="stat">Return%: {Number(currentAnomalies.returnPct || 0).toFixed(2)}%</div>
-                <div className="stat">Override Approvals: {Number(currentAnomalies.overrideApprovalCount || 0)}</div>
-                <div className="stat">Manager Approvals: {Number(currentAnomalies.approvalCount || 0)}</div>
+                <div className="stat">{tt("shRisk")}: {currentAnomalies.riskBand}</div>
+                <div className="stat">{tt("shScore")}: {Number(currentAnomalies.anomalyScore || 0).toFixed(2)}</div>
+                <div className="stat">{tt("shDiscountPct")}: {Number(currentAnomalies.discountPct || 0).toFixed(2)}%</div>
+                <div className="stat">{tt("shReturnPct")}: {Number(currentAnomalies.returnPct || 0).toFixed(2)}%</div>
+                <div className="stat">{tt("shOverrideApprovals")}: {Number(currentAnomalies.overrideApprovalCount || 0)}</div>
+                <div className="stat">{tt("shManagerApprovals")}: {Number(currentAnomalies.approvalCount || 0)}</div>
               </div>
               <div style={{ marginTop: 6, color: "var(--muted)" }}>
-                Flags:{" "}
-                {currentAnomalies.flags?.highDiscountRate ? "High discount rate; " : ""}
-                {currentAnomalies.flags?.highReturnRate ? "High return rate; " : ""}
-                {currentAnomalies.flags?.highOverrideCount ? "Frequent override approvals; " : ""}
-                {currentAnomalies.flags?.frequentManagerApprovals ? "Frequent manager approvals; " : ""}
+                {tt("shFlags")}:{" "}
+                {currentAnomalies.flags?.highDiscountRate ? `${tt("shFlagHighDiscountRate")}; ` : ""}
+                {currentAnomalies.flags?.highReturnRate ? `${tt("shFlagHighReturnRate")}; ` : ""}
+                {currentAnomalies.flags?.highOverrideCount ? `${tt("shFlagFrequentOverrideApprovals")}; ` : ""}
+                {currentAnomalies.flags?.frequentManagerApprovals ? `${tt("shFlagFrequentManagerApprovals")}; ` : ""}
                 {!currentAnomalies.flags?.highDiscountRate &&
                 !currentAnomalies.flags?.highReturnRate &&
                 !currentAnomalies.flags?.highOverrideCount &&
                 !currentAnomalies.flags?.frequentManagerApprovals
-                  ? "No anomaly flag."
+                  ? tt("shNoAnomalyFlag")
                   : ""}
               </div>
             </div>
           ) : null}
           <form onSubmit={addMovement} className="form-grid" style={{ marginBottom: 12 }}>
             <select className="form-select-sm" value={movementType} onChange={(e) => setMovementType(e.target.value)}>
-              <option value="IN">Cash In</option>
-              <option value="OUT">Cash Out</option>
+              <option value="IN">{tt("shCashIn")}</option>
+              <option value="OUT">{tt("shCashOut")}</option>
             </select>
             <input
               type="number"
-              placeholder="Movement amount"
+              placeholder={tt("shMovementAmount")}
               value={movementAmount}
               onChange={(e) => setMovementAmount(e.target.value)}
             />
             <input
-              placeholder="Reason (petty cash, withdraw, top-up)"
+              placeholder={tt("shMovementReason")}
               value={movementReason}
               onChange={(e) => setMovementReason(e.target.value)}
             />
-            <button type="submit">Record Movement</button>
+            <button type="submit">{tt("shRecordMovement")}</button>
           </form>
           <div style={{ margin: "8px 0 12px" }}>
-            <strong>Recent Movements:</strong>
+            <strong>{tt("shRecentMovements")}:</strong>
             {Array.isArray(currentShift.movements) && currentShift.movements.length ? (
               <ul style={{ margin: "6px 0 0 16px", padding: 0 }}>
                 {currentShift.movements.slice(0, 5).map((m) => (
@@ -179,7 +193,7 @@ function Shifts() {
                 ))}
               </ul>
             ) : (
-              <p style={{ margin: "6px 0 0" }}>No drawer movements yet.</p>
+              <p style={{ margin: "6px 0 0" }}>{tt("shNoDrawerMovementsYet")}</p>
             )}
           </div>
           <div
@@ -192,9 +206,9 @@ function Shifts() {
               background: "linear-gradient(180deg, rgba(248, 250, 252, 0.95), #fff)",
             }}
           >
-            <h5 style={{ marginTop: 0, marginBottom: 8 }}>Bill &amp; coin count (৳)</h5>
+            <h5 style={{ marginTop: 0, marginBottom: 8 }}>{tt("shBillCoinCount")}</h5>
             <p className="pos-inline-note" style={{ marginBottom: 10 }}>
-              Enter pieces per denomination; counted total fills &quot;Closing cash&quot; unless you use manual entry.
+              {tt("shBillCoinHelp")}
             </p>
             <div
               style={{
@@ -212,7 +226,7 @@ function Shifts() {
                     min={0}
                     step={1}
                     inputMode="numeric"
-                    placeholder="0"
+                    placeholder={tt("shZero")}
                     value={denomCounts[d]}
                     onChange={(e) =>
                       setDenomCounts((prev) => ({
@@ -226,7 +240,7 @@ function Shifts() {
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center", marginBottom: 10 }}>
               <span style={{ fontWeight: 700 }}>
-                Counted from bills/coins: ৳{Number(denomTotal(denomCounts).toFixed(2)).toFixed(2)}
+                {tt("shCountedFromBillsCoins")}: ৳{Number(denomTotal(denomCounts).toFixed(2)).toFixed(2)}
               </span>
               <button
                 type="button"
@@ -236,7 +250,7 @@ function Shifts() {
                   if (!manualClosingCash) setClosingCash("");
                 }}
               >
-                Clear counts
+                {tt("shClearCounts")}
               </button>
               <label style={{ display: "inline-flex", alignItems: "center", gap: 6, margin: 0, cursor: "pointer" }}>
                 <input
@@ -251,14 +265,14 @@ function Shifts() {
                     }
                   }}
                 />
-                <span style={{ fontSize: 13 }}>Enter closing cash manually</span>
+                <span style={{ fontSize: 13 }}>{tt("shEnterClosingCashManually")}</span>
               </label>
             </div>
           </div>
           <form onSubmit={closeShift} className="form-grid">
             <input
               type="number"
-              placeholder="Counted closing cash"
+              placeholder={tt("shCountedClosingCash")}
               value={closingCash}
               onChange={(e) => {
                 setManualClosingCash(true);
@@ -266,54 +280,54 @@ function Shifts() {
               }}
             />
             <input
-              placeholder="Variance reason (required if mismatch)"
+              placeholder={tt("shVarianceReasonReq")}
               value={varianceReason}
               onChange={(e) => setVarianceReason(e.target.value)}
             />
             <input
               type="password"
-              placeholder="Manager PIN (if large variance)"
+              placeholder={tt("shManagerPinLargeVariance")}
               value={managerApprovalPin}
               onChange={(e) => setManagerApprovalPin(e.target.value)}
             />
-            <button type="submit">Close Shift</button>
+            <button type="submit">{tt("shCloseShift")}</button>
           </form>
         </div>
       ) : (
         <form onSubmit={openShift} className="form-grid" style={{ marginBottom: 12 }}>
           <input
             type="number"
-            placeholder="Opening cash"
+            placeholder={tt("shOpeningCashInput")}
             value={openingCash}
             onChange={(e) => setOpeningCash(e.target.value)}
           />
-          <button type="submit">Open Shift</button>
+          <button type="submit">{tt("shOpenShiftAction")}</button>
         </form>
       )}
 
       <DataTable
-        title="Recent Shift History"
+        title={tt("shRecentShiftHistory")}
         rows={history.map((row) => ({
           ...row,
           openedAtLabel: new Date(row.openedAt).toLocaleString(),
-          closedAtLabel: row.closedAt ? new Date(row.closedAt).toLocaleString() : "Open",
+          closedAtLabel: row.closedAt ? new Date(row.closedAt).toLocaleString() : tt("shOpen"),
         }))}
         searchableKeys={["openedAtLabel", "closedAtLabel"]}
         columns={[
-          { key: "id", label: "ID" },
-          { key: "openedAtLabel", label: "Opened At" },
-          { key: "closedAtLabel", label: "Closed At" },
-          { key: "openingCash", label: "Opening", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "cashSales", label: "Cash Sales", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "cashIn", label: "Cash In", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "cashOut", label: "Cash Out", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "expectedCash", label: "Expected", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "closingCash", label: "Counted", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "variance", label: "Variance", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "anomalyScore", label: "Anomaly Score", render: (v) => Number(v || 0).toFixed(2) },
+          { key: "id", label: tt("colId") },
+          { key: "openedAtLabel", label: tt("shOpenedAt") },
+          { key: "closedAtLabel", label: tt("shClosedAt") },
+          { key: "openingCash", label: tt("shOpening"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "cashSales", label: tt("shCashSales"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "cashIn", label: tt("shCashIn"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "cashOut", label: tt("shCashOut"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "expectedCash", label: tt("shExpected"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "closingCash", label: tt("shCounted"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "variance", label: tt("shVariance"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "anomalyScore", label: tt("shAnomalyScore"), render: (v) => Number(v || 0).toFixed(2) },
           {
             key: "anomalyRiskBand",
-            label: "Risk",
+            label: tt("shRisk"),
             render: (v) => {
               const risk = String(v || "LOW").toUpperCase();
               const color = risk === "HIGH" ? "#b91c1c" : risk === "MEDIUM" ? "#d97706" : "#15803d";
@@ -324,14 +338,14 @@ function Shifts() {
               );
             },
           },
-          { key: "varianceReason", label: "Variance Reason" },
+          { key: "varianceReason", label: tt("shVarianceReason") },
           {
             key: "closingDenomination",
-            label: "Cash count",
+            label: tt("shCashCount"),
             render: (v) =>
               Array.isArray(v) && v.length ? (
                 <span title={JSON.stringify(v)} style={{ color: "#15803d", fontWeight: 700 }}>
-                  Saved
+                  {tt("shSaved")}
                 </span>
               ) : (
                 "—"

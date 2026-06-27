@@ -2,8 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
 import SubmitButton from "../components/SubmitButton";
-import { notifySuccess } from "../utils/notify";
+import { notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 function SalesReturns() {
   const [uiLang, setUiLang] = useState(() => getLang());
@@ -17,6 +20,14 @@ function SalesReturns() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canReturn = hasPermission("sale.return");
+
+  const requireSaleReturn = () => {
+    if (canReturn) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "sale.return" }));
+    return false;
+  };
 
   const [sales, setSales] = useState([]);
   const [productsBySale, setProductsBySale] = useState([]);
@@ -43,6 +54,7 @@ function SalesReturns() {
 
   const submit = async (e) => {
     e.preventDefault();
+    if (!requireSaleReturn()) return;
     setSubmitting(true);
     try {
       await api.post(`/sales/${Number(form.saleId)}/return`, {
@@ -67,23 +79,28 @@ function SalesReturns() {
           <div className="page-subtitle">{tt("srSubtitle")}</div>
         </div>
       </div>
+      <PermissionBanner show={!canReturn} code="sale.return" tt={tt} />
       <form onSubmit={submit} className="form-grid">
-        <select className="form-select-sm" value={form.saleId} onChange={(e) => setForm({ ...form, saleId: e.target.value, productId: "" })}>
-          <option value="">{tt("srPhSelectSale")}</option>
-          {sales.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.invoiceNo || tt("srSaleNum", { n: s.id })}
-            </option>
-          ))}
-        </select>
-        <select className="form-select-sm" value={form.productId} onChange={(e) => setForm({ ...form, productId: e.target.value })}>
-          <option value="">{tt("srPhSelectProduct")}</option>
-          {productsBySale.map((i) => (
-            <option key={i.productId} value={i.productId}>
-              {tt("srProductOption", { id: i.productId, qty: i.qty })}
-            </option>
-          ))}
-        </select>
+        <SearchSelect
+          className="form-select-sm"
+          value={form.saleId}
+          onChange={(val) => setForm({ ...form, saleId: val, productId: "" })}
+          placeholder={tt("srPhSelectSale")}
+          options={sales.map((s) => ({
+            value: s.id,
+            label: s.invoiceNo || tt("srSaleNum", { n: s.id }),
+          }))}
+        />
+        <SearchSelect
+          className="form-select-sm"
+          value={form.productId}
+          onChange={(val) => setForm({ ...form, productId: val })}
+          placeholder={tt("srPhSelectProduct")}
+          options={productsBySale.map((i) => ({
+            value: i.productId,
+            label: tt("srProductOption", { id: i.productId, qty: i.qty }),
+          }))}
+        />
         <input placeholder={tt("receiptQty")} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} />
         <input placeholder={tt("invColReason")} value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} />
         <input
@@ -91,7 +108,7 @@ function SalesReturns() {
           value={form.managerApprovalPin}
           onChange={(e) => setForm({ ...form, managerApprovalPin: e.target.value })}
         />
-        <SubmitButton loading={submitting} loadingLabel={tt("srCreatingReturn")}>
+        <SubmitButton loading={submitting} loadingLabel={tt("srCreatingReturn")} disabled={!canReturn}>
           {tt("srBtnCreate")}
         </SubmitButton>
       </form>

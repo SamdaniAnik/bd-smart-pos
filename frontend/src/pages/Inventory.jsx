@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import Select from "react-select";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
-import { getStoredPermissions, hasPermission } from "../utils/permissions";
-import { createSearchSelectStyles } from "../utils/selectStyles";
+import useServerTable from "../hooks/useServerTable";
+import SearchSelect from "../components/SearchSelect";
+import usePermissions from "../hooks/usePermissions";
 import { getLang, t } from "../i18n";
+import { formatProductStockDisplay } from "../utils/formatSaleLineQty";
+import { GROCERY_CATEGORY_CHIPS } from "../constants/retailDepartments";
 import {
   notifyActionRequired,
   notifyError,
@@ -14,13 +16,12 @@ import {
 
 const PURCHASE_DRAFT_KEY = "bd_pos_purchase_draft_v1";
 const APPROVAL_FOCUS_KEY = "bd_pos_approval_focus_id";
-const SEARCH_SELECT_STYLES = createSearchSelectStyles(32);
 
 function Inventory() {
-  const permissions = getStoredPermissions();
-  const canAdjustInventory = hasPermission("inventory.adjust", permissions);
-  const canTransferInventory = hasPermission("inventory.transfer", permissions);
-  const canExportReports = hasPermission("accounting.report", permissions);
+  const { hasPermission } = usePermissions();
+  const canAdjustInventory = hasPermission("inventory.adjust");
+  const canTransferInventory = hasPermission("inventory.transfer");
+  const canExportReports = hasPermission("accounting.report");
 
   const [uiLang, setUiLang] = useState(() => getLang());
   useEffect(() => {
@@ -46,10 +47,13 @@ function Inventory() {
   const [branches, setBranches] = useState([]);
   const [targetBranchProducts, setTargetBranchProducts] = useState([]);
   const [showOnlyCriticalLowStock, setShowOnlyCriticalLowStock] = useState(true);
+  const [lowStockAisleFilter, setLowStockAisleFilter] = useState("ALL");
   const [batchExpiryWindowDays, setBatchExpiryWindowDays] = useState(30);
   const [batchRows, setBatchRows] = useState([]);
   const [batchAlertRows, setBatchAlertRows] = useState([]);
   const [batchAlertSummary, setBatchAlertSummary] = useState({ tracked: 0, nearExpiryCount: 0, expiredCount: 0 });
+  const [traceQuery, setTraceQuery] = useState({ batchId: "", batchCode: "", productId: "" });
+  const [traceResult, setTraceResult] = useState(null);
   const [transferSuggestionRows, setTransferSuggestionRows] = useState([]);
   const [transferSuggestionSummary, setTransferSuggestionSummary] = useState({ suggestions: 0, totalSuggestedQty: 0 });
   const [intelligenceRangeDays, setIntelligenceRangeDays] = useState(30);
@@ -96,6 +100,32 @@ function Inventory() {
   });
   const [editingReasonId, setEditingReasonId] = useState(null);
   const [inventoryTab, setInventoryTab] = useState("overview");
+
+  // Server-driven data source for the stock-ledger table (backend search/sort/paging).
+  const fetchLedgerPage = useCallback(async (q) => {
+    const res = await api.get("/inventory/ledger", {
+      params: {
+        paged: true,
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const ledgerTable = useServerTable(fetchLedgerPage, {
+    pageSize: 10,
+    sortKey: "createdAt",
+    sortDir: "desc",
+  });
+  useEffect(() => {
+    if (inventoryTab === "ops") ledgerTable.refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inventoryTab]);
+  const [batchExpiryTableFilter, setBatchExpiryTableFilter] = useState("all");
   const [focusWorstMarginImpact, setFocusWorstMarginImpact] = useState(false);
   const [selectedImpactSku, setSelectedImpactSku] = useState("");
 
@@ -168,6 +198,36 @@ function Inventory() {
     }, 0);
     return () => clearTimeout(timer);
   }, [load]);
+
+  useEffect(() => {
+    try {
+      const tab = sessionStorage.getItem("bd_pos_inventory_tab");
+      const filter = sessionStorage.getItem("bd_pos_inventory_batch_filter");
+      if (tab) {
+        setInventoryTab(tab);
+        sessionStorage.removeItem("bd_pos_inventory_tab");
+      }
+      if (filter) {
+        setBatchExpiryTableFilter(filter);
+        sessionStorage.removeItem("bd_pos_inventory_batch_filter");
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const filteredBatchAlertRows = useMemo(() => {
+    if (batchExpiryTableFilter === "near") {
+      return batchAlertRows.filter((r) => r.isNear && !r.isExpired);
+    }
+    if (batchExpiryTableFilter === "expired") {
+      return batchAlertRows.filter((r) => r.isExpired);
+    }
+    if (batchExpiryTableFilter === "alert") {
+      return batchAlertRows.filter((r) => r.isNear || r.isExpired);
+    }
+    return batchAlertRows;
+  }, [batchAlertRows, batchExpiryTableFilter]);
 
   useEffect(() => {
     const toBranchId = Number(transferForm.toBranchId || 0);
@@ -481,6 +541,13 @@ function Inventory() {
       maxProducts: 100,
     });
     notifySuccess(res.data?.message || tt("invMarkdownCampaignCreated"));
+    window.dispatchEvent(new CustomEvent("bd_pos_promotions_changed"));
+    try {
+      sessionStorage.setItem("bd_pos_promotions_filter", "expiry_auto");
+    } catch {
+      /* ignore */
+    }
+    window.dispatchEvent(new CustomEvent("bd_pos_navigate", { detail: { view: "promotions" } }));
   };
 
   const appendLowStockToPurchaseDraft = (items) => {
@@ -620,10 +687,33 @@ function Inventory() {
   }, [intelligenceRows, selectedImpactSku, focusWorstMarginImpact]);
 
   const displayedLowStockRows = useMemo(() => {
-    const rows = marginImpactRows(lowStockRows);
+    let rows = marginImpactRows(lowStockRows);
+    const aisle = String(lowStockAisleFilter || "ALL").toUpperCase();
+    if (aisle !== "ALL") {
+      rows = rows.filter((row) => String(row.category || "").trim().toUpperCase() === aisle);
+    }
     if (!selectedImpactSku) return rows;
     return rows.filter((row) => String(row?.sku || "").trim() === selectedImpactSku);
-  }, [lowStockRows, selectedImpactSku, focusWorstMarginImpact]);
+  }, [lowStockRows, selectedImpactSku, focusWorstMarginImpact, lowStockAisleFilter]);
+
+  const writeOffExpiredBatch = async (row) => {
+    if (!canAdjustInventory) {
+      notifyPermissionRequired(tt("invNeedPermAdjust"));
+      return;
+    }
+    const batchId = Number(row.batchId || row.id);
+    if (!batchId) return;
+    if (!window.confirm(tt("invConfirmSpoilage", { name: row.productName, code: row.batchCode }))) return;
+    try {
+      await api.post(`/inventory/batches/${batchId}/spoilage`, {
+        note: tt("invSpoilageNote", { code: row.batchCode || batchId }),
+      });
+      notifySuccess(tt("invSpoilageDone"));
+      load();
+    } catch (err) {
+      notifyError(err.response?.data?.error || tt("invSpoilageFailed"));
+    }
+  };
 
   return (
     <div className="page-stack">
@@ -828,7 +918,11 @@ function Inventory() {
           { key: "price", label: tt("prodLblSellingPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           { key: "profitMargin", label: tt("prodLblProfitMargin"), render: (_, row) => `${calcMarginPct(row).toFixed(2)}%` },
           { key: "marginImpactPct", label: tt("prodLblLandedVsBaseMarginImpact"), render: (_, row) => formatMarginImpact(row) },
-          { key: "stock", label: tt("prodLblStock") },
+          {
+            key: "stock",
+            label: tt("prodLblStock"),
+            render: (_, row) => row.stockDisplay || formatProductStockDisplay(row, tt),
+          },
           { key: "soldQty", label: tt("invColSoldQty") },
           { key: "avgDailySold", label: tt("invColAvgDay"), render: (v) => Number(v || 0).toFixed(2) },
           { key: "forecastNeed", label: tt("invColForecastNeed"), render: (v) => Number(v || 0).toFixed(2) },
@@ -875,6 +969,46 @@ function Inventory() {
           },
         ]}
       />
+      <div className="pos-department-chips" style={{ marginBottom: 10 }} role="group" aria-label={tt("invLowStockAisleAria")}>
+        <button
+          type="button"
+          className={`pos-dept-chip ${lowStockAisleFilter === "ALL" ? "pos-dept-chip-active" : ""}`}
+          onClick={() => setLowStockAisleFilter("ALL")}
+        >
+          {tt("posDeptAll")}
+        </button>
+        {GROCERY_CATEGORY_CHIPS.map((cat) => (
+          <button
+            key={cat.id}
+            type="button"
+            className={`pos-dept-chip ${lowStockAisleFilter === cat.id ? "pos-dept-chip-active" : ""}`}
+            onClick={() => setLowStockAisleFilter(cat.id)}
+          >
+            {cat.icon} {tt(cat.labelKey)}
+          </button>
+        ))}
+        {lowStockAisleFilter !== "ALL" ? (
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            onClick={() =>
+              appendLowStockToPurchaseDraft(
+                displayedLowStockRows
+                  .filter((x) => x.status === "LOW" || x.status === "OUT")
+                  .map((x) => ({
+                    productId: x.kind === "VARIANT" ? Number(x.productId) : Number(x.id),
+                    productName: x.name,
+                    qty: Math.max(1, Number(x.shortageQty || 1)),
+                    cost: Number(x.price || 0),
+                  }))
+              )
+            }
+            disabled={!displayedLowStockRows.length}
+          >
+            {tt("invBtnDraftAisleLow")}
+          </button>
+        ) : null}
+      </div>
       <DataTable
         title={tt("invDtLowStock")}
         rows={displayedLowStockRows}
@@ -887,7 +1021,11 @@ function Inventory() {
           { key: "price", label: tt("prodLblSellingPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           { key: "profitMargin", label: tt("prodLblProfitMargin"), render: (_, row) => `${calcMarginPct(row).toFixed(2)}%` },
           { key: "marginImpactPct", label: tt("prodLblLandedVsBaseMarginImpact"), render: (_, row) => formatMarginImpact(row) },
-          { key: "stock", label: tt("prodLblStock") },
+          {
+            key: "stock",
+            label: tt("prodLblStock"),
+            render: (_, row) => row.stockDisplay || formatProductStockDisplay(row, tt),
+          },
           { key: "reorderLevel", label: tt("prodLblReorder") },
           { key: "shortageQty", label: tt("dashShortQty") },
           {
@@ -954,17 +1092,83 @@ function Inventory() {
       {inventoryTab === "batches" ? (
         <div className="pos-tab-panel">
       <div className="page-card" style={{ marginBottom: 12 }}>
+        <h3>{tt("invBatchTraceTitle")}</h3>
+        <p className="text-muted" style={{ fontSize: 13 }}>{tt("invBatchTraceHelp")}</p>
+        <div className="form-grid" style={{ marginBottom: 8 }}>
+          <input
+            type="number"
+            placeholder={tt("invTraceBatchId")}
+            value={traceQuery.batchId}
+            onChange={(e) => setTraceQuery((p) => ({ ...p, batchId: e.target.value }))}
+          />
+          <input
+            placeholder={tt("invColBatch")}
+            value={traceQuery.batchCode}
+            onChange={(e) => setTraceQuery((p) => ({ ...p, batchCode: e.target.value }))}
+          />
+          <input
+            type="number"
+            placeholder={tt("invTraceProductId")}
+            value={traceQuery.productId}
+            onChange={(e) => setTraceQuery((p) => ({ ...p, productId: e.target.value }))}
+          />
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={async () => {
+              const q = new URLSearchParams();
+              if (traceQuery.batchId) q.set("batchId", traceQuery.batchId);
+              if (traceQuery.batchCode && traceQuery.productId) {
+                q.set("batchCode", traceQuery.batchCode);
+                q.set("productId", traceQuery.productId);
+              }
+              try {
+                const res = await api.get(`/inventory/batches/traceability?${q.toString()}`);
+                setTraceResult(res.data);
+              } catch (err) {
+                setTraceResult(null);
+                notifyError(err?.response?.data?.error || tt("invTraceNotFound"));
+              }
+            }}
+          >
+            {tt("invTraceSearch")}
+          </button>
+        </div>
+        {traceResult?.batch ? (
+          <div style={{ fontSize: 13, marginBottom: 12 }}>
+            <strong>{traceResult.batch.productName}</strong> · {traceResult.batch.batchCode} ·{" "}
+            {traceResult.batch.expiryDate
+              ? new Date(traceResult.batch.expiryDate).toLocaleDateString()
+              : tt("invNoExpiry")}{" "}
+            · {tt("invBatchQtyLabel")}: {traceResult.batch.qtyOnHand}
+            {(traceResult.sales || []).length ? (
+              <DataTable
+                title={tt("invTraceSales")}
+                rows={traceResult.sales}
+                pageSize={5}
+                allowExport={false}
+                columns={[
+                  { key: "invoiceNo", label: tt("receiptInvoice") },
+                  { key: "soldAt", label: tt("colDate"), render: (v) => (v ? new Date(v).toLocaleString() : "—") },
+                  { key: "qty", label: tt("receiptQty") },
+                  { key: "linePrice", label: tt("salesLookupColPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+                ]}
+              />
+            ) : (
+              <p className="text-muted">{tt("invTraceNoSales")}</p>
+            )}
+          </div>
+        ) : null}
+      </div>
+      <div className="page-card" style={{ marginBottom: 12 }}>
         <h3>{tt("invBatchSectionTitle")}</h3>
         <form onSubmit={submitBatch} className="form-grid" style={{ marginBottom: 8 }}>
-          <Select
+          <SearchSelect
             className="form-select-sm"
-            value={productOptions.find((opt) => opt.value === String(batchForm.productId)) || null}
-            options={productOptions}
-            onChange={(opt) => setBatchForm((p) => ({ ...p, productId: opt?.value || "" }))}
+            kind="products"
+            value={batchForm.productId}
+            onChange={(val) => setBatchForm((p) => ({ ...p, productId: val }))}
             placeholder={tt("invPhSelectProduct")}
-            isClearable
-            isSearchable
-            styles={SEARCH_SELECT_STYLES}
           />
           <input
             placeholder={tt("invPhBatchCode")}
@@ -993,15 +1197,12 @@ function Inventory() {
           <button type="submit" disabled={!canAdjustInventory}>{tt("invAddBatch")}</button>
         </form>
         <form onSubmit={submitBatchAdjustment} className="form-grid">
-          <Select
+          <SearchSelect
             className="form-select-sm"
-            value={batchOptions.find((opt) => opt.value === String(batchAdjustForm.batchId)) || null}
-            options={batchOptions}
-            onChange={(opt) => setBatchAdjustForm((p) => ({ ...p, batchId: opt?.value || "" }))}
+            value={batchAdjustForm.batchId}
+            onChange={(val) => setBatchAdjustForm((p) => ({ ...p, batchId: val }))}
             placeholder={tt("invPhSelectBatch")}
-            isClearable
-            isSearchable
-            styles={SEARCH_SELECT_STYLES}
+            options={batchOptions}
           />
           <input
             type="number"
@@ -1018,9 +1219,26 @@ function Inventory() {
           <button type="submit" disabled={!canAdjustInventory}>{tt("invUpdateBatchQty")}</button>
         </form>
       </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+        {[
+          { id: "all", label: tt("invExpiryFilterAll") },
+          { id: "alert", label: tt("invExpiryFilterAlert") },
+          { id: "near", label: tt("invExpiryFilterNear") },
+          { id: "expired", label: tt("invExpiryFilterExpired") },
+        ].map((chip) => (
+          <button
+            key={chip.id}
+            type="button"
+            className={`pos-dept-chip${batchExpiryTableFilter === chip.id ? " active" : ""}`}
+            onClick={() => setBatchExpiryTableFilter(chip.id)}
+          >
+            {chip.label}
+          </button>
+        ))}
+      </div>
       <DataTable
         title={tt("invDtNearExpiry")}
-        rows={batchAlertRows.map((row) => ({
+        rows={filteredBatchAlertRows.map((row) => ({
           ...row,
           expiryDateLabel: row.expiryDate ? new Date(row.expiryDate).toLocaleDateString() : "-",
           markdownLabel: `${Number(row.suggestedMarkdownPct || 0).toFixed(0)}%`,
@@ -1044,6 +1262,16 @@ function Inventory() {
               ) : (
                 <span className="badge badge-success">{tt("invBadgeOk")}</span>
               ),
+          },
+          {
+            key: "actions",
+            label: "",
+            render: (_, row) =>
+              row.isExpired && Number(row.qtyOnHand || 0) > 0 ? (
+                <button type="button" className="btn-danger btn-sm" onClick={() => writeOffExpiredBatch(row)}>
+                  {tt("invBtnWriteOffExpired")}
+                </button>
+              ) : null,
           },
         ]}
       />
@@ -1099,20 +1327,28 @@ function Inventory() {
             value={reasonForm.label}
             onChange={(e) => setReasonForm((p) => ({ ...p, label: e.target.value }))}
           />
-          <select className="form-select-sm" value={reasonForm.direction} onChange={(e) => setReasonForm((p) => ({ ...p, direction: e.target.value }))}>
-            <option value="BOTH">{tt("invDirBoth")}</option>
-            <option value="IN">{tt("invDirInOnly")}</option>
-            <option value="OUT">{tt("invDirOutOnly")}</option>
-          </select>
-          <select
+          <SearchSelect
+            className="form-select-sm"
+            value={reasonForm.direction}
+            onChange={(val) => setReasonForm((p) => ({ ...p, direction: val || "BOTH" }))}
+            options={[
+              { value: "BOTH", label: tt("invDirBoth") },
+              { value: "IN", label: tt("invDirInOnly") },
+              { value: "OUT", label: tt("invDirOutOnly") },
+            ]}
+            isClearable={false}
+          />
+          <SearchSelect
             className="form-select-sm"
             value={reasonForm.accountingImpact}
-            onChange={(e) => setReasonForm((p) => ({ ...p, accountingImpact: e.target.value }))}
-          >
-            <option value="NONE">{tt("invAccNone")}</option>
-            <option value="WRITE_OFF">{tt("invAccWriteOff")}</option>
-            <option value="GAIN">{tt("invAccGain")}</option>
-          </select>
+            onChange={(val) => setReasonForm((p) => ({ ...p, accountingImpact: val || "NONE" }))}
+            options={[
+              { value: "NONE", label: tt("invAccNone") },
+              { value: "WRITE_OFF", label: tt("invAccWriteOff") },
+              { value: "GAIN", label: tt("invAccGain") },
+            ]}
+            isClearable={false}
+          />
           <input
             placeholder={tt("invPhAccountCodeOpt")}
             value={reasonForm.accountCode}
@@ -1162,25 +1398,19 @@ function Inventory() {
         />
       </div>
       <form onSubmit={submitAdjustment} className="form-grid">
-        <Select
+        <SearchSelect
           className="form-select-sm"
-          value={productOptions.find((opt) => opt.value === String(adjustment.productId)) || null}
-          options={productOptions}
-          onChange={(opt) => setAdjustment({ ...adjustment, productId: opt?.value || "" })}
+          kind="products"
+          value={adjustment.productId}
+          onChange={(val) => setAdjustment({ ...adjustment, productId: val })}
           placeholder={tt("invPhSelectProduct")}
-          isClearable
-          isSearchable
-          styles={SEARCH_SELECT_STYLES}
         />
-        <Select
+        <SearchSelect
           className="form-select-sm"
-          value={warehouseOptions.find((opt) => opt.value === String(adjustment.warehouseId)) || null}
-          options={warehouseOptions}
-          onChange={(opt) => setAdjustment({ ...adjustment, warehouseId: opt?.value || "" })}
+          kind="warehouses"
+          value={adjustment.warehouseId}
+          onChange={(val) => setAdjustment({ ...adjustment, warehouseId: val })}
           placeholder={tt("invPhSelectWarehouseOpt")}
-          isClearable
-          isSearchable
-          styles={SEARCH_SELECT_STYLES}
         />
         <input
           placeholder={tt("invPhQtyChange")}
@@ -1192,15 +1422,12 @@ function Inventory() {
           value={adjustment.reason}
           onChange={(e) => setAdjustment({ ...adjustment, reason: e.target.value })}
         />
-        <Select
+        <SearchSelect
           className="form-select-sm"
-          value={adjustReasonOptions.find((opt) => opt.value === String(adjustment.reasonCode)) || null}
-          options={adjustReasonOptions}
-          onChange={(opt) => setAdjustment({ ...adjustment, reasonCode: opt?.value || "" })}
+          value={adjustment.reasonCode}
+          onChange={(val) => setAdjustment({ ...adjustment, reasonCode: val })}
           placeholder={tt("invPhReasonCodeOpt")}
-          isClearable
-          isSearchable
-          styles={SEARCH_SELECT_STYLES}
+          options={adjustReasonOptions}
         />
         <button type="submit" disabled={!canAdjustInventory}>{editingAdjustmentId ? tt("invUpdateAdjustment") : tt("invAddAdjustment")}</button>
         {editingAdjustmentId ? (
@@ -1276,13 +1503,19 @@ function Inventory() {
       />
       <DataTable
         title={tt("invDtStockLedger")}
-        rows={ledger.map((r) => ({
+        serverMode
+        totalRows={ledgerTable.total}
+        loading={ledgerTable.loading}
+        onQueryChange={ledgerTable.onQueryChange}
+        initialSort="createdAt"
+        initialSortDir="desc"
+        pageSize={10}
+        rows={ledgerTable.rows.map((r) => ({
           ...r,
           productName: r.product?.name || `#${r.productId}`,
           warehouseName: r.warehouse?.name || "-",
           createdAtLabel: new Date(r.createdAt).toLocaleString(),
         }))}
-        searchableKeys={["productName", "warehouseName", "refType", "createdAtLabel"]}
         filters={[
           {
             key: "refType",
@@ -1291,13 +1524,13 @@ function Inventory() {
           },
         ]}
         columns={[
-          { key: "id", label: tt("colId") },
-          { key: "createdAtLabel", label: tt("invColDate") },
+          { key: "id", label: tt("colId"), searchable: false },
+          { key: "createdAtLabel", label: tt("invColDate"), searchable: false },
           { key: "refType", label: tt("invColRefType") },
           { key: "productName", label: tt("invColProduct") },
           { key: "warehouseName", label: tt("invColWarehouse") },
-          { key: "inQty", label: tt("invColIn") },
-          { key: "outQty", label: tt("invColOut") },
+          { key: "inQty", label: tt("invColIn"), searchable: false },
+          { key: "outQty", label: tt("invColOut"), searchable: false },
         ]}
       />
         </div>
@@ -1308,27 +1541,24 @@ function Inventory() {
         <h3>{tt("invTransferBranchTitle")}</h3>
         <form onSubmit={submitTransfer}>
           <div className="form-grid">
-            <Select
+            <SearchSelect
               className="form-select-sm"
-              value={destinationBranchOptions.find((opt) => opt.value === String(transferForm.toBranchId)) || null}
-              options={destinationBranchOptions}
-              onChange={(opt) =>
+              value={transferForm.toBranchId}
+              onChange={(val) =>
                 setTransferForm({
-                  toBranchId: opt?.value || "",
+                  toBranchId: val,
                   items: [{ fromProductId: "", toProductId: "", qty: "" }],
                 })
               }
               placeholder={tt("invPhDestinationBranch")}
-              isClearable
-              isSearchable
-              styles={SEARCH_SELECT_STYLES}
+              options={destinationBranchOptions}
             />
           </div>
           {transferForm.items.map((line, idx) => (
             <div key={`transfer-line-${idx}`} className="form-grid" style={{ marginTop: 8 }}>
-              <Select
+              <SearchSelect
                 className="form-select-sm"
-                value={productOptions.find((opt) => opt.value === String(line.fromProductId)) || null}
+                value={line.fromProductId}
                 options={productOptions.map((opt) => {
                   const p = fromProductMap.get(Number(opt.value));
                   return {
@@ -1336,8 +1566,8 @@ function Inventory() {
                     label: `${opt.label} — ${tt("invStockInLabel")} ${p?.stock ?? 0}`,
                   };
                 })}
-                onChange={(opt) => {
-                  const fromProductId = opt?.value || "";
+                onChange={(val) => {
+                  const fromProductId = val || "";
                   const fromProduct = fromProductMap.get(Number(fromProductId));
                   const autoMatch = targetBranchProducts.find(
                     (p) =>
@@ -1351,19 +1581,13 @@ function Inventory() {
                   });
                 }}
                 placeholder={tt("invPhFromProduct")}
-                isClearable
-                isSearchable
-                styles={SEARCH_SELECT_STYLES}
               />
-              <Select
+              <SearchSelect
                 className="form-select-sm"
-                value={targetBranchProductOptions.find((opt) => opt.value === String(line.toProductId)) || null}
+                value={line.toProductId}
                 options={targetBranchProductOptions}
-                onChange={(opt) => upsertTransferItem(idx, { toProductId: opt?.value || "" })}
+                onChange={(val) => upsertTransferItem(idx, { toProductId: val || "" })}
                 placeholder={tt("invPhToProduct")}
-                isClearable
-                isSearchable
-                styles={SEARCH_SELECT_STYLES}
               />
               <input
                 type="number"

@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import SearchSelect from "../components/SearchSelect";
 import { getLang, t } from "../i18n";
+import { formatSaleLineQtyDisplay, getBillingUnitsForSaleLine } from "../utils/formatSaleLineQty";
 import {
   consumeGlobalSubmitError,
   notifyActionRequired,
   notifyError,
-  notifySuccess,
+  notifyPermissionRequired,
 } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 
 function Quotations() {
   const [uiLang, setUiLang] = useState(() => getLang());
@@ -21,6 +25,14 @@ function Quotations() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canManageQuotes = hasPermission("sale.create");
+
+  const requireSaleCreate = () => {
+    if (canManageQuotes) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "sale.create" }));
+    return false;
+  };
 
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState("OPEN");
@@ -68,6 +80,7 @@ function Quotations() {
   };
 
   const cancelQuote = async (row) => {
+    if (!requireSaleCreate()) return;
     if (!window.confirm(tt("quoConfirmCancel", { id: row.quoteNo || row.id }))) return;
     try {
       await api.delete(`/sales/quotes/${row.id}`);
@@ -78,6 +91,7 @@ function Quotations() {
   };
 
   const duplicateQuote = async (row) => {
+    if (!requireSaleCreate()) return;
     try {
       const res = await api.post(`/sales/quotes/${row.id}/duplicate`);
       const newId = Number(res?.data?.id || 0);
@@ -139,10 +153,11 @@ function Quotations() {
       const lines = items
         .map((it) => {
           const name = it?.product?.name || tt("quoProductNum", { n: it?.productId || "" });
-          const qty = Number(it?.qty || 0);
+          const bill = getBillingUnitsForSaleLine(it);
+          const qtyLabel = formatSaleLineQtyDisplay(it, tt);
           const price = Number(it?.price || 0);
-          const amount = qty * price;
-          return `<tr><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;">${name}</td><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">${qty}</td><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">${price.toFixed(2)}</td><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">${amount.toFixed(2)}</td></tr>`;
+          const amount = bill * price;
+          return `<tr><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;">${name}</td><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">${qtyLabel}</td><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">${price.toFixed(2)}</td><td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">${amount.toFixed(2)}</td></tr>`;
         })
         .join("");
       const html = `<!doctype html>
@@ -209,6 +224,7 @@ function Quotations() {
   };
 
   const setFollowUp = async (row, mode) => {
+    if (!requireSaleCreate()) return;
     try {
       let followUpAt = null;
       if (mode === "today") {
@@ -230,6 +246,7 @@ function Quotations() {
   };
 
   const markFollowUpDone = async (row) => {
+    if (!requireSaleCreate()) return;
     try {
       await api.post(`/sales/quotes/${row.id}/follow-up-done`);
       load();
@@ -249,6 +266,7 @@ function Quotations() {
           </div>
         </div>
       </div>
+      <PermissionBanner show={!canManageQuotes} code="sale.create" tt={tt} />
       <div className="metrics-grid" style={{ marginBottom: 10 }}>
         <div className="metric warning">
           <div className="metric-label">{tt("quoMetricOverdue")}</div>
@@ -270,28 +288,38 @@ function Quotations() {
       <div className="form-grid" style={{ marginBottom: 12, maxWidth: 360 }}>
         <label>
           {tt("quoFilterStatus")}
-          <select className="form-select-sm" value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">{tt("quoAll")}</option>
-            <option value="OPEN">{tt("quoStatusOpen")}</option>
-            <option value="EXPIRED">{tt("quoStatusExpired")}</option>
-            <option value="CONVERTED">{tt("quoStatusConverted")}</option>
-            <option value="CANCELLED">{tt("quoStatusCancelled")}</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={status}
+            onChange={(val) => setStatus(val)}
+            placeholder={tt("quoAll")}
+            options={[
+              { value: "OPEN", label: tt("quoStatusOpen") },
+              { value: "EXPIRED", label: tt("quoStatusExpired") },
+              { value: "CONVERTED", label: tt("quoStatusConverted") },
+              { value: "CANCELLED", label: tt("quoStatusCancelled") },
+            ]}
+          />
         </label>
         <button type="button" className="btn-secondary" onClick={load}>
           {tt("dashRefresh")}
         </button>
         <label>
           {tt("quoFilterReminder")}
-          <select className="form-select-sm" value={reminder} onChange={(e) => setReminder(e.target.value)}>
-            <option value="">{tt("quoAll")}</option>
-            <option value="OVERDUE">{tt("quoRemOverdue")}</option>
-            <option value="TODAY">{tt("quoRemToday")}</option>
-            <option value="TOMORROW">{tt("quoRemTomorrow")}</option>
-            <option value="UPCOMING">{tt("quoRemUpcoming")}</option>
-            <option value="NONE">{tt("quoRemNone")}</option>
-            <option value="DONE">{tt("quoRemDone")}</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={reminder}
+            onChange={(val) => setReminder(val)}
+            placeholder={tt("quoAll")}
+            options={[
+              { value: "OVERDUE", label: tt("quoRemOverdue") },
+              { value: "TODAY", label: tt("quoRemToday") },
+              { value: "TOMORROW", label: tt("quoRemTomorrow") },
+              { value: "UPCOMING", label: tt("quoRemUpcoming") },
+              { value: "NONE", label: tt("quoRemNone") },
+              { value: "DONE", label: tt("quoRemDone") },
+            ]}
+          />
         </label>
       </div>
       <DataTable rows={rows} pageSize={15} allowExport columns={[
@@ -362,7 +390,7 @@ function Quotations() {
                 <button type="button" className="btn-secondary btn-sm" disabled={row.status !== "OPEN"} onClick={() => openInPos(row.id)}>
                   {tt("quoBtnOpenPos")}
                 </button>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => duplicateQuote(row)}>
+                <button type="button" className="btn-secondary btn-sm" disabled={!canManageQuotes} onClick={() => duplicateQuote(row)}>
                   {tt("quoBtnDuplicateOpen")}
                 </button>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => previewQuotePdf(row)}>
@@ -377,7 +405,7 @@ function Quotations() {
                 <button
                   type="button"
                   className="btn-secondary btn-sm"
-                  disabled={row.status !== "OPEN"}
+                  disabled={row.status !== "OPEN" || !canManageQuotes}
                   onClick={() => setFollowUp(row, "today")}
                 >
                   {tt("quoBtnFollowUpToday")}
@@ -385,7 +413,7 @@ function Quotations() {
                 <button
                   type="button"
                   className="btn-secondary btn-sm"
-                  disabled={row.status !== "OPEN"}
+                  disabled={row.status !== "OPEN" || !canManageQuotes}
                   onClick={() => setFollowUp(row, "tomorrow")}
                 >
                   {tt("quoBtnTomorrow")}
@@ -393,7 +421,7 @@ function Quotations() {
                 <button
                   type="button"
                   className="btn-secondary btn-sm"
-                  disabled={row.status !== "OPEN"}
+                  disabled={row.status !== "OPEN" || !canManageQuotes}
                   onClick={() => setFollowUp(row, "clear")}
                 >
                   {tt("quoBtnClearReminder")}
@@ -401,7 +429,7 @@ function Quotations() {
                 <button
                   type="button"
                   className="btn-secondary btn-sm"
-                  disabled={row.status !== "OPEN" || row.followUpStatus === "DONE"}
+                  disabled={row.status !== "OPEN" || row.followUpStatus === "DONE" || !canManageQuotes}
                   onClick={() => markFollowUpDone(row)}
                 >
                   {tt("quoBtnFollowUpDone")}
@@ -414,7 +442,7 @@ function Quotations() {
                 >
                   {tt("quoBtnOpenSaleInvoice")}
                 </button>
-                <button type="button" className="btn-danger btn-sm" disabled={row.status !== "OPEN"} onClick={() => cancelQuote(row)}>
+                <button type="button" className="btn-danger btn-sm" disabled={row.status !== "OPEN" || !canManageQuotes} onClick={() => cancelQuote(row)}>
                   {tt("quoBtnCancel")}
                 </button>
               </div>

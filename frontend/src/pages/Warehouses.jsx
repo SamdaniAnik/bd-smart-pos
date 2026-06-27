@@ -1,26 +1,55 @@
-import { useEffect, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import useServerTable from "../hooks/useServerTable";
 import SubmitButton from "../components/SubmitButton";
+import { notifyPermissionRequired } from "../utils/notify";
+import { getLang, t } from "../i18n";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 
 function Warehouses() {
-  const [warehouses, setWarehouses] = useState([]);
+  const lang = getLang();
+  const tt = useMemo(() => (key, params) => t(lang, key, params), [lang]);
+  const { hasPermission } = usePermissions();
+  const canManageWarehouses = hasPermission("inventory.adjust");
+
+  const requireWarehouseManage = () => {
+    if (canManageWarehouses) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "inventory.adjust" }));
+    return false;
+  };
+
   const [form, setForm] = useState({ name: "" });
   const [editingId, setEditingId] = useState(null);
   const [selected, setSelected] = useState(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const load = async () => {
-    const res = await api.get("/warehouses");
-    setWarehouses(res.data);
-  };
-
-  useEffect(() => {
-    load();
+  const fetchWarehousePage = useCallback(async (q) => {
+    const res = await api.get("/warehouses", {
+      params: {
+        paged: true,
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
   }, []);
+  const warehousesTable = useServerTable(fetchWarehousePage, {
+    pageSize: 10,
+    sortKey: "id",
+    sortDir: "desc",
+  });
+  const warehouses = warehousesTable.rows;
+  const load = warehousesTable.refresh;
 
   const submit = async (e) => {
     e.preventDefault();
+    if (!requireWarehouseManage()) return;
     const payload = { name: form.name.trim() };
     setSubmitting(true);
     try {
@@ -52,6 +81,7 @@ function Warehouses() {
   };
 
   const handleDelete = async (row) => {
+    if (!requireWarehouseManage()) return;
     if (!window.confirm(`Delete warehouse "${row.name}"?`)) return;
     await api.delete(`/warehouses/${row.id}`);
     if (selected?.id === row.id) setSelected(null);
@@ -70,6 +100,7 @@ function Warehouses() {
           <div className="page-subtitle">Storage locations for stock and transfers</div>
         </div>
       </div>
+      <PermissionBanner show={!canManageWarehouses} code="inventory.adjust" tt={tt} />
       <form onSubmit={submit} className="form-grid">
         <input
           placeholder="Warehouse Name"
@@ -77,7 +108,7 @@ function Warehouses() {
           onChange={(e) => setForm({ ...form, name: e.target.value })}
           required
         />
-        <SubmitButton loading={submitting} loadingLabel={editingId ? "Updating…" : "Saving…"}>
+        <SubmitButton loading={submitting} loadingLabel={editingId ? "Updating…" : "Saving…"} disabled={!canManageWarehouses}>
           {editingId ? "Update warehouse" : "Add warehouse"}
         </SubmitButton>
         {editingId ? (
@@ -109,9 +140,15 @@ function Warehouses() {
       <DataTable
         title="Warehouse List"
         rows={warehouses}
-        searchableKeys={["name"]}
+        serverMode
+        totalRows={warehousesTable.total}
+        loading={warehousesTable.loading}
+        onQueryChange={warehousesTable.onQueryChange}
+        initialSort="id"
+        initialSortDir="desc"
+        pageSize={10}
         columns={[
-          { key: "id", label: "ID" },
+          { key: "id", label: "ID", searchable: false },
           { key: "name", label: "Name" },
           {
             key: "actions",
@@ -121,10 +158,10 @@ function Warehouses() {
                 <button type="button" className="btn-secondary btn-sm" onClick={() => handleDetails(row)}>
                   Details
                 </button>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => handleEdit(row)}>
+                <button type="button" className="btn-secondary btn-sm" disabled={!canManageWarehouses} onClick={() => handleEdit(row)}>
                   Edit
                 </button>
-                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)}>
+                <button type="button" className="btn-danger btn-sm" disabled={!canManageWarehouses} onClick={() => handleDelete(row)}>
                   Delete
                 </button>
               </div>

@@ -4,6 +4,8 @@ const {
   createPromotion,
   updatePromotion,
   deletePromotion,
+  listFestivalTemplates,
+  deployFestivalKit,
 } = require("./promotionController");
 const {
   listCoupons,
@@ -19,6 +21,9 @@ router.get("/coupons", requireAuth, requirePermission("product.view"), listCoupo
 router.post("/coupons", requireAuth, requirePermission("product.create"), createCoupon);
 router.put("/coupons/:id", requireAuth, requirePermission("product.create"), updateCoupon);
 router.delete("/coupons/:id", requireAuth, requirePermission("product.create"), deleteCoupon);
+
+router.get("/festival-templates", requireAuth, requirePermission("product.view"), listFestivalTemplates);
+router.post("/festival-kits/:templateId/deploy", requireAuth, requirePermission("product.create"), deployFestivalKit);
 
 router.get("/", requireAuth, requirePermission("product.view"), listPromotions);
 router.post("/", requireAuth, requirePermission("product.create"), createPromotion);

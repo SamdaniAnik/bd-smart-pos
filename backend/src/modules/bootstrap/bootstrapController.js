@@ -1,6 +1,7 @@
 const prisma = require("../../utils/prisma");
 const config = require("../../utils/config");
 const bcrypt = require("bcrypt");
+const { ensureDefaultOrganization } = require("../../utils/subscriptionUtil");
 
 const permissionCodes = [
   "branch.manage",
@@ -39,6 +40,14 @@ const permissionCodes = [
   "financial.lock.override",
   "financial.lock.maturity.view",
   "financial.lock.maturity.override",
+  "pharmacy.view",
+  "pharmacy.manage",
+  "pharmacy.dispense",
+  "topup.view",
+  "topup.create",
+  "topup.manage",
+  "fcommerce.view",
+  "fcommerce.manage",
 ];
 
 const accountDefaults = [
@@ -47,6 +56,8 @@ const accountDefaults = [
   { code: "1120", name: "Petty Cash", type: "Asset", isSystem: true },
   { code: "1130", name: "Bank Current Account", type: "Asset", isSystem: true },
   { code: "1200", name: "Accounts Receivable", type: "Asset", isSystem: true },
+  { code: "1140", name: "Recharge/Bill Float", type: "Asset", isSystem: true },
+  { code: "1150", name: "Mobile Wallet (MFS) Clearing", type: "Asset", isSystem: true },
   { code: "1300", name: "Inventory", type: "Asset", isSystem: true },
   { code: "1400", name: "Fixed Assets", type: "Asset", isSystem: true },
   { code: "1410", name: "Accumulated Depreciation", type: "Asset", isSystem: true },
@@ -57,6 +68,7 @@ const accountDefaults = [
   { code: "2320", name: "Bank Loans Payable", type: "Liability", isSystem: true },
   { code: "3100", name: "Owner Equity", type: "Equity", isSystem: true },
   { code: "4100", name: "Sales Revenue", type: "Revenue", isSystem: true },
+  { code: "4150", name: "Recharge & Bill Commission Income", type: "Revenue", isSystem: true },
   { code: "5100", name: "Cost Of Goods Sold", type: "Expense", isSystem: true },
   { code: "5200", name: "Operating Expense", type: "Expense", isSystem: true },
 ];
@@ -131,6 +143,7 @@ exports.seedSystem = async (req, res) => {
         data: {
           code: `BR-${Date.now()}`,
           name: branchName,
+          organizationId: (await ensureDefaultOrganization()).id,
         },
       });
       bId = createdBranch.id;
@@ -222,10 +235,38 @@ exports.seedSystem = async (req, res) => {
       });
     }
 
+    const { RETAIL_CATEGORY_SEEDS } = require("../../constants/retailDepartments");
+    for (const seed of RETAIL_CATEGORY_SEEDS) {
+      const name = String(seed.name || "").trim();
+      if (!name) continue;
+      const existingCat = await prisma.productCategory.findFirst({
+        where: { branchId: bId, name: { equals: name } },
+        select: { id: true },
+      });
+      if (!existingCat) {
+        await prisma.productCategory.create({
+          data: {
+            branchId: bId,
+            name,
+            department: seed.department ? String(seed.department).toUpperCase() : null,
+            attributeSet: Array.isArray(seed.attributeSet) ? seed.attributeSet : [],
+            minMarginPct:
+              seed.minMarginPct != null && Number.isFinite(Number(seed.minMarginPct))
+                ? Number(seed.minMarginPct)
+                : null,
+          },
+        });
+      }
+    }
+
     // Mark branch as bootstrapped — this blocks future seed attempts on this branch.
     await prisma.branch.update({
       where: { id: bId },
-      data: { bootstrapped: true, bootstrappedAt: new Date() },
+      data: {
+        bootstrapped: true,
+        bootstrappedAt: new Date(),
+        businessProfile: "MIXED",
+      },
     });
 
     return res.json({

@@ -12,6 +12,7 @@ const {
   corsOptions,
   loginRateLimiter,
   bootstrapRateLimiter,
+  apiRateLimiter,
 } = require("./middleware/security");
 
 const productRoutes = require("./routes/productRoutes");
@@ -97,6 +98,7 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: "1mb" }));
 
 // Rate-limited routes (mounted before the general routers so the limiter wraps them).
+app.use("/api", apiRateLimiter);
 app.use("/api/auth/login", loginRateLimiter);
 app.use("/api/bootstrap/seed", bootstrapRateLimiter);
 
@@ -118,6 +120,7 @@ app.use("/api/dues", duesRoutes);
 app.use("/api/shifts", shiftRoutes);
 app.use("/api/approvals", approvalRoutes);
 app.use("/api/promotions", promotionRoutes);
+app.use("/api/pharmacy", require("./modules/pharmacy/pharmacyRoutes"));
 app.use("/api/gift-cards", require("./modules/giftcard/giftCardRoutes"));
 app.use("/api/finance", require("./modules/finance/financeRoutes"));
 app.use("/api/cheques", require("./modules/cheque/chequeRoutes"));
@@ -127,6 +130,23 @@ app.use("/api/petty-cash", require("./modules/pettycash/pettyCashRoutes"));
 app.use("/api/integration/webhooks", require("./modules/integration/webhookRoutes"));
 app.use("/api/nbr", require("./modules/nbr/nbrRoutes"));
 app.use("/api/withholding", require("./modules/withholding/withholdingRoutes"));
+app.use("/api/payments", require("./modules/payments/mfsPaymentRoutes"));
+app.use("/api/efd", require("./modules/efd/efdRoutes"));
+app.use("/api/restaurant", require("./modules/restaurant/restaurantRoutes"));
+app.use("/api/serials", require("./modules/serial/serialRoutes"));
+app.use("/api/billing", require("./modules/billing/billingRoutes"));
+app.use("/api/manufacturing", require("./modules/manufacturing/manufacturingRoutes"));
+app.use("/api/courier", require("./modules/courier/courierRoutes"));
+app.use("/api/orders", require("./modules/orders/orderInboxRoutes"));
+app.use("/api/topup", require("./modules/topup/topupRoutes"));
+app.use("/api/fcommerce", require("./modules/fcommerce/fcommerceRoutes"));
+app.use("/api/warranty", require("./modules/warranty/warrantyRoutes"));
+app.use("/api/loyalty/public", require("./modules/loyalty/loyaltyPublicRoutes"));
+app.use("/api/storefront", require("./modules/storefront/storefrontRoutes"));
+app.use("/api/sms", require("./modules/sms/smsRoutes"));
+app.use("/api/installments", require("./modules/installment/installmentRoutes"));
+app.use("/api/imei", require("./modules/imei/imeiRoutes"));
+app.use("/api/expiry-markdown", require("./modules/expiryMarkdown/expiryMarkdownRoutes"));
 
 app.get("/", function (req, res) {
   res.send("BD Smart POS API is running");
@@ -204,6 +224,13 @@ server.listen(config.port, function () {
     },
     `Server running on http://127.0.0.1:${config.port}`
   );
+
+  // Background EFD fiscalization retry sweeper (no-op unless EFD provider configured).
+  try {
+    require("./modules/efd/efdRetryQueue").start();
+  } catch (err) {
+    logger.error({ err: err.message }, "Failed to start EFD retry sweeper");
+  }
 });
 
 process.on("unhandledRejection", function (err) {

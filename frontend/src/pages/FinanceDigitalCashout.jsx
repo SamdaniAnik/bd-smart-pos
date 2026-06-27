@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import api from "../services/api";
 import SubmitButton from "../components/SubmitButton";
 import { notifyActionRequired, notifySuccess } from "../utils/notify";
+import SearchSelect from "../components/SearchSelect";
 
 const TRANSFER_METHOD_OPTIONS = ["Cash", "bKash", "Nagad", "Rocket", "Card", "Wallet"];
 
@@ -85,23 +86,23 @@ export default function FinanceDigitalCashout() {
       <form onSubmit={submit} className="form-grid page-card section-card" style={{ maxWidth: 720 }}>
         <label>
           From method
-          <select className="form-select-sm" value={form.fromMethod} onChange={(e) => setForm((p) => ({ ...p, fromMethod: e.target.value }))}>
-            {TRANSFER_METHOD_OPTIONS.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={form.fromMethod}
+            onChange={(val) => setForm((p) => ({ ...p, fromMethod: val || "bKash" }))}
+            options={TRANSFER_METHOD_OPTIONS.map((m) => ({ value: m, label: m }))}
+            isClearable={false}
+          />
         </label>
         <label>
           To method
-          <select className="form-select-sm" value={form.toMethod} onChange={(e) => setForm((p) => ({ ...p, toMethod: e.target.value }))}>
-            {TRANSFER_METHOD_OPTIONS.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={form.toMethod}
+            onChange={(val) => setForm((p) => ({ ...p, toMethod: val || "Cash" }))}
+            options={TRANSFER_METHOD_OPTIONS.map((m) => ({ value: m, label: m }))}
+            isClearable={false}
+          />
         </label>
         {sameMethod ? (
           <p style={{ gridColumn: "1 / -1", margin: 0, color: "#b42318", fontSize: 13, fontWeight: 600 }}>

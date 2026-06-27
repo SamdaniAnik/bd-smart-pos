@@ -3,22 +3,30 @@ import api from "../services/api";
 import DataTable from "../components/DataTable";
 import { notifyError, notifySuccess } from "../utils/notify";
 import { formatBDT } from "../utils/currency";
+import { formatSaleLineQtyDisplay, getBillingUnitsForSaleLine } from "../utils/formatSaleLineQty";
+import { getLang, t } from "../i18n";
 import {
   downloadMushak63XmlWithCompletenessHint,
   resolveSaleIdForMushak63Lookup,
   runMushak63CompletenessCheck,
 } from "../services/nbrMushak63";
+import SearchSelect from "../components/SearchSelect";
 
 const reportLang = () =>
   typeof window !== "undefined" && localStorage.getItem("bd_pos_lang") === "bn" ? "bn" : "en";
 const bdt = (v) => formatBDT(v, { lang: reportLang(), decimals: 2 });
+const tt = (key, params) => t(reportLang(), key, params);
 
 function SalesLookup() {
+  const [panel, setPanel] = useState("sale");
   const [query, setQuery] = useState("");
   const [lookupMode, setLookupMode] = useState("auto");
   const [loading, setLoading] = useState(false);
   const [sale, setSale] = useState(null);
   const [resolvedId, setResolvedId] = useState(null);
+  const [serialQuery, setSerialQuery] = useState("");
+  const [serialResult, setSerialResult] = useState(null);
+  const [serialLoading, setSerialLoading] = useState(false);
 
   const findSale = async (overrideQuery, overrideMode) => {
     const q = String(overrideQuery != null ? overrideQuery : query).trim();
@@ -49,12 +57,32 @@ function SalesLookup() {
     }
   };
 
+  const findSerial = async () => {
+    const q = serialQuery.trim();
+    if (q.length < 8) {
+      notifyError(tt("salesLookupSerialNotFound"));
+      return;
+    }
+    setSerialLoading(true);
+    setSerialResult(null);
+    try {
+      const res = await api.get("/serials/lookup", { params: { serial: q } });
+      setSerialResult(res.data);
+      notifySuccess(tt("salesLookupSerialLoaded", { saleId: res.data?.sale?.id || "" }));
+    } catch (err) {
+      notifyError(err?.response?.data?.error || tt("salesLookupSerialNotFound"));
+    } finally {
+      setSerialLoading(false);
+    }
+  };
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const inv = params.get("invoice");
     const sid = params.get("saleId");
     if (inv?.trim()) {
       const v = inv.trim();
+      setPanel("sale");
       setLookupMode("invoice");
       setQuery(v);
       void findSale(v, "invoice");
@@ -62,6 +90,7 @@ function SalesLookup() {
     }
     if (sid?.trim()) {
       const v = sid.trim();
+      setPanel("sale");
       setLookupMode("saleId");
       setQuery(v);
       void findSale(v, "saleId");
@@ -117,14 +146,48 @@ function SalesLookup() {
 
   const lineRows =
     sale && Array.isArray(sale.items)
-      ? sale.items.map((line, idx) => ({
-          sl: idx + 1,
-          name: line.product?.name || `Product #${line.productId}`,
-          qty: line.qty,
-          priceLabel: bdt(line.price),
-          lineTotalLabel: bdt(Number(line.qty || 0) * Number(line.price || 0)),
-        }))
+      ? sale.items.map((line, idx) => {
+          const bill = getBillingUnitsForSaleLine(line);
+          const revenue = bill * Number(line.price || 0);
+          const unitCost = Number(line.cost || 0);
+          const cogs = unitCost > 0 ? bill * unitCost : 0;
+          const margin = revenue - cogs;
+          const marginPct = revenue > 0 ? (margin / revenue) * 100 : 0;
+          const batchInfo = (line.batchAllocations || [])
+            .map((b) => {
+              const code = b.batch?.batchCode || `#${b.batchId}`;
+              const exp = b.batch?.expiryDate
+                ? new Date(b.batch.expiryDate).toLocaleDateString()
+                : "";
+              return exp ? `${code} (${exp})` : code;
+            })
+            .join(", ");
+          const serialInfo = line.serialNumber ? `IMEI: ${line.serialNumber}` : "";
+          const warrantyInfo =
+            line.warrantyUntil && line.serialNumber
+              ? new Date(line.warrantyUntil).toLocaleDateString()
+              : "";
+          return {
+            sl: idx + 1,
+            name: line.product?.name || `Product #${line.productId}`,
+            qty: formatSaleLineQtyDisplay(line, tt),
+            priceLabel: bdt(line.price),
+            costLabel: unitCost > 0 ? bdt(unitCost) : "—",
+            lineTotalLabel: bdt(revenue),
+            marginLabel: unitCost > 0 ? bdt(margin) : "—",
+            marginPctLabel: unitCost > 0 ? `${marginPct.toFixed(1)}%` : "—",
+            batches: [batchInfo, serialInfo, warrantyInfo ? `Warranty: ${warrantyInfo}` : ""].filter(Boolean).join(" · ") || "—",
+          };
+        })
       : [];
+
+  const warrantyLabel = () => {
+    if (!serialResult?.warrantyUntil) return tt("salesLookupNoWarranty");
+    const date = new Date(serialResult.warrantyUntil).toLocaleDateString();
+    return serialResult.warrantyActive
+      ? tt("salesLookupWarrantyActive", { date })
+      : tt("salesLookupWarrantyExpired", { date });
+  };
 
   return (
     <div className="page-stack">
@@ -136,36 +199,94 @@ function SalesLookup() {
       </div>
 
       <div className="page-card" style={{ marginBottom: 12 }}>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
-            Match by
-            <select className="form-select-sm" value={lookupMode} onChange={(e) => setLookupMode(e.target.value)} style={{ minWidth: 140 }}>
-              <option value="auto">Auto</option>
-              <option value="saleId">Sale ID</option>
-              <option value="invoice">Invoice number</option>
-            </select>
-          </label>
-          <input
-            type="text"
-            placeholder={
-              lookupMode === "saleId"
-                ? "Sale ID"
-                : lookupMode === "invoice"
-                  ? "Invoice number"
-                  : "Sale ID or invoice no."
-            }
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            style={{ width: 220 }}
-            onKeyDown={(e) => e.key === "Enter" && findSale()}
-          />
-          <button type="button" className="btn-primary btn-sm" onClick={() => findSale()} disabled={loading}>
-            {loading ? "Loading…" : "Find sale"}
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button
+            type="button"
+            className={`btn-secondary btn-sm${panel === "sale" ? " btn-primary" : ""}`}
+            onClick={() => setPanel("sale")}
+          >
+            Sale / invoice
+          </button>
+          <button
+            type="button"
+            className={`btn-secondary btn-sm${panel === "serial" ? " btn-primary" : ""}`}
+            onClick={() => setPanel("serial")}
+          >
+            {tt("salesLookupSerial")}
           </button>
         </div>
+
+        {panel === "sale" ? (
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+              Match by
+              <SearchSelect
+                className="form-select-sm"
+                value={lookupMode}
+                onChange={(val) => setLookupMode(val || "auto")}
+                options={[
+                  { value: "auto", label: "Auto" },
+                  { value: "saleId", label: "Sale ID" },
+                  { value: "invoice", label: "Invoice number" },
+                ]}
+                isClearable={false}
+              />
+            </label>
+            <input
+              type="text"
+              placeholder={
+                lookupMode === "saleId"
+                  ? "Sale ID"
+                  : lookupMode === "invoice"
+                    ? "Invoice number"
+                    : "Sale ID or invoice no."
+              }
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              style={{ width: 220 }}
+              onKeyDown={(e) => e.key === "Enter" && findSale()}
+            />
+            <button type="button" className="btn-primary btn-sm" onClick={() => findSale()} disabled={loading}>
+              {loading ? "Loading…" : "Find sale"}
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <input
+              type="text"
+              placeholder={tt("salesLookupSerialPlaceholder")}
+              value={serialQuery}
+              onChange={(e) => setSerialQuery(e.target.value)}
+              style={{ width: 260 }}
+              onKeyDown={(e) => e.key === "Enter" && findSerial()}
+            />
+            <button type="button" className="btn-primary btn-sm" onClick={findSerial} disabled={serialLoading}>
+              {serialLoading ? "Loading…" : tt("salesLookupSerialFind")}
+            </button>
+          </div>
+        )}
       </div>
 
-      {sale ? (
+      {panel === "serial" && serialResult ? (
+        <div className="page-card" style={{ marginBottom: 12 }}>
+          <p style={{ margin: "0 0 6px" }}>
+            <strong>{serialResult.product?.name}</strong> · {serialResult.serialNumber}
+          </p>
+          <p className="text-muted" style={{ margin: "0 0 6px", fontSize: 13 }}>
+            Sale #{serialResult.sale?.id}
+            {serialResult.sale?.invoiceNo ? ` · ${serialResult.sale.invoiceNo}` : ""} ·{" "}
+            {serialResult.soldAt ? new Date(serialResult.soldAt).toLocaleString() : ""}
+          </p>
+          {serialResult.sale?.customer ? (
+            <p className="text-muted" style={{ margin: "0 0 6px", fontSize: 13 }}>
+              {serialResult.sale.customer.name} · {serialResult.sale.customer.phone || "—"}
+            </p>
+          ) : null}
+          <p style={{ margin: 0 }}>{warrantyLabel()}</p>
+        </div>
+      ) : null}
+
+      {panel === "sale" && sale ? (
         <>
           <div className="page-card" style={{ marginBottom: 12 }}>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -176,54 +297,54 @@ function SalesLookup() {
                 Mushak 6.3 XML
               </button>
               <button type="button" className="btn-secondary btn-sm" onClick={checkCompleteness}>
-                Check Mushak completeness
+                Completeness check
               </button>
             </div>
-            <p className="text-muted" style={{ fontSize: 12, marginTop: 10 }}>
-              Internal sale id: <strong>{resolvedId}</strong>
-              {sale.mushakDocumentNo ? (
-                <>
-                  {" "}
-                  · Mushak ref: <strong>{sale.mushakDocumentNo}</strong>
-                </>
-              ) : null}
-            </p>
-            <div className="quick-stats" style={{ marginTop: 8 }}>
-              <div className="stat">Invoice: {sale.invoiceNo || "—"}</div>
-              <div className="stat">Date: {new Date(sale.createdAt).toLocaleString()}</div>
-              <div className="stat">Payment: {sale.paymentMethod || "—"}</div>
-              <div className="stat">Customer: {sale.customer?.name || "Walk-in"}</div>
-            </div>
-            <div className="quick-stats" style={{ marginTop: 8 }}>
-              <div className="stat">Subtotal: {bdt(sale.subTotal)}</div>
-              <div className="stat">VAT: {bdt(sale.vatAmount)}</div>
-              <div className="stat">Discount: {bdt(sale.discount)}</div>
-              <div className="stat" style={{ background: "#dcfce7" }}>
-                Total: {bdt(sale.total)}
+          </div>
+
+          <div className="page-card" style={{ marginBottom: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+              <div>
+                <div className="text-muted" style={{ fontSize: 12 }}>
+                  Sale ID
+                </div>
+                <strong>{resolvedId}</strong>
               </div>
-              <div className="stat">Paid: {bdt(sale.paidAmount)}</div>
-              <div className="stat">Due: {bdt(sale.dueAmount)}</div>
+              <div>
+                <div className="text-muted" style={{ fontSize: 12 }}>
+                  Invoice
+                </div>
+                <strong>{sale.invoiceNo || "—"}</strong>
+              </div>
+              <div>
+                <div className="text-muted" style={{ fontSize: 12 }}>
+                  Total
+                </div>
+                <strong>{bdt(sale.totalAmount ?? sale.total)}</strong>
+              </div>
+              <div>
+                <div className="text-muted" style={{ fontSize: 12 }}>
+                  Date
+                </div>
+                <strong>{sale.createdAt ? new Date(sale.createdAt).toLocaleString() : "—"}</strong>
+              </div>
             </div>
-            {sale.buyerBinOrNidNote ? (
-              <p style={{ fontSize: 13, marginTop: 8 }}>
-                <strong>Buyer BIN / NID note:</strong> {sale.buyerBinOrNidNote}
-              </p>
-            ) : null}
           </div>
 
           <DataTable
-            title="Line items"
-            rows={lineRows}
-            pageSize={10}
-            allowExport={false}
-            searchableKeys={["name"]}
             columns={[
-              { key: "sl", label: "SL" },
+              { key: "sl", label: "#", width: 40 },
               { key: "name", label: "Product" },
               { key: "qty", label: "Qty" },
               { key: "priceLabel", label: "Price" },
+              { key: "costLabel", label: "Cost" },
               { key: "lineTotalLabel", label: "Line total" },
+              { key: "marginLabel", label: "Margin" },
+              { key: "marginPctLabel", label: "Margin %" },
+              { key: "batches", label: "Batch / serial" },
             ]}
+            rows={lineRows}
+            emptyMessage="No line items"
           />
         </>
       ) : null}

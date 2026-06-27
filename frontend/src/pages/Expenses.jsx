@@ -1,10 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import useServerTable from "../hooks/useServerTable";
 import SubmitButton from "../components/SubmitButton";
-import { notifyActionRequired, notifySuccess } from "../utils/notify";
+import { notifyActionRequired, notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 function Expenses() {
   const [uiLang, setUiLang] = useState(() => getLang());
@@ -18,8 +22,15 @@ function Expenses() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canManageExpenses = hasPermission("expense.create");
 
-  const [rows, setRows] = useState([]);
+  const requireExpenseCreate = () => {
+    if (canManageExpenses) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "expense.create" }));
+    return false;
+  };
+
   const [costCenters, setCostCenters] = useState([]);
   const [form, setForm] = useState({
     category: "",
@@ -43,17 +54,32 @@ function Expenses() {
   });
   const fiscalBlocked = Boolean(fiscalGateData && fiscalGateData.ok === false);
 
-  const load = async () => {
-    const [res, ccRes] = await Promise.all([
-      api.get("/expenses"),
-      api.get("/cost-centers", { params: { active: 1 } }),
-    ]);
-    setRows(res.data);
-    setCostCenters(Array.isArray(ccRes.data) ? ccRes.data : []);
-  };
+  const fetchExpensePage = useCallback(async (q) => {
+    const res = await api.get("/expenses", {
+      params: {
+        paged: true,
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const expensesTable = useServerTable(fetchExpensePage, {
+    pageSize: 10,
+    sortKey: "expenseDate",
+    sortDir: "desc",
+  });
+  const rows = expensesTable.rows;
+  const load = expensesTable.refresh;
 
   useEffect(() => {
-    load();
+    api.get("/cost-centers", { params: { active: 1 } }).then((ccRes) => {
+      setCostCenters(Array.isArray(ccRes.data) ? ccRes.data : []);
+    });
   }, []);
 
   const resetForm = () => {
@@ -70,6 +96,7 @@ function Expenses() {
 
   const submit = async (e) => {
     e.preventDefault();
+    if (!requireExpenseCreate()) return;
     if (fiscalBlocked) {
       notifyActionRequired(fiscalGateData?.message || tt("posFiscalNoPeriod"));
       return;
@@ -118,6 +145,7 @@ function Expenses() {
   };
 
   const handleDelete = async (row) => {
+    if (!requireExpenseCreate()) return;
     if (!window.confirm(tt("expConfirmDelete", { id: row.id }))) return;
     await api.delete(`/expenses/${row.id}`);
     if (editingId === row.id) resetForm();
@@ -140,6 +168,7 @@ function Expenses() {
           <p>{fiscalGateData?.message || tt("posFiscalNoPeriod")}</p>
         </div>
       ) : null}
+      <PermissionBanner show={!canManageExpenses} code="expense.create" tt={tt} />
       <form onSubmit={submit} className="form-grid">
         <input
           placeholder={tt("expPhCategory")}
@@ -154,40 +183,37 @@ function Expenses() {
           onChange={(e) => setForm({ ...form, amount: e.target.value })}
           required
         />
-        <select
+        <SearchSelect
           className="form-select-sm"
           value={form.paymentMethod}
-          onChange={(e) => setForm({ ...form, paymentMethod: e.target.value })}
-        >
-          <option value="Cash">{tt("dashMethodCash")}</option>
-          <option value="Bank">{tt("expMethodBank")}</option>
-          <option value="bKash">bKash</option>
-          <option value="Nagad">Nagad</option>
-          <option value="Card">{tt("dashMethodCard")}</option>
-        </select>
+          onChange={(val) => setForm({ ...form, paymentMethod: val || "Cash" })}
+          options={[
+            { value: "Cash", label: tt("dashMethodCash") },
+            { value: "Bank", label: tt("expMethodBank") },
+            { value: "bKash", label: "bKash" },
+            { value: "Nagad", label: "Nagad" },
+            { value: "Card", label: tt("dashMethodCard") },
+          ]}
+          isClearable={false}
+        />
         <input
           type="date"
           value={form.expenseDate}
           onChange={(e) => setForm({ ...form, expenseDate: e.target.value })}
         />
-        <select
+        <SearchSelect
           className="form-select-sm"
           value={form.costCenterId}
-          onChange={(e) => setForm({ ...form, costCenterId: e.target.value })}
-        >
-          <option value="">{tt("expPhCostCenterOptional")}</option>
-          {costCenters.map((cc) => (
-            <option key={cc.id} value={cc.id}>
-              {cc.code} - {cc.name}
-            </option>
-          ))}
-        </select>
+          onChange={(val) => setForm({ ...form, costCenterId: val })}
+          placeholder={tt("expPhCostCenterOptional")}
+          options={costCenters.map((cc) => ({ value: cc.id, label: `${cc.code} - ${cc.name}` }))}
+        />
         <input
           placeholder={tt("expPhDescriptionOptional")}
           value={form.description}
           onChange={(e) => setForm({ ...form, description: e.target.value })}
         />
-        <SubmitButton loading={submitting} loadingLabel={editingId ? tt("settingsUpdating") : tt("settingsSaving")}>
+        <SubmitButton loading={submitting} loadingLabel={editingId ? tt("settingsUpdating") : tt("settingsSaving")} disabled={!canManageExpenses || fiscalBlocked}>
           {editingId ? tt("expBtnUpdate") : tt("expBtnAdd")}
         </SubmitButton>
         {editingId ? (
@@ -216,45 +242,48 @@ function Expenses() {
 
       <DataTable
         title={tt("expListTitle")}
+        serverMode
+        totalRows={expensesTable.total}
+        loading={expensesTable.loading}
+        onQueryChange={expensesTable.onQueryChange}
+        initialSort="expenseDate"
+        initialSortDir="desc"
+        pageSize={10}
         rows={rows.map((r) => ({
           ...r,
           expenseDateLabel: new Date(r.expenseDate).toLocaleDateString(),
           createdByName: r.creator?.name || r.creator?.email || "-",
           costCenterLabel: r.costCenter ? `${r.costCenter.code} - ${r.costCenter.name}` : "-",
         }))}
-        searchableKeys={["category", "paymentMethod", "expenseDateLabel", "createdByName", "costCenterLabel"]}
         filters={[
           {
             key: "paymentMethod",
             label: tt("expPaymentMethod"),
-            options: [...new Set(rows.map((x) => x.paymentMethod).filter(Boolean))].map((x) => ({
-              label: x,
-              value: x,
-            })),
-          },
-          {
-            key: "costCenterLabel",
-            label: tt("expCostCenter"),
-            options: [...new Set(rows.map((x) => (x.costCenter ? `${x.costCenter.code} - ${x.costCenter.name}` : "-")))]
-              .map((x) => ({ label: x, value: x })),
+            options: [
+              { value: "Cash", label: tt("dashMethodCash") },
+              { value: "Bank", label: tt("expMethodBank") },
+              { value: "bKash", label: "bKash" },
+              { value: "Nagad", label: "Nagad" },
+              { value: "Card", label: tt("dashMethodCard") },
+            ],
           },
         ]}
         columns={[
-          { key: "id", label: tt("colId") },
-          { key: "expenseDateLabel", label: tt("receiptDate") },
+          { key: "id", label: tt("colId"), searchable: false },
+          { key: "expenseDateLabel", label: tt("receiptDate"), searchable: false },
           { key: "category", label: tt("expCategory") },
-          { key: "amount", label: tt("receiptAmount"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "amount", label: tt("receiptAmount"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "paymentMethod", label: tt("expPayment") },
-          { key: "costCenterLabel", label: tt("expCostCenter") },
-          { key: "createdByName", label: tt("expCreatedBy") },
+          { key: "costCenterLabel", label: tt("expCostCenter"), searchable: false },
+          { key: "createdByName", label: tt("expCreatedBy"), searchable: false },
           {
             key: "actions",
             label: tt("colActions"),
             render: (_, row) => (
               <div style={{ display: "flex", gap: 6 }}>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => handleDetails(row)}>{tt("supBtnDetails")}</button>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => handleEdit(row)}>{tt("actionEdit")}</button>
-                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)}>{tt("actionDelete")}</button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => handleEdit(row)} disabled={!canManageExpenses}>{tt("actionEdit")}</button>
+                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)} disabled={!canManageExpenses}>{tt("actionDelete")}</button>
               </div>
             ),
           },

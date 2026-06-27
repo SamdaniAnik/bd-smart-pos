@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import Select from "react-select";
+import SearchSelect from "../components/SearchSelect";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import useServerTable from "../hooks/useServerTable";
 import SubmitButton from "../components/SubmitButton";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
-import { createSearchSelectStyles } from "../utils/selectStyles";
 import {
   notifyActionRequired,
   notifyError,
@@ -13,10 +13,13 @@ import {
   notifySuccess,
 } from "../utils/notify";
 import { getLang, t } from "../i18n";
+import { formatProductStockDisplay, formatSaleUnitBadge } from "../utils/formatSaleLineQty";
+import {
+  productNeedsExpiryOnPurchase,
+  suggestExpiryDateFromShelfLife,
+} from "../constants/retailDepartments";
 
 const PURCHASE_DRAFT_KEY = "bd_pos_purchase_draft_v1";
-const SEARCH_SELECT_STYLES = createSearchSelectStyles(38);
-
 const toInputDate = (date) => {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
@@ -63,7 +66,35 @@ function Purchases() {
     vatRate: "",
     vatType: "EXCLUSIVE",
     deferStockPosting: false,
+    productVariantId: "",
+    batchCode: "",
+    expiryDate: "",
   });
+
+  const purchaseLineKey = (line) =>
+    `${line.productId}-${line.productVariantId || 0}-${String(line.batchCode || "").trim()}`;
+
+  const productById = useMemo(() => new Map(products.map((p) => [Number(p.id), p])), [products]);
+  const selectedPurchaseProduct = productById.get(Number(form.productId)) || null;
+  const purchaseNeedsBatch = productNeedsExpiryOnPurchase(selectedPurchaseProduct);
+  const purchaseNeedsVariant = Boolean(
+    selectedPurchaseProduct?.hasVariants && selectedPurchaseProduct?.variants?.length
+  );
+
+  useEffect(() => {
+    if (!selectedPurchaseProduct || !purchaseNeedsBatch) return;
+    const suggested = suggestExpiryDateFromShelfLife(selectedPurchaseProduct);
+    if (!suggested) return;
+    setForm((f) => ({
+      ...f,
+      expiryDate: f.expiryDate || suggested,
+      batchCode:
+        f.batchCode ||
+        (selectedPurchaseProduct.batchTracked
+          ? ""
+          : `LOT-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}`),
+    }));
+  }, [form.productId, purchaseNeedsBatch, selectedPurchaseProduct?.id, selectedPurchaseProduct?.shelfLifeDays]);
   const [returnForm, setReturnForm] = useState({
     purchaseId: "",
     productId: "",
@@ -92,6 +123,10 @@ function Purchases() {
   });
   const [grnReceiveQtyByProduct, setGrnReceiveQtyByProduct] = useState({});
   const [purchasesTab, setPurchasesTab] = useState("create");
+  useEffect(() => {
+    if (purchasesTab === "history") purchasesHistory.refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [purchasesTab]);
   const [submittingPurchase, setSubmittingPurchase] = useState(false);
   const [submittingReturn, setSubmittingReturn] = useState(false);
   const [paymentSchedule, setPaymentSchedule] = useState({
@@ -137,6 +172,27 @@ function Purchases() {
   });
   const fiscalBlocked = Boolean(fiscalGateData && fiscalGateData.ok === false);
 
+  // Server-driven data source for the purchase-history table (backend search/sort/paging).
+  const fetchPurchasePage = useCallback(async (q) => {
+    const res = await api.get("/purchases", {
+      params: {
+        paged: true,
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const purchasesHistory = useServerTable(fetchPurchasePage, {
+    pageSize: 10,
+    sortKey: "createdAt",
+    sortDir: "desc",
+  });
+
   const load = useCallback(async () => {
     const query = new URLSearchParams();
     if (returnRange.from) query.set("from", returnRange.from);
@@ -146,7 +202,7 @@ function Purchases() {
       api.get("/purchases"),
       api.get(returnsUrl),
       api.get("/master/suppliers"),
-      api.get("/products"),
+      api.get("/products?include=variants"),
       api.get(`/purchases/optimization?days=${optimizationDays}&leadDays=${optimizationLeadDays}`),
       api.get("/purchases/plan-approvals"),
       api.get(`/purchases/supplier-scorecards?days=${Number(supplierScorecardDays || 60)}`),
@@ -219,10 +275,13 @@ function Purchases() {
   );
   const productOptions = useMemo(
     () =>
-      products.map((p) => ({
-        value: String(p.id),
-        label: p.name,
-      })),
+      products.map((p) => {
+        const unit = formatSaleUnitBadge(p, tt);
+        return {
+          value: String(p.id),
+          label: unit ? `${p.name} · ${unit}` : p.name,
+        };
+      }),
     [products]
   );
   const returnPurchaseOptions = useMemo(
@@ -329,8 +388,11 @@ function Purchases() {
         ? [
             {
               productId: Number(form.productId),
+              productVariantId: form.productVariantId ? Number(form.productVariantId) : null,
               qty: Number(form.qty),
               cost: Number(form.cost || 0),
+              batchCode: form.batchCode ? String(form.batchCode).trim() : null,
+              expiryDate: form.expiryDate || null,
               vatRate: Number(form.vatRate || productVatById.get(Number(form.productId)) || 0),
               vatType: String(form.vatType || "EXCLUSIVE").toUpperCase(),
             },
@@ -339,8 +401,11 @@ function Purchases() {
     const draftLines = draftItems
       .map((x) => ({
         productId: Number(x.productId),
+        productVariantId: x.productVariantId ? Number(x.productVariantId) : null,
         qty: Number(x.qty || 0),
         cost: Number(x.cost || 0),
+        batchCode: x.batchCode ? String(x.batchCode).trim() : null,
+        expiryDate: x.expiryDate || null,
         vatRate: Number(
           x.vatRate != null ? x.vatRate : productVatById.get(Number(x.productId)) || 0
         ),
@@ -349,11 +414,12 @@ function Purchases() {
       .filter((x) => x.productId && x.qty > 0);
     const lineMap = new Map();
     for (const line of [...manualLine, ...draftLines]) {
-      if (!lineMap.has(line.productId)) {
-        lineMap.set(line.productId, { ...line });
+      const key = purchaseLineKey(line);
+      if (!lineMap.has(key)) {
+        lineMap.set(key, { ...line });
       } else {
-        const prev = lineMap.get(line.productId);
-        lineMap.set(line.productId, {
+        const prev = lineMap.get(key);
+        lineMap.set(key, {
           ...prev,
           qty: Number(prev.qty || 0) + Number(line.qty || 0),
           cost: Number(line.cost || prev.cost || 0),
@@ -400,6 +466,9 @@ function Purchases() {
         vatRate: "",
         vatType: "EXCLUSIVE",
         deferStockPosting: false,
+        productVariantId: "",
+        batchCode: "",
+        expiryDate: "",
       });
       setDraftItems([]);
       localStorage.removeItem(PURCHASE_DRAFT_KEY);
@@ -661,8 +730,8 @@ function Purchases() {
     notifySuccess(tt("purSuccessAppliedDraft", { n: next.length }));
   };
 
-  const removeDraftItem = (productId) => {
-    const next = draftItems.filter((x) => Number(x.productId) !== Number(productId));
+  const removeDraftItem = (lineKey) => {
+    const next = draftItems.filter((x) => purchaseLineKey(x) !== lineKey);
     setDraftItems(next);
     localStorage.setItem(PURCHASE_DRAFT_KEY, JSON.stringify(next));
   };
@@ -1149,7 +1218,11 @@ function Purchases() {
             { key: "rowNo", label: tt("colId") },
             { key: "productName", label: tt("invColProduct") },
             { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
-            { key: "stock", label: tt("prodLblStock") },
+            {
+              key: "stock",
+              label: tt("prodLblStock"),
+              render: (_, row) => row.stockDisplay || formatProductStockDisplay(row, tt),
+            },
             { key: "recommendedQty", label: tt("purColRecommended") },
             {
               key: "plannedQty",
@@ -1317,9 +1390,13 @@ function Purchases() {
           )}
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {draftSuggestions.map((x) => (
-              <div key={`draft-${x.productId}`} style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+              <div key={`draft-${purchaseLineKey(x)}`} style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                 <span>
-                  {x.productName || tt("purProductNum", { n: x.productId })} · {tt("purDraftQtyLabel")}{" "}
+                  {x.productName || tt("purProductNum", { n: x.productId })}
+                  {x.batchCode ? ` · ${tt("purBatchLabel")} ${x.batchCode}` : ""}
+                  {x.expiryDate ? ` · ${tt("purExpiryLabel")} ${x.expiryDate}` : ""}
+                  {" · "}
+                  {tt("purDraftQtyLabel")}{" "}
                   {Number(x.qty || 0)} · {tt("purDraftCostLabel")} ৳
                   {Number(x.cost || 0).toFixed(2)}
                   {" · "}
@@ -1368,7 +1445,7 @@ function Purchases() {
                       {tt("purUseBestSupplier")}
                     </button>
                   ) : null}
-                  <button type="button" className="btn-secondary btn-sm" onClick={() => removeDraftItem(x.productId)}>
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => removeDraftItem(purchaseLineKey(x))}>
                     {tt("purRemove")}
                   </button>
                 </div>
@@ -1391,15 +1468,11 @@ function Purchases() {
       ) : null}
       {purchasesTab === "create" ? (
       <form onSubmit={submit} className="form-grid">
-        <Select
-          className="form-select-sm"
-          value={supplierOptions.find((opt) => opt.value === String(form.supplierId)) || null}
-          options={supplierOptions}
-          onChange={(opt) => setForm({ ...form, supplierId: opt?.value || "" })}
+        <SearchSelect
+          kind="suppliers"
+          value={form.supplierId}
+          onChange={(val) => setForm({ ...form, supplierId: val })}
           placeholder={tt("purPhSelectSupplier")}
-          isClearable
-          isSearchable
-          styles={SEARCH_SELECT_STYLES}
         />
         <input
           placeholder={tt("purPhInvoiceNo")}
@@ -1408,22 +1481,21 @@ function Purchases() {
         />
         <label style={{ gridColumn: "1 / -1", display: "flex", flexDirection: "column", gap: 6 }}>
           <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>{tt("purLblFinancing")}</span>
-          <select
-            className="form-select-sm"
+          <SearchSelect
             value={form.financingSource}
-            onChange={(e) =>
+            onChange={(val) =>
               setForm({
                 ...form,
-                financingSource: e.target.value,
-                ...(e.target.value !== "BANK_LOAN"
-                  ? { loanReference: "", loanNote: "", loanMaturityDate: "" }
-                  : {}),
+                financingSource: val || "SUPPLIER_CREDIT",
+                ...(val !== "BANK_LOAN" ? { loanReference: "", loanNote: "", loanMaturityDate: "" } : {}),
               })
             }
-          >
-            <option value="SUPPLIER_CREDIT">{tt("purFinSupplierCredit")}</option>
-            <option value="BANK_LOAN">{tt("purFinBankLoan")}</option>
-          </select>
+            options={[
+              { value: "SUPPLIER_CREDIT", label: tt("purFinSupplierCredit") },
+              { value: "BANK_LOAN", label: tt("purFinBankLoan") },
+            ]}
+            isClearable={false}
+          />
         </label>
         {form.financingSource === "BANK_LOAN" ? (
           <>
@@ -1480,42 +1552,76 @@ function Purchases() {
           value={form.extraOtherCost}
           onChange={(e) => setForm({ ...form, extraOtherCost: e.target.value })}
         />
-        <Select
-          className="form-select-sm"
-          value={productOptions.find((opt) => opt.value === String(form.productId)) || null}
-          options={productOptions}
-          onChange={(opt) => {
-            const productId = Number(opt?.value || 0);
+        <SearchSelect
+          kind="products"
+          value={form.productId}
+          onChange={(val) => {
+            const productId = Number(val || 0);
             const recommendation = optimizationRows.find((x) => Number(x.productId) === productId);
-            setForm({
-              ...form,
-              productId: opt?.value || "",
+            setForm((prev) => ({
+              ...prev,
+              productId: val || "",
               supplierId:
-                recommendation?.bestSupplier?.supplierId && !form.supplierId
+                recommendation?.bestSupplier?.supplierId && !prev.supplierId
                   ? String(recommendation.bestSupplier.supplierId)
-                  : form.supplierId,
+                  : prev.supplierId,
               qty:
                 recommendation?.recommendedQty && Number(recommendation.recommendedQty) > 0
                   ? String(recommendation.recommendedQty)
-                  : form.qty,
+                  : prev.qty,
               cost:
                 recommendation?.bestSupplier?.avgCost && Number(recommendation.bestSupplier.avgCost) > 0
                   ? String(recommendation.bestSupplier.avgCost)
-                  : form.cost,
+                  : prev.cost,
               vatRate: productId ? String(productVatById.get(productId) || 0) : "",
               vatType: "EXCLUSIVE",
-            });
+            }));
+          }}
+          onOptionChange={(opt) => {
+            const productId = Number(opt?.value || 0);
+            if (!productId || productVatById.has(productId)) return;
+            const vatFromRaw = Number(opt?.raw?.vatRate || 0);
+            if (Number.isFinite(vatFromRaw)) {
+              setForm((prev) =>
+                String(prev.productId) === String(productId)
+                  ? { ...prev, vatRate: String(vatFromRaw) }
+                  : prev
+              );
+            }
           }}
           placeholder={tt("purPhSelectProduct")}
-          isClearable
-          isSearchable
-          styles={SEARCH_SELECT_STYLES}
         />
         <input
           placeholder={tt("purPhQuantity")}
           value={form.qty}
           onChange={(e) => setForm({ ...form, qty: e.target.value })}
         />
+        {purchaseNeedsVariant ? (
+          <SearchSelect
+            value={form.productVariantId}
+            onChange={(val) => setForm({ ...form, productVariantId: val || "" })}
+            placeholder={tt("posPickVariant")}
+            options={(selectedPurchaseProduct.variants || []).map((v) => ({
+              value: String(v.id),
+              label: v.label || v.sku || `#${v.id}`,
+            }))}
+          />
+        ) : null}
+        {purchaseNeedsBatch ? (
+          <>
+            <input
+              placeholder={tt("purPhBatchCode")}
+              value={form.batchCode}
+              onChange={(e) => setForm({ ...form, batchCode: e.target.value })}
+            />
+            <input
+              type="date"
+              placeholder={tt("purPhExpiry")}
+              value={form.expiryDate}
+              onChange={(e) => setForm({ ...form, expiryDate: e.target.value })}
+            />
+          </>
+        ) : null}
         <input
           placeholder={tt("purPhUnitCostShort")}
           value={form.cost}
@@ -1529,14 +1635,15 @@ function Purchases() {
           value={form.vatRate}
           onChange={(e) => setForm({ ...form, vatRate: e.target.value })}
         />
-        <select
-          className="form-select-sm"
+        <SearchSelect
           value={form.vatType}
-          onChange={(e) => setForm({ ...form, vatType: e.target.value })}
-        >
-          <option value="EXCLUSIVE">{tt("purVatExclusiveOpt")}</option>
-          <option value="INCLUSIVE">{tt("purVatInclusiveOpt")}</option>
-        </select>
+          onChange={(val) => setForm({ ...form, vatType: val || "EXCLUSIVE" })}
+          isClearable={false}
+          options={[
+            { value: "EXCLUSIVE", label: tt("purVatExclusiveOpt") },
+            { value: "INCLUSIVE", label: tt("purVatInclusiveOpt") },
+          ]}
+        />
         <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <input
             type="checkbox"
@@ -1591,33 +1698,25 @@ function Purchases() {
       {purchasesTab === "history" ? <h4 style={{ marginTop: 8 }}>{tt("purReturnSectionTitle")}</h4> : null}
       {purchasesTab === "history" ? (
       <form onSubmit={submitReturn} className="form-grid">
-        <Select
-          className="form-select-sm"
-          value={returnPurchaseOptions.find((opt) => opt.value === String(returnForm.purchaseId)) || null}
-          options={returnPurchaseOptions}
-          onChange={(opt) =>
+        <SearchSelect
+          kind="purchases"
+          value={returnForm.purchaseId}
+          onChange={(val) =>
             setReturnForm({
               ...returnForm,
-              purchaseId: opt?.value || "",
+              purchaseId: val || "",
               productId: "",
               qty: "",
               cost: "",
             })
           }
           placeholder={tt("purPhSelectPurchase")}
-          isClearable
-          isSearchable
-          styles={SEARCH_SELECT_STYLES}
         />
-        <Select
-          className="form-select-sm"
-          value={returnProductOptions.find((opt) => opt.value === String(returnForm.productId)) || null}
-          options={returnProductOptions}
-          onChange={(opt) => setReturnForm({ ...returnForm, productId: opt?.value || "" })}
+        <SearchSelect
+          value={returnForm.productId}
+          onChange={(val) => setReturnForm({ ...returnForm, productId: val || "" })}
           placeholder={tt("purPhSelectProduct")}
-          isClearable
-          isSearchable
-          styles={SEARCH_SELECT_STYLES}
+          options={returnProductOptions}
         />
         <input
           placeholder={tt("purPhReturnQty")}
@@ -1711,7 +1810,14 @@ function Purchases() {
       {purchasesTab === "history" ? (
       <DataTable
         title={tt("purDtPurchaseHistory")}
-        rows={purchases.map((p) => ({
+        serverMode
+        totalRows={purchasesHistory.total}
+        loading={purchasesHistory.loading}
+        onQueryChange={purchasesHistory.onQueryChange}
+        initialSort="createdAt"
+        initialSortDir="desc"
+        pageSize={10}
+        rows={purchasesHistory.rows.map((p) => ({
           ...p,
           supplierName: p.supplier?.name || "-",
           createdAtLabel: new Date(p.createdAt).toLocaleString(),
@@ -1723,35 +1829,24 @@ function Purchases() {
           vendorBillStatus: String(p.vendorBill?.status || "DRAFT"),
           financeLabel: String(p.financingSource || "SUPPLIER_CREDIT").toUpperCase() === "BANK_LOAN" ? tt("purFinanceLoan") : tt("purFinanceCredit"),
         }))}
-        searchableKeys={["supplierName", "invoiceNo", "createdAtLabel", "financeLabel"]}
-        filters={[
-          {
-            key: "supplierName",
-            label: tt("purColSupplier"),
-            options: [...new Set(purchases.map((p) => p.supplier?.name).filter(Boolean))].map((x) => ({
-              label: x,
-              value: x,
-            })),
-          },
-        ]}
         columns={[
-          { key: "id", label: tt("colId") },
-          { key: "createdAtLabel", label: tt("receiptDate") },
+          { key: "id", label: tt("colId"), searchable: false },
+          { key: "createdAtLabel", label: tt("receiptDate"), searchable: false },
           { key: "supplierName", label: tt("purColSupplier") },
           { key: "invoiceNo", label: tt("receiptInvoice"), render: (v) => v || "-" },
-          { key: "financeLabel", label: tt("purColFinance"), render: (v) => v || "-" },
-          { key: "total", label: tt("receiptTotal"), render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "transportationCost", label: tt("purColTransportationCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "bribesCost", label: tt("purColBribesCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "extraOtherCost", label: tt("purColExtraOtherCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "taxableAmount", label: tt("purColTaxable"), render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "inputVat", label: tt("purColInputVat"), render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "grossAmount", label: tt("purColGross"), render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "receiveStatus", label: tt("purColReceiveStatus"), render: (v) => v || "-" },
-          { key: "vendorBillStatus", label: tt("purColVendorBillStatus"), render: (v) => v || "DRAFT" },
-          { key: "remainingQty", label: tt("purColPendingQty"), render: (v) => Number(v || 0) },
-          { key: "paidAmount", label: tt("dashPaid"), render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "dueAmount", label: tt("dashDue"), render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "financeLabel", label: tt("purColFinance"), searchable: false, render: (v) => v || "-" },
+          { key: "total", label: tt("receiptTotal"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "transportationCost", label: tt("purColTransportationCost"), searchable: false, render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "bribesCost", label: tt("purColBribesCost"), searchable: false, render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "extraOtherCost", label: tt("purColExtraOtherCost"), searchable: false, render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "taxableAmount", label: tt("purColTaxable"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "inputVat", label: tt("purColInputVat"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "grossAmount", label: tt("purColGross"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "receiveStatus", label: tt("purColReceiveStatus"), searchable: false, render: (v) => v || "-" },
+          { key: "vendorBillStatus", label: tt("purColVendorBillStatus"), searchable: false, render: (v) => v || "DRAFT" },
+          { key: "remainingQty", label: tt("purColPendingQty"), searchable: false, render: (v) => Number(v || 0) },
+          { key: "paidAmount", label: tt("dashPaid"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "dueAmount", label: tt("dashDue"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
           {
             key: "actions",
             label: tt("colActions"),

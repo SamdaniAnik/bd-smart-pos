@@ -7,6 +7,12 @@ const helmetMiddleware = helmet({
   // so a strict default CSP is fine. Tweak via env later if needed.
   contentSecurityPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
+  // Force HTTPS for a year (incl. subdomains) once a client has seen us on TLS.
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  // Don't leak full URLs to third-party origins via the Referer header.
+  referrerPolicy: { policy: "no-referrer" },
+  // Disallow the API from being framed (clickjacking defense).
+  frameguard: { action: "deny" },
 });
 
 function buildOriginChecker() {
@@ -50,9 +56,29 @@ const bootstrapRateLimiter = rateLimit({
   message: { error: "Too many seed attempts. Try again later." },
 });
 
+// Generous global ceiling so a single abusive IP can't flood the whole API.
+const apiRateLimiter = rateLimit({
+  windowMs: config.rateLimit.apiWindowMs,
+  max: config.rateLimit.apiMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please slow down." },
+});
+
+// Strict ceiling for unauthenticated OTP requests (SMS cost / OTP bombing).
+const otpRateLimiter = rateLimit({
+  windowMs: config.rateLimit.otpWindowMs,
+  max: config.rateLimit.otpMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many OTP requests. Try again later." },
+});
+
 module.exports = {
   helmetMiddleware,
   corsOptions,
   loginRateLimiter,
   bootstrapRateLimiter,
+  apiRateLimiter,
+  otpRateLimiter,
 };

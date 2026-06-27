@@ -28,6 +28,16 @@ function LoyaltyDashboard() {
     campaigns: [],
     latestQueue: [],
   });
+  const [pointsExpiry, setPointsExpiry] = useState({
+    summary: {
+      pointsExpiryDays: 365,
+      expiryEnabled: true,
+      customersWithExpiringSoon: 0,
+      totalExpiringSoonPoints: 0,
+      totalExpiredPoints: 0,
+    },
+    rows: [],
+  });
 
   const exportFile = async (url, filename) => {
     const res = await api.get(url, { responseType: "blob" });
@@ -80,21 +90,52 @@ function LoyaltyDashboard() {
     if (range.from) q.set("from", range.from);
     if (range.to) q.set("to", range.to);
     const redemptionUrl = q.toString() ? `/sales/loyalty/redemptions?${q.toString()}` : "/sales/loyalty/redemptions";
-    const [rankRes, redeemRes, retentionRes, automationRes] = await Promise.all([
+    const [rankRes, redeemRes, retentionRes, automationRes, expiryRes] = await Promise.all([
       api.get("/master/customers/loyalty"),
       api.get(redemptionUrl),
       api.get("/master/customers/retention"),
       api.get("/master/customers/retention/automation"),
+      api.get("/master/customers/loyalty/points-expiry?filter=expiring"),
     ]);
     setRanking(rankRes.data || []);
     setRedemptions(redeemRes.data || { rows: [], summary: {} });
     setRetention(retentionRes.data || { summary: {}, atRiskCustomers: [], upcomingBirthdays: [] });
     setAutomation(automationRes.data || { summary: { campaigns: 0, totalQueued: 0 }, campaigns: [], latestQueue: [] });
+    setPointsExpiry(
+      expiryRes.data || {
+        summary: {
+          pointsExpiryDays: 365,
+          expiryEnabled: true,
+          customersWithExpiringSoon: 0,
+          totalExpiringSoonPoints: 0,
+          totalExpiredPoints: 0,
+        },
+        rows: [],
+      }
+    );
   }, [range.from, range.to]);
 
   const runRetentionAutomation = async (segment) => {
     await api.post("/master/customers/retention/automation", { segment, birthdayWindowDays: 7, maxCustomers: 100 });
     await load();
+  };
+
+  const [dispatchingId, setDispatchingId] = useState(null);
+  const dispatchRetentionSms = async (automationId, totalQueued) => {
+    if (!window.confirm(`Send SMS to ${totalQueued} queued customer(s)? Bangla messages use 70 chars per SMS segment.`)) return;
+    setDispatchingId(automationId);
+    try {
+      const res = await api.post(`/master/customers/retention/automation/${automationId}/dispatch`, {});
+      const s = res.data?.summary || {};
+      window.alert(
+        `${res.data?.message || "Dispatch completed"}\nSent: ${s.sent || 0} · Simulated: ${s.simulated || 0} · Failed: ${s.failed || 0} · Segments: ${s.totalSegments || 0}`
+      );
+      await load();
+    } catch (error) {
+      window.alert(error?.response?.data?.error || "SMS dispatch failed");
+    } finally {
+      setDispatchingId(null);
+    }
   };
 
   useEffect(() => {
@@ -197,7 +238,34 @@ function LoyaltyDashboard() {
         <div className="stat">Marketing Opt-in: {Number(retention.summary?.marketingOptInCount || 0)}</div>
         <div className="stat">Automations: {Number(automation.summary?.campaigns || 0)}</div>
         <div className="stat">Queued Contacts: {Number(automation.summary?.totalQueued || 0)}</div>
+        <div className="stat">Expiring soon: {Number(pointsExpiry.summary?.totalExpiringSoonPoints || 0)} pts</div>
+        <div className="stat">Expired: {Number(pointsExpiry.summary?.totalExpiredPoints || 0)} pts</div>
       </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+        <button
+          type="button"
+          className="btn-secondary btn-sm"
+          onClick={() => exportFile("/master/customers/loyalty/points-expiry/export.csv?filter=expiring", "loyalty-points-expiry.csv")}
+        >
+          Export expiring points CSV
+        </button>
+      </div>
+
+      <DataTable
+        title="Points expiring soon"
+        rows={(pointsExpiry.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+        searchableKeys={["name", "phone"]}
+        columns={[
+          { key: "rowNo", label: "ID" },
+          { key: "name", label: "Customer" },
+          { key: "phone", label: "Phone", render: (v) => v || "—" },
+          { key: "availablePoints", label: "Available", render: (v) => Number(v || 0).toFixed(0) },
+          { key: "expiringSoonPoints", label: "Expiring soon", render: (v) => Number(v || 0).toFixed(0) },
+          { key: "expiredPoints", label: "Expired", render: (v) => Number(v || 0).toFixed(0) },
+          { key: "loyaltyTier", label: "Tier" },
+        ]}
+      />
 
       <DataTable
         title="Top Loyalty Customers"
@@ -209,6 +277,7 @@ function LoyaltyDashboard() {
           { key: "phone", label: "Phone", render: (v) => v || "-" },
           { key: "loyaltyTier", label: "Tier" },
           { key: "loyaltyPoints", label: "Available Points", render: (v) => Number(v || 0).toFixed(0) },
+          { key: "loyaltyExpiringSoonPoints", label: "Expiring soon", render: (v) => Number(v || 0).toFixed(0) },
           { key: "loyaltyTotalSpent", label: "Total Spent", render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           { key: "loyaltyOrders", label: "Orders" },
         ]}
@@ -296,6 +365,29 @@ function LoyaltyDashboard() {
           { key: "birthdayCount", label: "Birthday" },
           { key: "generatedBy", label: "Generated By", render: (v) => v || "-" },
           { key: "generatedAt", label: "Generated At", render: (v) => (v ? new Date(v).toLocaleString() : "-") },
+          {
+            key: "actions",
+            label: "SMS",
+            render: (_v, row) =>
+              row.dispatchedAt ? (
+                <span title={`Provider: ${row.dispatchProvider || "-"} · ${new Date(row.dispatchedAt).toLocaleString()}`}>
+                  {Number(row.smsFailed || 0) > 0
+                    ? `Sent ${row.smsSent + row.smsSimulated}/${row.smsSent + row.smsSimulated + row.smsFailed}`
+                    : row.smsSimulated > 0
+                      ? `Simulated (${row.smsSimulated})`
+                      : `Sent (${row.smsSent})`}
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={dispatchingId === row.id || !Number(row.totalQueued || 0)}
+                  onClick={() => dispatchRetentionSms(row.id, row.totalQueued)}
+                >
+                  {dispatchingId === row.id ? "Sending..." : "Send SMS"}
+                </button>
+              ),
+          },
         ]}
       />
 

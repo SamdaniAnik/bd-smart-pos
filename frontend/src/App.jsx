@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import POS from "./pages/POS";
 import Dashboard from "./pages/Dashboard";
 import Inventory from "./pages/Inventory";
@@ -5,6 +6,9 @@ import Warehouses from "./pages/Warehouses";
 import Purchases from "./pages/Purchases";
 import Expenses from "./pages/Expenses";
 import DueCollection from "./pages/DueCollection";
+import Installments from "./pages/Installments";
+import ImeiRegistry from "./pages/ImeiRegistry";
+import ExpiryMarkdown from "./pages/ExpiryMarkdown";
 import Accounting from "./pages/Accounting";
 import Reports from "./pages/Reports";
 import Settings from "./pages/Settings";
@@ -19,6 +23,7 @@ import ApprovalQueue from "./pages/ApprovalQueue";
 import StockCount from "./pages/StockCount";
 import Quotations from "./pages/Quotations";
 import Promotions from "./pages/Promotions";
+import Prescriptions from "./pages/Prescriptions";
 import GiftCards from "./pages/GiftCards";
 import FinanceSettlements from "./pages/FinanceSettlements";
 import FinanceDigitalCashout from "./pages/FinanceDigitalCashout";
@@ -30,16 +35,44 @@ import CostCenters from "./pages/CostCenters";
 import PettyCash from "./pages/PettyCash";
 import IntegrationWebhooks from "./pages/IntegrationWebhooks";
 import SalesLookup from "./pages/SalesLookup";
+import OrderInbox from "./pages/OrderInbox";
+import Fcommerce from "./pages/Fcommerce";
+import TopupBills from "./pages/TopupBills";
+import Restaurant from "./pages/Restaurant";
+import Manufacturing from "./pages/Manufacturing";
 import CustomerDisplay from "./pages/CustomerDisplay";
+import Storefront from "./pages/Storefront";
+import LoyaltyCard from "./pages/LoyaltyCard";
+import WarrantyClaims from "./pages/WarrantyClaims";
 import { isCustomerDisplayRoute } from "./services/customerDisplay";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isStorefrontRoute } from "./services/storefront";
+import { isLoyaltyRoute } from "./services/loyaltyPublic";
+import useHashRoute from "./hooks/useHashRoute";
+import useMediaQuery from "./hooks/useMediaQuery";
 import api from "./services/api";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import ToastHost from "./components/ToastHost";
-import { t } from "./i18n";
-import { getStoredPermissions, hasPermission } from "./utils/permissions";
+import { t, setTermOverrides } from "./i18n";
+import { getStoredPermissions, setStoredPermissions, hasPermission } from "./utils/permissions";
 import SubmitButton from "./components/SubmitButton";
 import { notifyError } from "./utils/notify";
+import PageAccessDenied from "./components/PageAccessDenied";
+import {
+  APP_PAGES,
+  PAGE_GROUPS,
+  canAccessPage,
+  getPageDef,
+  listAccessiblePages,
+} from "./config/pagePermissions";
+import {
+  BUSINESS_TYPES,
+  BUSINESS_TYPE_STORAGE_KEY,
+  buildTermOverrides,
+  getDefaultViewForBusiness,
+  isPageVisibleForBusiness,
+  mapBusinessTypeToProfile,
+  readBusinessType,
+} from "./config/businessTypes";
 
 const readNavPins = () => {
   try {
@@ -52,18 +85,6 @@ const readNavPins = () => {
   }
 };
 
-function useHashRoute() {
-  const read = () =>
-    typeof window === "undefined" ? "" : String(window.location.hash || "");
-  const [hash, setHash] = useState(read);
-  useEffect(() => {
-    const onChange = () => setHash(read());
-    window.addEventListener("hashchange", onChange);
-    return () => window.removeEventListener("hashchange", onChange);
-  }, []);
-  return hash;
-}
-
 function MainApp() {
   const [view, setView] = useState(localStorage.getItem("bd_pos_last_view") || "dashboard");
   const [menuQuery, setMenuQuery] = useState("");
@@ -71,79 +92,43 @@ function MainApp() {
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const [loginSubmitting, setLoginSubmitting] = useState(false);
   const token = localStorage.getItem("bd_pos_token");
-  const permissions = getStoredPermissions();
+  const [permissions, setPermissions] = useState(() => getStoredPermissions());
   const userJson = localStorage.getItem("bd_pos_user");
   const user = userJson ? JSON.parse(userJson) : null;
   const branchId = localStorage.getItem("bd_pos_branch_id") || "1";
   const menuSearchRef = useRef(null);
+  const permissionsBootstrappedRef = useRef(false);
   const [navPins, setNavPins] = useState(readNavPins);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [navMobileOpen, setNavMobileOpen] = useState(false);
+  const isMobileNav = useMediaQuery("(max-width: 1024px)");
+  const [businessType, setBusinessType] = useState(readBusinessType);
+  // Don't show the setup modal until we've checked the branch for a shared type.
+  const [bizReady, setBizReady] = useState(() => Boolean(readBusinessType()));
+
+  // Apply business-type term overrides during render so children (menu, POS,
+  // page titles) read the relabeled strings on the same pass.
+  useMemo(() => {
+    setTermOverrides(buildTermOverrides(businessType));
+    return null;
+  }, [businessType]);
 
   const sectionsByPerm = useMemo(() => {
-    const canSeePos = hasPermission("sale.create", permissions) || hasPermission("sale.view", permissions);
-    const baseSections = [
-      {
-        title: t(lang, "navGroupDaily"),
-        items: [
-          { key: "dashboard", label: t(lang, "dashboard"), hint: t(lang, "hintDashboard"), icon: "📊", perm: "report.view" },
-          { key: "pos", label: t(lang, "pos"), hint: t(lang, "hintPos"), icon: "🛒", perm: canSeePos },
-          { key: "returns", label: t(lang, "salesReturns"), hint: t(lang, "hintReturns"), icon: "↩️", perm: "sale.return" },
-          { key: "quotations", label: t(lang, "quotations"), hint: t(lang, "hintQuotations"), icon: "📄", perm: canSeePos },
-          { key: "shifts", label: t(lang, "shifts"), hint: t(lang, "hintShifts"), icon: "🧮", perm: canSeePos },
-        ],
-      },
-      {
-        title: t(lang, "navGroupInventory"),
-        items: [
-          { key: "products", label: t(lang, "products"), hint: t(lang, "hintProducts"), icon: "🧷", perm: "product.view" },
-          { key: "inventory", label: t(lang, "inventory"), hint: t(lang, "hintInventory"), icon: "📦", perm: "inventory.view" },
-          { key: "stockCount", label: t(lang, "stockCount"), hint: t(lang, "hintStockCount"), icon: "🧾", perm: "inventory.adjust" },
-          { key: "warehouses", label: t(lang, "warehouses"), hint: t(lang, "hintWarehouses"), icon: "🏬", perm: "inventory.view" },
-          { key: "purchases", label: t(lang, "purchases"), hint: t(lang, "hintPurchases"), icon: "🧾", perm: "purchase.view" },
-          { key: "promotions", label: t(lang, "promotions"), hint: t(lang, "hintPromotions"), icon: "🏷️", perm: "product.create" },
-          { key: "suppliers", label: t(lang, "suppliers"), hint: t(lang, "hintSuppliers"), icon: "🚚", perm: "supplier.view" },
-          { key: "customers", label: t(lang, "customers"), hint: t(lang, "hintCustomers"), icon: "👥", perm: "customer.view" },
-          { key: "giftCards", label: t(lang, "giftCards"), hint: t(lang, "hintGiftCards"), icon: "🎫", perm: "customer.view" },
-        ],
-      },
-      {
-        title: t(lang, "navGroupFinance"),
-        items: [
-          { key: "expenses", label: t(lang, "expenses"), hint: t(lang, "hintExpenses"), icon: "💸", perm: "expense.view" },
-          { key: "dueCollection", label: t(lang, "dueCollection"), hint: t(lang, "hintDueCollection"), icon: "💳", perm: "report.view" },
-          { key: "salesLookup", label: t(lang, "salesLookup"), hint: t(lang, "hintSalesLookup"), icon: "🔎", perm: "sale.view" },
-          { key: "loyalty", label: t(lang, "loyalty"), hint: t(lang, "hintLoyalty"), icon: "🎁", perm: "customer.view" },
-          { key: "approvals", label: t(lang, "approvals"), hint: t(lang, "hintApprovals"), icon: "✅", perm: "report.view" },
-          { key: "accounting", label: t(lang, "accounting"), hint: t(lang, "hintAccounting"), icon: "💰", perm: "accounting.view" },
-          { key: "financeSettlements", label: t(lang, "settlements"), hint: t(lang, "hintSettlements"), icon: "🏦", perm: "accounting.report" },
-          { key: "financeDigitalCashout", label: t(lang, "digitalTransfer"), hint: t(lang, "hintDigitalTransfer"), icon: "💵", perm: "accounting.report" },
-          { key: "financeBankCsv", label: t(lang, "bankImport"), hint: t(lang, "hintBankImport"), icon: "📥", perm: "accounting.report" },
-          { key: "fiscalPeriods", label: t(lang, "fiscalPeriods"), hint: t(lang, "hintFiscalPeriods"), icon: "🗓️", perm: "accounting.report" },
-          { key: "costCenters", label: t(lang, "costCenters"), hint: t(lang, "hintCostCenters"), icon: "🏷️", perm: "costcenter.view" },
-          { key: "pettyCash", label: t(lang, "pettyCash"), hint: t(lang, "hintPettyCash"), icon: "👛", perm: "pettycash.view" },
-          { key: "assets", label: t(lang, "assets"), hint: t(lang, "hintAssets"), icon: "🏢", perm: "asset.view" },
-          { key: "cheques", label: t(lang, "cheques"), hint: t(lang, "hintCheques"), icon: "🧾", perm: "cheque.view" },
-          { key: "reports", label: t(lang, "reports"), hint: t(lang, "hintReports"), icon: "📈", perm: "report.view" },
-        ],
-      },
-      {
-        title: t(lang, "navGroupAdmin"),
-        items: [
-          { key: "roles", label: t(lang, "roleManagement"), hint: t(lang, "hintRoles"), icon: "🛡️", perm: "rbac.manage" },
-          { key: "integrationWebhooks", label: t(lang, "webhooks"), hint: t(lang, "hintWebhooks"), icon: "🔗", perm: "rbac.manage" },
-          { key: "settings", label: t(lang, "settings"), hint: t(lang, "hintSettings"), icon: "⚙️", perm: "branch.manage" },
-        ],
-      },
-    ];
-
-    return baseSections.map((section) => ({
-      ...section,
-      items: section.items.filter(
-        (item) =>
-          item.perm === true || (typeof item.perm === "string" && hasPermission(item.perm, permissions))
-      ),
-    }));
-  }, [lang, permissions]);
+    return PAGE_GROUPS.map((group) => ({
+      title: t(lang, group.titleKey),
+      items: APP_PAGES.filter(
+        (page) =>
+          page.group === group.id &&
+          canAccessPage(page, permissions, { isAuthenticated: true }) &&
+          isPageVisibleForBusiness(page.key, businessType)
+      ).map((page) => ({
+        key: page.key,
+        label: t(lang, page.labelKey),
+        hint: t(lang, page.hintKey),
+        icon: page.icon,
+      })),
+    })).filter((section) => section.items.length > 0);
+  }, [lang, permissions, businessType]);
 
   const allMenuItemsByPerm = useMemo(
     () => sectionsByPerm.flatMap((section) => section.items),
@@ -240,10 +225,155 @@ function MainApp() {
     };
   }, []);
 
+  useEffect(() => {
+    const syncPerms = () => setPermissions(getStoredPermissions());
+    window.addEventListener("bd_pos_permissions_changed", syncPerms);
+    window.addEventListener("storage", syncPerms);
+    return () => {
+      window.removeEventListener("bd_pos_permissions_changed", syncPerms);
+      window.removeEventListener("storage", syncPerms);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get("/auth/me");
+        if (cancelled) return;
+        const next = res.data?.permissions || [];
+        setStoredPermissions(next);
+        setPermissions(next);
+      } catch {
+        /* keep cached permissions */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  useEffect(() => {
+    if (!token || permissionsBootstrappedRef.current || !permissions.length) return;
+    permissionsBootstrappedRef.current = true;
+    const pageDef = getPageDef(view);
+    if (canAccessPage(pageDef, permissions, { isAuthenticated: true })) return;
+    const fallback = listAccessiblePages(permissions, { isAuthenticated: true })[0]?.key || "dashboard";
+    if (fallback === view) return;
+    setView(fallback);
+    localStorage.setItem("bd_pos_last_view", fallback);
+  }, [token, permissions, view]);
+
   const openView = useCallback((nextView) => {
     setView(nextView);
     localStorage.setItem("bd_pos_last_view", nextView);
+    setNavMobileOpen(false);
   }, []);
+
+  const applyBusinessType = useCallback(
+    (nextType, { navigate = true } = {}) => {
+      setBusinessType(nextType);
+      try {
+        if (nextType) localStorage.setItem(BUSINESS_TYPE_STORAGE_KEY, nextType);
+        else localStorage.removeItem(BUSINESS_TYPE_STORAGE_KEY);
+      } catch {
+        /* ignore storage failures */
+      }
+      window.dispatchEvent(
+        new CustomEvent("bd_pos_business_type_changed", { detail: { type: nextType } })
+      );
+      // Persist the choice branch-wide so every device on this branch follows
+      // suit (best-effort; needs branch.manage permission). The business type
+      // covers the UI tailoring; the mapped profile drives the POS engine.
+      if (nextType && hasPermission("branch.manage")) {
+        const mappedProfile = mapBusinessTypeToProfile(nextType);
+        api
+          .patch(`/branches/${branchId}/business-profile`, {
+            businessType: nextType,
+            ...(mappedProfile ? { businessProfile: mappedProfile } : {}),
+          })
+          .then(() => {
+            if (mappedProfile) localStorage.setItem("bd_pos_business_profile", mappedProfile);
+            window.dispatchEvent(new Event("bd_pos_branch_changed"));
+          })
+          .catch(() => {
+            /* keep the local device override even if the write fails */
+          });
+      }
+      if (!navigate || !nextType) return;
+      const target = getDefaultViewForBusiness(nextType, "dashboard");
+      const targetDef = getPageDef(target);
+      const canOpenTarget =
+        targetDef && canAccessPage(targetDef, permissions, { isAuthenticated: true });
+      if (canOpenTarget) {
+        setView(target);
+        localStorage.setItem("bd_pos_last_view", target);
+      } else if (!isPageVisibleForBusiness(view, nextType)) {
+        // Current page got hidden and we can't reach the default — go home.
+        setView("dashboard");
+        localStorage.setItem("bd_pos_last_view", "dashboard");
+      }
+      setNavMobileOpen(false);
+    },
+    [permissions, view, branchId]
+  );
+
+  useEffect(() => {
+    if (!isMobileNav) setNavMobileOpen(false);
+  }, [isMobileNav]);
+
+  // On a fresh device, adopt the business type saved on the branch (shared
+  // branch-wide). A locally chosen type always wins to preserve offline picks.
+  useEffect(() => {
+    if (!token) return undefined;
+    if (readBusinessType()) {
+      setBizReady(true);
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get("/branches");
+        const id = Number(localStorage.getItem("bd_pos_branch_id") || 1);
+        const branch = (Array.isArray(res.data) ? res.data : []).find(
+          (b) => Number(b.id) === id
+        );
+        if (!cancelled && branch?.businessType) {
+          applyBusinessType(branch.businessType, { navigate: false });
+        }
+      } catch {
+        /* ignore — fall back to the setup modal */
+      } finally {
+        if (!cancelled) setBizReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token, applyBusinessType]);
+
+  // Apply the per-type accent theme via a root attribute (see index.css).
+  useEffect(() => {
+    const root = document.documentElement;
+    if (businessType) root.setAttribute("data-business", businessType);
+    else root.removeAttribute("data-business");
+    return () => root.removeAttribute("data-business");
+  }, [businessType]);
+
+  useEffect(() => {
+    if (!navMobileOpen) return undefined;
+    const onKey = (e) => {
+      if (e.key === "Escape") setNavMobileOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [navMobileOpen]);
 
   useEffect(() => {
     const onNavigate = (event) => {
@@ -252,6 +382,55 @@ function MainApp() {
       if (prefill && typeof prefill === "object") {
         try {
           sessionStorage.setItem("bd_pos_sales_lookup_prefill", JSON.stringify(prefill));
+        } catch {
+          /* ignore */
+        }
+      }
+      if (detail.inventoryTab) {
+        try {
+          sessionStorage.setItem("bd_pos_inventory_tab", String(detail.inventoryTab));
+        } catch {
+          /* ignore */
+        }
+      }
+      if (detail.batchExpiryFilter) {
+        try {
+          sessionStorage.setItem("bd_pos_inventory_batch_filter", String(detail.batchExpiryFilter));
+        } catch {
+          /* ignore */
+        }
+      }
+      if (detail.productsTab) {
+        try {
+          sessionStorage.setItem("bd_pos_products_tab", String(detail.productsTab));
+        } catch {
+          /* ignore */
+        }
+      }
+      if (detail.labelAisleFilter) {
+        try {
+          sessionStorage.setItem("bd_pos_label_aisle_filter", String(detail.labelAisleFilter));
+        } catch {
+          /* ignore */
+        }
+      }
+      if (detail.labelQueue && typeof detail.labelQueue === "object") {
+        try {
+          sessionStorage.setItem("bd_pos_label_queue_pending", JSON.stringify(detail.labelQueue));
+        } catch {
+          /* ignore */
+        }
+      }
+      if (detail.reportsTab) {
+        try {
+          sessionStorage.setItem("bd_pos_reports_tab", String(detail.reportsTab));
+        } catch {
+          /* ignore */
+        }
+      }
+      if (detail.marginErosionOnly) {
+        try {
+          sessionStorage.setItem("bd_pos_margin_erosion_only", "1");
         } catch {
           /* ignore */
         }
@@ -369,8 +548,19 @@ function MainApp() {
   }
 
   const renderPage = () => {
-    const allowedKeys = new Set(allMenuItems.map((i) => i.key));
-    if (!allowedKeys.has(view)) return <Dashboard />;
+    const pageDef = getPageDef(view);
+    if (!canAccessPage(pageDef, permissions, { isAuthenticated: true })) {
+      const canSeeRoles = hasPermission("rbac.manage", permissions);
+      return (
+        <PageAccessDenied
+          lang={lang}
+          pageKey={view}
+          pageDef={pageDef}
+          onGoDashboard={() => openView("dashboard")}
+          onGoRoles={canSeeRoles ? () => openView("roles") : undefined}
+        />
+      );
+    }
     switch (view) {
       case "dashboard":
         return <Dashboard />;
@@ -386,6 +576,8 @@ function MainApp() {
         return <Warehouses />;
       case "purchases":
         return <Purchases />;
+      case "prescriptions":
+        return <Prescriptions />;
       case "promotions":
         return <Promotions />;
       case "accounting":
@@ -410,6 +602,12 @@ function MainApp() {
         return <Expenses />;
       case "dueCollection":
         return <DueCollection />;
+      case "installments":
+        return <Installments />;
+      case "imeiRegistry":
+        return <ImeiRegistry />;
+      case "expiryMarkdown":
+        return <ExpiryMarkdown />;
       case "salesLookup":
         return <SalesLookup />;
       case "reports":
@@ -422,12 +620,24 @@ function MainApp() {
         return <Suppliers />;
       case "customers":
         return <Customers />;
+      case "warranty":
+        return <WarrantyClaims />;
       case "giftCards":
         return <GiftCards />;
       case "returns":
         return <SalesReturns />;
       case "quotations":
         return <Quotations />;
+      case "orderInbox":
+        return <OrderInbox />;
+      case "fcommerce":
+        return <Fcommerce />;
+      case "topup":
+        return <TopupBills />;
+      case "restaurant":
+        return <Restaurant />;
+      case "manufacturing":
+        return <Manufacturing />;
       case "settings":
         return <Settings />;
       case "shifts":
@@ -450,11 +660,29 @@ function MainApp() {
     .toUpperCase();
 
   return (
-    <div className="app-shell">
-      <aside className="app-sidebar">
+    <div className={`app-shell ${navMobileOpen ? "nav-mobile-open" : ""}`}>
+      {navMobileOpen ? (
+        <button
+          type="button"
+          className="sidebar-backdrop"
+          aria-label={t(lang, "navCloseMenu")}
+          onClick={() => setNavMobileOpen(false)}
+        />
+      ) : null}
+      <aside className={`app-sidebar ${navMobileOpen ? "is-open" : ""}`} aria-hidden={isMobileNav && !navMobileOpen}>
         <div className="app-brand">
           <span className="logo-mark">BD</span>
-          <span>{t(lang, "appTitle")}</span>
+          <span className="app-brand-text">{t(lang, "appTitle")}</span>
+          {isMobileNav ? (
+            <button
+              type="button"
+              className="sidebar-close-btn btn-icon"
+              aria-label={t(lang, "navCloseMenu")}
+              onClick={() => setNavMobileOpen(false)}
+            >
+              ✕
+            </button>
+          ) : null}
         </div>
         <div className="app-nav">
           <div style={{ padding: "6px 10px 10px" }}>
@@ -543,6 +771,17 @@ function MainApp() {
       </aside>
       <main className="app-main">
         <div className="app-topbar">
+          {isMobileNav ? (
+            <button
+              type="button"
+              className="nav-menu-toggle btn-icon"
+              aria-label={t(lang, "navOpenMenu")}
+              aria-expanded={navMobileOpen}
+              onClick={() => setNavMobileOpen(true)}
+            >
+              ☰
+            </button>
+          ) : null}
           <div className="topbar-title">
             {currentItem ? (
               <span>
@@ -554,6 +793,21 @@ function MainApp() {
             )}
           </div>
           <div className="topbar-actions">
+            <label className="biz-type-select" title={t(lang, "bizSelectorLabel")}>
+              <span className="biz-type-select-icon" aria-hidden="true">🏷️</span>
+              <select
+                aria-label={t(lang, "bizSelectorAria")}
+                value={businessType}
+                onChange={(e) => applyBusinessType(e.target.value)}
+              >
+                <option value="">{t(lang, "bizSelectorLabel")}</option>
+                {BUSINESS_TYPES.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.icon} {t(lang, b.labelKey)}
+                  </option>
+                ))}
+              </select>
+            </label>
             <span className="branch-pill">{t(lang, "branchPill", { n: branchId })}</span>
             <button
               type="button"
@@ -569,6 +823,28 @@ function MainApp() {
         </div>
         <div className="app-content view-root">{renderPage()}</div>
       </main>
+      {bizReady && !businessType ? (
+        <div className="biz-setup-overlay" role="dialog" aria-modal="true" aria-labelledby="biz-setup-title">
+          <div className="biz-setup-modal">
+            <h2 id="biz-setup-title" className="biz-setup-title">{t(lang, "bizSetupTitle")}</h2>
+            <p className="biz-setup-subtitle">{t(lang, "bizSetupSubtitle")}</p>
+            <div className="biz-setup-grid">
+              {BUSINESS_TYPES.map((b) => (
+                <button
+                  key={b.id}
+                  type="button"
+                  className="biz-setup-card"
+                  onClick={() => applyBusinessType(b.id)}
+                >
+                  <span className="biz-setup-card-icon" aria-hidden="true">{b.icon}</span>
+                  <span className="biz-setup-card-name">{t(lang, b.labelKey)}</span>
+                  <span className="biz-setup-card-desc">{t(lang, b.descKey)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
       <KeyboardShortcutsModal
         open={shortcutsOpen}
         onClose={() => setShortcutsOpen(false)}
@@ -583,6 +859,12 @@ function App() {
   const hash = useHashRoute();
   if (isCustomerDisplayRoute(hash)) {
     return <CustomerDisplay />;
+  }
+  if (isStorefrontRoute(hash)) {
+    return <Storefront />;
+  }
+  if (isLoyaltyRoute(hash)) {
+    return <LoyaltyCard />;
   }
   return <MainApp />;
 }

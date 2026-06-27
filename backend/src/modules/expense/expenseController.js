@@ -1,6 +1,7 @@
 const prisma = require("../../utils/prisma");
 const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
 
 exports.createExpense = async (req, res) => {
   try {
@@ -89,13 +90,32 @@ exports.createExpense = async (req, res) => {
 
 exports.getExpenses = async (req, res) => {
   try {
+    const lq = parseListQuery(req, {
+      searchableFields: ["category", "paymentMethod", "description"],
+      filterableFields: ["paymentMethod"],
+      sortableFields: ["id", "amount", "expenseDate", "category"],
+      defaultSort: "expenseDate",
+      defaultSortDir: "desc",
+    });
+    const include = {
+      creator: { select: { id: true, name: true, email: true } },
+      costCenter: { select: { id: true, code: true, name: true } },
+    };
+    const where = { branchId: req.branchId };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    if (lq.paged) {
+      const [expenses, total] = await prisma.$transaction([
+        prisma.expense.findMany({ where, include, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.expense.count({ where }),
+      ]);
+      return res.json(pagedResult({ data: expenses, total, page: lq.page, pageSize: lq.pageSize }));
+    }
+
     const expenses = await prisma.expense.findMany({
-      where: { branchId: req.branchId },
-      include: {
-        creator: { select: { id: true, name: true, email: true } },
-        costCenter: { select: { id: true, code: true, name: true } },
-      },
-      orderBy: { expenseDate: "desc" },
+      where,
+      include,
+      orderBy: lq.orderBy || { expenseDate: "desc" },
     });
     res.json(expenses);
   } catch (error) {

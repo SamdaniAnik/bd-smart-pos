@@ -1,4 +1,6 @@
 const prisma = require("../../utils/prisma");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
+const { postPurchaseLineStock } = require("../../utils/inventoryBatchUtil");
 const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
 const { resolveFundingAccountCode } = require("../../utils/fundingAccount");
@@ -623,8 +625,11 @@ exports.createPurchase = async (req, res) => {
           items: {
             create: items.map((i) => ({
               productId: Number(i.productId),
+              productVariantId: i.productVariantId ? Number(i.productVariantId) : null,
               qty: Number(i.qty),
               cost: Number(i.cost),
+              batchCode: i.batchCode ? String(i.batchCode).trim().slice(0, 191) : null,
+              expiryDate: i.expiryDate ? new Date(i.expiryDate) : null,
             })),
           },
         },
@@ -634,27 +639,24 @@ exports.createPurchase = async (req, res) => {
         const landedByProduct = new Map(
           (landed.lines || []).map((line) => [Number(line.productId), Number(line.landedUnitCost || 0)])
         );
+        const productIds = [...new Set(items.map((i) => Number(i.productId)))];
+        const products = await tx.product.findMany({
+          where: { branchId, id: { in: productIds } },
+        });
+        const productMap = new Map(products.map((p) => [p.id, p]));
         for (const item of items) {
           const productId = Number(item.productId);
           if (Number(item.qty) <= 0 || Number(item.cost) < 0) {
             throw new Error("Invalid purchase qty/cost");
           }
-          await tx.product.update({
-            where: { id: productId },
-            data: {
-              stock: { increment: Number(item.qty) },
-              price: Number(landedByProduct.get(productId) || Number(item.cost)),
-            },
-          });
-          await tx.stockLedger.create({
-            data: {
-              branchId,
-              productId,
-              refType: "PURCHASE",
-              refId: created.id,
-              inQty: Number(item.qty),
-              unitCost: Number(landedByProduct.get(productId) || Number(item.cost)),
-            },
+          const product = productMap.get(productId);
+          if (!product) throw new Error(`Product ${productId} not found`);
+          await postPurchaseLineStock(tx, {
+            branchId,
+            purchaseId: created.id,
+            product,
+            item,
+            landedUnitCost: Number(landedByProduct.get(productId) || Number(item.cost)),
           });
         }
       }
@@ -779,11 +781,36 @@ exports.createPurchase = async (req, res) => {
 exports.getPurchases = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const purchases = await prisma.purchase.findMany({
-      where: { branchId },
-      include: { supplier: true, items: true },
-      orderBy: { createdAt: "desc" },
+    const lq = parseListQuery(req, {
+      searchableFields: ["invoiceNo", "financingSource", "loanReference", "loanNote"],
+      relationSearch: { supplierName: { relation: "supplier", field: "name" } },
+      sortableFields: ["id", "total", "paidAmount", "dueAmount", "createdAt"],
+      defaultSort: "createdAt",
+      defaultSortDir: "desc",
     });
+    const where = { branchId };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    let total = null;
+    let purchases;
+    if (lq.paged) {
+      [purchases, total] = await prisma.$transaction([
+        prisma.purchase.findMany({
+          where,
+          include: { supplier: true, items: true },
+          orderBy: lq.orderBy,
+          skip: lq.skip,
+          take: lq.take,
+        }),
+        prisma.purchase.count({ where }),
+      ]);
+    } else {
+      purchases = await prisma.purchase.findMany({
+        where,
+        include: { supplier: true, items: true },
+        orderBy: lq.orderBy || { createdAt: "desc" },
+      });
+    }
     const purchaseIds = purchases.map((p) => p.id);
     const logs = purchaseIds.length
       ? await prisma.auditLog.findMany({
@@ -828,6 +855,9 @@ exports.getPurchases = async (req, res) => {
         },
       };
     });
+    if (lq.paged) {
+      return res.json(pagedResult({ data: withVat, total: total || 0, page: lq.page, pageSize: lq.pageSize }));
+    }
     res.json(withVat);
   } catch (error) {
     if (respondFiscalBlocked(res, error)) return;

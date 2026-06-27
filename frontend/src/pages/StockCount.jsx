@@ -1,12 +1,26 @@
 import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import { getLang, t } from "../i18n";
+import { notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
+import SearchSelect from "../components/SearchSelect";
 
 function StockCount() {
+  const lang = getLang();
+  const tt = (key, params) => t(lang, key, params);
+  const { hasPermission } = usePermissions();
+  const canAdjustStock = hasPermission("inventory.adjust");
+
+  const requireStockAdjust = () => {
+    if (canAdjustStock) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "inventory.adjust" }));
+    return false;
+  };
+
   const [sessions, setSessions] = useState([]);
   const [schedules, setSchedules] = useState([]);
-  const [users, setUsers] = useState([]);
-  const [warehouses, setWarehouses] = useState([]);
   const [activeSession, setActiveSession] = useState(null);
   const [sessionForm, setSessionForm] = useState({ warehouseId: "", note: "", blindMode: false, assignedToUserId: "" });
   const [scheduleForm, setScheduleForm] = useState({
@@ -65,22 +79,12 @@ function StockCount() {
   }, [sessions, showOnlyMyAssignments, showOnlyUnassigned, currentUserId]);
 
   const load = async () => {
-    const [sessionRes, scheduleRes, warehouseRes] = await Promise.all([
+    const [sessionRes, scheduleRes] = await Promise.all([
       api.get(`/inventory/stock-count/sessions${query}`),
       api.get("/inventory/stock-count/schedules"),
-      api.get("/warehouses"),
     ]);
-    let userRows = [];
-    try {
-      const usersRes = await api.get("/rbac/users");
-      userRows = Array.isArray(usersRes.data) ? usersRes.data : [];
-    } catch (_err) {
-      userRows = [];
-    }
     setSessions(sessionRes.data || []);
     setSchedules(scheduleRes.data || []);
-    setWarehouses(warehouseRes.data || []);
-    setUsers(userRows);
   };
 
   useEffect(() => {
@@ -89,6 +93,7 @@ function StockCount() {
 
   const createSession = async (e) => {
     e.preventDefault();
+    if (!requireStockAdjust()) return;
     await api.post("/inventory/stock-count/sessions", {
       warehouseId: sessionForm.warehouseId ? Number(sessionForm.warehouseId) : null,
       note: sessionForm.note,
@@ -101,6 +106,7 @@ function StockCount() {
 
   const createSchedule = async (e) => {
     e.preventDefault();
+    if (!requireStockAdjust()) return;
     const payload = {
       name: scheduleForm.name,
       warehouseId: scheduleForm.warehouseId ? Number(scheduleForm.warehouseId) : null,
@@ -121,6 +127,7 @@ function StockCount() {
   };
 
   const runDueSchedules = async () => {
+    if (!requireStockAdjust()) return;
     await api.post("/inventory/stock-count/schedules/run", {});
     load();
   };
@@ -139,16 +146,19 @@ function StockCount() {
   };
 
   const toggleSchedule = async (row) => {
+    if (!requireStockAdjust()) return;
     await api.patch(`/inventory/stock-count/schedules/${row.id}/toggle`, {});
     load();
   };
 
   const runScheduleNow = async (row) => {
+    if (!requireStockAdjust()) return;
     await api.post(`/inventory/stock-count/schedules/${row.id}/run`, {});
     load();
   };
 
   const deleteSchedule = async (row) => {
+    if (!requireStockAdjust()) return;
     if (!window.confirm("Delete this schedule?")) return;
     await api.delete(`/inventory/stock-count/schedules/${row.id}`);
     if (editingScheduleId === row.id) {
@@ -191,6 +201,7 @@ function StockCount() {
   };
 
   const saveSessionItems = async () => {
+    if (!requireStockAdjust()) return;
     if (!activeSession) return;
     await api.put(`/inventory/stock-count/sessions/${activeSession.id}/items`, {
       items: activeSession.items.map((x) => ({
@@ -204,6 +215,7 @@ function StockCount() {
   };
 
   const recountSession = async () => {
+    if (!requireStockAdjust()) return;
     if (!activeSession) return;
     await api.post(`/inventory/stock-count/sessions/${activeSession.id}/recount`, {});
     await openSession(activeSession);
@@ -211,6 +223,7 @@ function StockCount() {
   };
 
   const finalizeSession = async () => {
+    if (!requireStockAdjust()) return;
     if (!activeSession) return;
     await api.post(`/inventory/stock-count/sessions/${activeSession.id}/finalize`, {
       managerApprovalPin: managerPin,
@@ -238,17 +251,15 @@ function StockCount() {
           <div className="page-subtitle">Physical inventory sessions, schedules, and variance approvals</div>
         </div>
       </div>
+      <PermissionBanner show={!canAdjustStock} code="inventory.adjust" tt={tt} />
       <form onSubmit={createSession} className="form-grid">
-        <select
+        <SearchSelect
           className="form-select-sm"
+          kind="warehouses"
           value={sessionForm.warehouseId}
-          onChange={(e) => setSessionForm((prev) => ({ ...prev, warehouseId: e.target.value }))}
-        >
-          <option value="">Select Warehouse (Optional)</option>
-          {warehouses.map((w) => (
-            <option key={w.id} value={w.id}>{w.name}</option>
-          ))}
-        </select>
+          onChange={(val) => setSessionForm((prev) => ({ ...prev, warehouseId: val }))}
+          placeholder="Select Warehouse (Optional)"
+        />
         <input
           placeholder="Session note"
           value={sessionForm.note}
@@ -263,17 +274,14 @@ function StockCount() {
           />
           Blind Count Mode
         </label>
-        <select
+        <SearchSelect
           className="form-select-sm"
+          kind="users"
           value={sessionForm.assignedToUserId}
-          onChange={(e) => setSessionForm((prev) => ({ ...prev, assignedToUserId: e.target.value }))}
-        >
-          <option value="">Assign To (Optional)</option>
-          {users.map((u) => (
-            <option key={u.id} value={u.id}>{u.name || u.email}</option>
-          ))}
-        </select>
-        <button type="submit">Create Count Session</button>
+          onChange={(val) => setSessionForm((prev) => ({ ...prev, assignedToUserId: val }))}
+          placeholder="Assign To (Optional)"
+        />
+        <button type="submit" disabled={!canAdjustStock}>Create Count Session</button>
       </form>
 
       <h3 style={{ marginTop: 14 }}>Cycle Count Schedules</h3>
@@ -283,25 +291,24 @@ function StockCount() {
           value={scheduleForm.name}
           onChange={(e) => setScheduleForm((prev) => ({ ...prev, name: e.target.value }))}
         />
-        <select
+        <SearchSelect
           className="form-select-sm"
+          kind="warehouses"
           value={scheduleForm.warehouseId}
-          onChange={(e) => setScheduleForm((prev) => ({ ...prev, warehouseId: e.target.value }))}
-        >
-          <option value="">All/Default Warehouse</option>
-          {warehouses.map((w) => (
-            <option key={w.id} value={w.id}>{w.name}</option>
-          ))}
-        </select>
-        <select
+          onChange={(val) => setScheduleForm((prev) => ({ ...prev, warehouseId: val }))}
+          placeholder="All/Default Warehouse"
+        />
+        <SearchSelect
           className="form-select-sm"
           value={scheduleForm.frequency}
-          onChange={(e) => setScheduleForm((prev) => ({ ...prev, frequency: e.target.value }))}
-        >
-          <option value="daily">Daily</option>
-          <option value="weekly">Weekly</option>
-          <option value="monthly">Monthly</option>
-        </select>
+          onChange={(val) => setScheduleForm((prev) => ({ ...prev, frequency: val || "daily" }))}
+          options={[
+            { value: "daily", label: "Daily" },
+            { value: "weekly", label: "Weekly" },
+            { value: "monthly", label: "Monthly" },
+          ]}
+          isClearable={false}
+        />
         <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input
             type="checkbox"
@@ -320,22 +327,19 @@ function StockCount() {
           />
           Active
         </label>
-        <select
+        <SearchSelect
           className="form-select-sm"
+          kind="users"
           value={scheduleForm.assignedToUserId}
-          onChange={(e) => setScheduleForm((prev) => ({ ...prev, assignedToUserId: e.target.value }))}
-        >
-          <option value="">Assign To (Optional)</option>
-          {users.map((u) => (
-            <option key={u.id} value={u.id}>{u.name || u.email}</option>
-          ))}
-        </select>
+          onChange={(val) => setScheduleForm((prev) => ({ ...prev, assignedToUserId: val }))}
+          placeholder="Assign To (Optional)"
+        />
         <input
           placeholder="Schedule note"
           value={scheduleForm.note}
           onChange={(e) => setScheduleForm((prev) => ({ ...prev, note: e.target.value }))}
         />
-        <button type="submit">{editingScheduleId ? "Update Schedule" : "Create Schedule"}</button>
+        <button type="submit" disabled={!canAdjustStock}>{editingScheduleId ? "Update Schedule" : "Create Schedule"}</button>
         {editingScheduleId ? (
           <button
             type="button"
@@ -348,7 +352,7 @@ function StockCount() {
             Cancel Edit
           </button>
         ) : null}
-        <button type="button" className="btn-secondary" onClick={runDueSchedules}>Run Due Schedules</button>
+        <button type="button" className="btn-secondary" onClick={runDueSchedules} disabled={!canAdjustStock}>Run Due Schedules</button>
       </form>
 
       <DataTable
@@ -422,11 +426,16 @@ function StockCount() {
       <div className="form-grid" style={{ marginTop: 12 }}>
         <input type="date" value={filters.from} onChange={(e) => setFilters((p) => ({ ...p, from: e.target.value }))} />
         <input type="date" value={filters.to} onChange={(e) => setFilters((p) => ({ ...p, to: e.target.value }))} />
-        <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
-          <option value="">All Status</option>
-          <option value="OPEN">OPEN</option>
-          <option value="CLOSED">CLOSED</option>
-        </select>
+        <SearchSelect
+          className="form-select-sm"
+          value={filters.status}
+          onChange={(val) => setFilters((p) => ({ ...p, status: val }))}
+          placeholder="All Status"
+          options={[
+            { value: "OPEN", label: "OPEN" },
+            { value: "CLOSED", label: "CLOSED" },
+          ]}
+        />
         <button type="button" className="btn-secondary" onClick={() => setFilters({ from: "", to: "", status: "" })}>
           Clear Filter
         </button>

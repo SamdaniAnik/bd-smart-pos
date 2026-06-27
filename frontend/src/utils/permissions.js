@@ -8,6 +8,13 @@ export function getStoredPermissions() {
   }
 }
 
+export function setStoredPermissions(codes) {
+  const list = Array.isArray(codes) ? codes : [];
+  localStorage.setItem("bd_pos_permissions", JSON.stringify(list));
+  window.dispatchEvent(new CustomEvent("bd_pos_permissions_changed", { detail: { permissions: list } }));
+  return list;
+}
+
 export function hasPermission(code, permissions = getStoredPermissions()) {
   if (!code) return false;
   return permissions.includes(code);

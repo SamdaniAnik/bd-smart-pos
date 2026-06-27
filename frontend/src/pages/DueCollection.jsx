@@ -4,13 +4,39 @@ import api from "../services/api";
 import DataTable from "../components/DataTable";
 import SubmitButton from "../components/SubmitButton";
 import { formatBDT } from "../utils/currency";
-import { notifyActionRequired } from "../utils/notify";
+import { notifyActionRequired, notifyPermissionRequired, notifySuccess, notifyError } from "../utils/notify";
+import { getLang, t } from "../i18n";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
+import SearchSelect from "../components/SearchSelect";
 
 const lang = () =>
   typeof window !== "undefined" && localStorage.getItem("bd_pos_lang") === "bn" ? "bn" : "en";
 const bdt = (v) => formatBDT(v, { lang: lang(), decimals: 2 });
 
 function DueCollection() {
+  const tt = useMemo(() => (key, params) => t(lang(), key, params), []);
+  const { hasPermission } = usePermissions();
+  const canCollectCustomer = hasPermission("customer.create");
+  const canPaySupplier = hasPermission("supplier.create");
+  const canPayLoan = hasPermission("purchase.create");
+
+  const requireCustomerCreate = () => {
+    if (canCollectCustomer) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "customer.create" }));
+    return false;
+  };
+  const requireSupplierCreate = () => {
+    if (canPaySupplier) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "supplier.create" }));
+    return false;
+  };
+  const requirePurchaseCreate = () => {
+    if (canPayLoan) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "purchase.create" }));
+    return false;
+  };
+
   const [summary, setSummary] = useState({ customers: [], suppliers: [], purchaseBankLoans: null });
   const [customerCollections, setCustomerCollections] = useState([]);
   const [supplierPayments, setSupplierPayments] = useState([]);
@@ -22,7 +48,12 @@ function DueCollection() {
     method: "Cash",
     note: "",
     fundingAccountCode: "",
+    mfsTrxId: "",
   });
+  const [mfsSession, setMfsSession] = useState(null);
+  const [initiatingMfs, setInitiatingMfs] = useState(false);
+  const MFS_METHODS = ["bKash", "Nagad", "Rocket", "Upay"];
+  const isMfsMethod = (m) => MFS_METHODS.includes(String(m || ""));
   const [supplierForm, setSupplierForm] = useState({
     supplierId: "",
     amount: "",
@@ -42,10 +73,14 @@ function DueCollection() {
     fundingAccountCode: "",
   });
   const [submittingLoan, setSubmittingLoan] = useState(false);
+  const [sendingReminders, setSendingReminders] = useState(false);
   const [preview, setPreview] = useState(null);
   const [previewError, setPreviewError] = useState("");
   const [submittingSupplier, setSubmittingSupplier] = useState(false);
   const [submittingCustomer, setSubmittingCustomer] = useState(false);
+  const [bakirKhata, setBakirKhata] = useState(null);
+  const [loadingBakir, setLoadingBakir] = useState(false);
+  const [sendingBakirStatement, setSendingBakirStatement] = useState(false);
 
   const branchIdForFiscal = typeof window !== "undefined" ? localStorage.getItem("bd_pos_branch_id") || "1" : "1";
   const { data: fiscalGateData } = useQuery({
@@ -132,23 +167,104 @@ function DueCollection() {
     supplierForm.vdsRateOverride,
   ]);
 
+  useEffect(() => {
+    const cid = customerForm.customerId;
+    if (!cid) {
+      setBakirKhata(null);
+      return undefined;
+    }
+    let cancelled = false;
+    setLoadingBakir(true);
+    api
+      .get(`/dues/bakir-khata/${cid}`)
+      .then((res) => {
+        if (!cancelled) setBakirKhata(res.data);
+      })
+      .catch(() => {
+        if (!cancelled) setBakirKhata(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingBakir(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [customerForm.customerId]);
+
+  const bakirEntryLabel = (entryType) => {
+    const key = {
+      SALE_CREDIT: "bakirEntrySaleCredit",
+      COLLECTION: "bakirEntryCollection",
+      ADJUSTMENT: "bakirEntryAdjustment",
+    }[entryType];
+    return key ? tt(key) : entryType;
+  };
+
+  const initiateCustomerMfs = async () => {
+    if (!requireCustomerCreate()) return;
+    const amt = Number(customerForm.amount);
+    if (!(amt > 0)) {
+      notifyError("Enter the collection amount before initiating MFS payment");
+      return;
+    }
+    setInitiatingMfs(true);
+    try {
+      const res = await api.post("/payments/mfs/initiate", {
+        method: customerForm.method,
+        amount: amt,
+        invoiceRef: `DUE-${customerForm.customerId || "X"}-${Date.now()}`,
+      });
+      setMfsSession(res.data);
+      notifySuccess(
+        res.data?.provider === "log"
+          ? "MFS session created (simulated — enter any valid-format TrxID)"
+          : "MFS session created — ask the customer to pay, then enter the TrxID"
+      );
+    } catch (err) {
+      notifyError(err?.response?.data?.error || err?.message || "Failed to start MFS payment");
+    } finally {
+      setInitiatingMfs(false);
+    }
+  };
+
   const submitCustomerCollection = async (e) => {
     e.preventDefault();
+    if (!requireCustomerCreate()) return;
     if (fiscalBlocked) {
       notifyActionRequired(fiscalGateData?.message || "No open fiscal period for today.");
       return;
     }
+    const usingMfs = isMfsMethod(customerForm.method);
+    if (usingMfs && !mfsSession?.paymentId) {
+      notifyActionRequired("Initiate the MFS payment first, then enter the TrxID");
+      return;
+    }
+    if (usingMfs && !String(customerForm.mfsTrxId || "").trim()) {
+      notifyActionRequired("Enter the MFS TrxID to verify the payment");
+      return;
+    }
     setSubmittingCustomer(true);
     try {
+      const cid = customerForm.customerId;
       await api.post("/dues/customer-collections", {
-        customerId: Number(customerForm.customerId),
+        customerId: Number(cid),
         amount: Number(customerForm.amount),
         method: customerForm.method,
         note: customerForm.note || null,
         fundingAccountCode: customerForm.fundingAccountCode?.trim() || undefined,
+        ...(usingMfs
+          ? { mfsPaymentId: mfsSession.paymentId, trxId: String(customerForm.mfsTrxId).trim() }
+          : {}),
       });
-      setCustomerForm({ customerId: "", amount: "", method: "Cash", note: "", fundingAccountCode: "" });
+      setCustomerForm({ ...customerForm, amount: "", note: "", fundingAccountCode: "", mfsTrxId: "" });
+      setMfsSession(null);
       await load();
+      if (cid) {
+        const res = await api.get(`/dues/bakir-khata/${cid}`);
+        setBakirKhata(res.data);
+      }
+    } catch (err) {
+      notifyError(err?.response?.data?.error || err?.message || "Collection failed");
     } finally {
       setSubmittingCustomer(false);
     }
@@ -156,6 +272,7 @@ function DueCollection() {
 
   const submitSupplierPayment = async (e) => {
     e.preventDefault();
+    if (!requireSupplierCreate()) return;
     if (fiscalBlocked) {
       notifyActionRequired(fiscalGateData?.message || "No open fiscal period for today.");
       return;
@@ -200,6 +317,7 @@ function DueCollection() {
 
   const submitLoanPayment = async (e) => {
     e.preventDefault();
+    if (!requirePurchaseCreate()) return;
     if (fiscalBlocked) {
       notifyActionRequired(fiscalGateData?.message || "No open fiscal period for today.");
       return;
@@ -246,10 +364,8 @@ function DueCollection() {
     <div className="page-stack">
       <div className="page-header">
         <div>
-          <div className="page-title">Due collection & settlement</div>
-          <div className="page-subtitle">
-            Customer receipts, supplier AP (with withholding), and purchase bank-loan repayment (cash or bank GL)
-          </div>
+          <div className="page-title">{tt("duePageTitle")}</div>
+          <div className="page-subtitle">{tt("duePageSubtitle")}</div>
         </div>
       </div>
 
@@ -259,6 +375,10 @@ function DueCollection() {
           <p>{fiscalGateData?.message || "No open fiscal period for today."}</p>
         </div>
       ) : null}
+
+      {!canCollectCustomer ? <PermissionBanner show code="customer.create" tt={tt} /> : null}
+      {!canPaySupplier ? <PermissionBanner show code="supplier.create" tt={tt} /> : null}
+      {!canPayLoan ? <PermissionBanner show code="purchase.create" tt={tt} /> : null}
 
       {summary.purchaseBankLoans != null ? (
         <div className="page-card" style={{ marginTop: 8, padding: 12, background: "#f8fafc" }}>
@@ -270,21 +390,62 @@ function DueCollection() {
         </div>
       ) : null}
 
+      {summary.customers.length ? (
+        <div className="page-card" style={{ marginTop: 8, padding: 12, background: "#fffbeb" }}>
+          <strong>{tt("dueBakiSmsTitle")}</strong>
+          <p className="text-muted" style={{ margin: "6px 0 8px", fontSize: 13 }}>
+            {tt("dueBakiSmsHelp", {
+              count: summary.customers.length,
+              total: bdt(summary.customers.reduce((sum, c) => sum + Number(c.balance || 0), 0)),
+            })}
+          </p>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={sendingReminders || !canCollectCustomer}
+            onClick={async () => {
+              if (!requireCustomerCreate()) return;
+              if (!window.confirm(tt("dueBakiSmsConfirm", { count: summary.customers.length }))) return;
+              setSendingReminders(true);
+              try {
+                const res = await api.post("/dues/customer-reminders", {});
+                const s = res.data?.summary || {};
+                const simulated = Number(s.simulated || 0) > 0;
+                const parts = [
+                  tt("dueBakiSmsResultSent", { n: s.sent || 0 }),
+                  tt("dueBakiSmsResultSimulated", { n: s.simulated || 0 }),
+                  tt("dueBakiSmsResultFailed", { n: s.failed || 0 }),
+                ];
+                if (res.data?.skippedNoPhone) {
+                  parts.push(tt("dueBakiSmsSkipped", { n: res.data.skippedNoPhone }));
+                }
+                notifySuccess(
+                  `${simulated ? tt("dueBakiSmsDoneSimulated") : tt("dueBakiSmsDone")}\n${parts.join(" · ")}`
+                );
+              } catch (err) {
+                notifyError(err?.response?.data?.error || err?.message || tt("dueBakiSmsFailed"));
+              } finally {
+                setSendingReminders(false);
+              }
+            }}
+          >
+            {sendingReminders ? tt("dueBakiSmsSending") : tt("dueBakiSmsSend")}
+          </button>
+        </div>
+      ) : null}
+
       <h4 style={{ marginTop: 8 }}>Collect customer due</h4>
       <form onSubmit={submitCustomerCollection} className="form-grid">
-        <select
+        <SearchSelect
           className="form-select-sm"
           value={customerForm.customerId}
-          onChange={(e) => setCustomerForm({ ...customerForm, customerId: e.target.value })}
-          required
-        >
-          <option value="">Select Customer</option>
-          {summary.customers.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name} (Due: {bdt(c.balance || 0)})
-            </option>
-          ))}
-        </select>
+          onChange={(val) => setCustomerForm({ ...customerForm, customerId: val })}
+          placeholder="Select Customer"
+          options={summary.customers.map((c) => ({
+            value: String(c.id),
+            label: `${c.name} (Due: ${bdt(c.balance || 0)})`,
+          }))}
+        />
         <input
           type="number"
           placeholder="Amount"
@@ -292,28 +453,160 @@ function DueCollection() {
           onChange={(e) => setCustomerForm({ ...customerForm, amount: e.target.value })}
           required
         />
-        <select className="form-select-sm" value={customerForm.method} onChange={(e) => setCustomerForm({ ...customerForm, method: e.target.value })}>
-          <option value="Cash">Cash</option>
-          <option value="Bank">Bank</option>
-          <option value="bKash">bKash</option>
-          <option value="Nagad">Nagad</option>
-          <option value="Card">Card</option>
-        </select>
+        <SearchSelect
+          className="form-select-sm"
+          value={customerForm.method}
+          onChange={(val) => {
+            setMfsSession(null);
+            setCustomerForm({ ...customerForm, method: val || "Cash", mfsTrxId: "" });
+          }}
+          options={[
+            { value: "Cash", label: "Cash" },
+            { value: "Bank", label: "Bank" },
+            { value: "bKash", label: "bKash" },
+            { value: "Nagad", label: "Nagad" },
+            { value: "Rocket", label: "Rocket" },
+            { value: "Upay", label: "Upay" },
+            { value: "Card", label: "Card" },
+          ]}
+          isClearable={false}
+        />
         <input
           placeholder="GL code override (e.g. 1130 for bank)"
           value={customerForm.fundingAccountCode}
           onChange={(e) => setCustomerForm({ ...customerForm, fundingAccountCode: e.target.value })}
-          title="Optional. Defaults: Cash → 1100, Bank → 1130"
+          title="Optional. Defaults: Cash → 1100, Bank → 1130, MFS → 1150"
         />
         <input
           placeholder="Note (optional)"
           value={customerForm.note}
           onChange={(e) => setCustomerForm({ ...customerForm, note: e.target.value })}
         />
-        <SubmitButton loading={submittingCustomer} loadingLabel="Recording…">
+        <SubmitButton loading={submittingCustomer} loadingLabel="Recording…" disabled={!canCollectCustomer || fiscalBlocked}>
           Collect due
         </SubmitButton>
       </form>
+
+      {isMfsMethod(customerForm.method) ? (
+        <div
+          className="page-card"
+          style={{ marginTop: 8, padding: 12, background: "#eef2ff", border: "1px solid #c7d2fe", borderRadius: 8 }}
+        >
+          <strong>{customerForm.method} collection — verify payment</strong>
+          {!mfsSession ? (
+            <p className="text-muted" style={{ margin: "6px 0 8px", fontSize: 13 }}>
+              Enter the amount above, then start the MFS payment. The customer pays to the merchant number / QR, then you enter the TrxID to verify.
+            </p>
+          ) : (
+            <div style={{ margin: "6px 0 8px", fontSize: 13 }}>
+              <div>
+                Merchant: <strong>{mfsSession.merchantNumber || "—"}</strong> · Amount: <strong>{bdt(mfsSession.amount)}</strong>
+              </div>
+              {mfsSession.paymentUrl ? (
+                <div>
+                  Pay link:{" "}
+                  <a href={mfsSession.paymentUrl} target="_blank" rel="noreferrer">
+                    open
+                  </a>
+                </div>
+              ) : null}
+              <div className="text-muted">Session: {mfsSession.paymentId}</div>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              disabled={initiatingMfs || !canCollectCustomer}
+              onClick={initiateCustomerMfs}
+            >
+              {initiatingMfs ? "Starting…" : mfsSession ? "Restart MFS payment" : "Start MFS payment"}
+            </button>
+            <input
+              placeholder="MFS TrxID"
+              value={customerForm.mfsTrxId}
+              onChange={(e) => setCustomerForm({ ...customerForm, mfsTrxId: e.target.value })}
+              disabled={!mfsSession}
+              style={{ maxWidth: 220 }}
+            />
+          </div>
+        </div>
+      ) : null}
+
+      {customerForm.customerId ? (
+        <div className="page-card" style={{ marginTop: 16 }}>
+          <h4 style={{ marginTop: 0 }}>{tt("bakirKhataTitle")}</h4>
+          <p className="text-muted" style={{ fontSize: 13, marginTop: 0 }}>
+            {tt("bakirKhataHelp")}
+          </p>
+          {loadingBakir ? (
+            <p>{tt("bakirKhataLoading")}</p>
+          ) : bakirKhata ? (
+            <>
+              <p>
+                <strong>{tt("dashDue")}:</strong> {bdt(bakirKhata.currentBalance || 0)}
+                {Number(bakirKhata.creditLimit || 0) > 0 ? (
+                  <>
+                    {" "}
+                    · <strong>{tt("custCreditLimit")}:</strong> {bdt(bakirKhata.creditLimit)}
+                  </>
+                ) : null}
+              </p>
+              {(bakirKhata.entries || []).length ? (
+                <DataTable
+                  rows={[...(bakirKhata.entries || [])].reverse()}
+                  rowKey="id"
+                  columns={[
+                    {
+                      key: "createdAt",
+                      label: tt("colDate"),
+                      render: (v) => (v ? new Date(v).toLocaleString() : "—"),
+                    },
+                    { key: "entryType", label: tt("bakirEntryType"), render: (v) => bakirEntryLabel(v) },
+                    {
+                      key: "amount",
+                      label: tt("colAmount"),
+                      render: (v) => {
+                        const n = Number(v || 0);
+                        return `${n >= 0 ? "+" : ""}${bdt(n)}`;
+                      },
+                    },
+                    { key: "balanceAfter", label: tt("bakirBalanceAfter"), render: (v) => bdt(v || 0) },
+                    { key: "note", label: tt("colNote"), render: (v) => v || "—" },
+                  ]}
+                />
+              ) : (
+                <p className="text-muted">{tt("bakirKhataEmpty")}</p>
+              )}
+              <div style={{ marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={!canCollectCustomer || sendingBakirStatement}
+                  onClick={async () => {
+                    if (!requireCustomerCreate()) return;
+                    setSendingBakirStatement(true);
+                    try {
+                      const res = await api.post(
+                        `/dues/bakir-khata/${customerForm.customerId}/send-statement`,
+                        { ledgerLines: 5 }
+                      );
+                      const simulated = String(res.data?.message || "").includes("simulated");
+                      notifySuccess(simulated ? tt("bakirKhataSmsSimulated") : tt("bakirKhataSmsSent"));
+                    } catch (err) {
+                      notifyError(err?.response?.data?.error || err?.message || tt("bakirKhataSmsFailed"));
+                    } finally {
+                      setSendingBakirStatement(false);
+                    }
+                  }}
+                >
+                  {sendingBakirStatement ? tt("bakirKhataSmsSending") : tt("bakirKhataSmsSend")}
+                </button>
+              </div>
+            </>
+          ) : null}
+        </div>
+      ) : null}
 
       <h4 style={{ marginTop: 20 }}>Repay purchase bank loan</h4>
       <p className="text-muted" style={{ fontSize: 13, marginTop: 4 }}>
@@ -321,22 +614,18 @@ function DueCollection() {
         supplier payable.
       </p>
       <form onSubmit={submitLoanPayment} className="form-grid">
-        <select
+        <SearchSelect
           className="form-select-sm"
           value={loanForm.purchaseId}
-          onChange={(e) => setLoanForm({ ...loanForm, purchaseId: e.target.value })}
-          required
-        >
-          <option value="">
-            {outstandingLoans.purchases?.length ? "Select purchase with loan balance" : "No outstanding purchase loans"}
-          </option>
-          {(outstandingLoans.purchases || []).map((p) => (
-            <option key={p.id} value={p.id}>
-              #{p.id} {p.supplier?.name ? `· ${p.supplier.name}` : ""} · Due {bdt(p.dueAmount || 0)}
-              {p.invoiceNo ? ` · ${p.invoiceNo}` : ""}
-            </option>
-          ))}
-        </select>
+          onChange={(val) => setLoanForm({ ...loanForm, purchaseId: val })}
+          placeholder={
+            outstandingLoans.purchases?.length ? "Select purchase with loan balance" : "No outstanding purchase loans"
+          }
+          options={(outstandingLoans.purchases || []).map((p) => ({
+            value: String(p.id),
+            label: `#${p.id}${p.supplier?.name ? ` · ${p.supplier.name}` : ""} · Due ${bdt(p.dueAmount || 0)}${p.invoiceNo ? ` · ${p.invoiceNo}` : ""}`,
+          }))}
+        />
         <input
           type="number"
           placeholder="Amount"
@@ -344,38 +633,39 @@ function DueCollection() {
           onChange={(e) => setLoanForm({ ...loanForm, amount: e.target.value })}
           required
         />
-        <select className="form-select-sm" value={loanForm.method} onChange={(e) => setLoanForm({ ...loanForm, method: e.target.value })}>
-          <option value="Cash">Cash (GL 1100)</option>
-          <option value="Bank">Bank (GL 1130)</option>
-        </select>
+        <SearchSelect
+          className="form-select-sm"
+          value={loanForm.method}
+          onChange={(val) => setLoanForm({ ...loanForm, method: val || "Cash" })}
+          options={[
+            { value: "Cash", label: "Cash (GL 1100)" },
+            { value: "Bank", label: "Bank (GL 1130)" },
+          ]}
+          isClearable={false}
+        />
         <input
           placeholder="GL code override (optional)"
           value={loanForm.fundingAccountCode}
           onChange={(e) => setLoanForm({ ...loanForm, fundingAccountCode: e.target.value })}
         />
         <input placeholder="Note (optional)" value={loanForm.note} onChange={(e) => setLoanForm({ ...loanForm, note: e.target.value })} />
-        <SubmitButton loading={submittingLoan} loadingLabel="Posting…">
+        <SubmitButton loading={submittingLoan} loadingLabel="Posting…" disabled={!canPayLoan || fiscalBlocked}>
           Pay loan
         </SubmitButton>
       </form>
 
       <h4 style={{ marginTop: 16 }}>Pay Supplier Due (with AIT / VDS withholding)</h4>
       <form onSubmit={submitSupplierPayment} className="form-grid">
-        <select
+        <SearchSelect
           className="form-select-sm"
           value={supplierForm.supplierId}
-          onChange={(e) => setSupplierForm({ ...supplierForm, supplierId: e.target.value })}
-          required
-        >
-          <option value="">Select Supplier</option>
-          {summary.suppliers.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.name} (Payable: {bdt(s.payableBalance || 0)})
-              {s.taxCategory ? ` · ${s.taxCategory}` : ""}
-              {s.withholdingExempt ? " · EXEMPT" : ""}
-            </option>
-          ))}
-        </select>
+          onChange={(val) => setSupplierForm({ ...supplierForm, supplierId: val })}
+          placeholder="Select Supplier"
+          options={summary.suppliers.map((s) => ({
+            value: String(s.id),
+            label: `${s.name} (Payable: ${bdt(s.payableBalance || 0)})${s.taxCategory ? ` · ${s.taxCategory}` : ""}${s.withholdingExempt ? " · EXEMPT" : ""}`,
+          }))}
+        />
         <input
           type="number"
           placeholder="Gross amount"
@@ -383,26 +673,29 @@ function DueCollection() {
           onChange={(e) => setSupplierForm({ ...supplierForm, amount: e.target.value })}
           required
         />
-        <select className="form-select-sm" value={supplierForm.method} onChange={(e) => setSupplierForm({ ...supplierForm, method: e.target.value })}>
-          <option value="Cash">Cash</option>
-          <option value="Bank">Bank</option>
-          <option value="bKash">bKash</option>
-          <option value="Nagad">Nagad</option>
-          <option value="Card">Card</option>
-        </select>
-        <select
+        <SearchSelect
+          className="form-select-sm"
+          value={supplierForm.method}
+          onChange={(val) => setSupplierForm({ ...supplierForm, method: val || "Cash" })}
+          options={[
+            { value: "Cash", label: "Cash" },
+            { value: "Bank", label: "Bank" },
+            { value: "bKash", label: "bKash" },
+            { value: "Nagad", label: "Nagad" },
+            { value: "Card", label: "Card" },
+          ]}
+          isClearable={false}
+        />
+        <SearchSelect
           className="form-select-sm"
           value={supplierForm.taxCategoryOverride}
-          onChange={(e) => setSupplierForm({ ...supplierForm, taxCategoryOverride: e.target.value, aitRateOverride: "", vdsRateOverride: "" })}
-          title="Override the supplier's default tax category for this single payment"
-        >
-          <option value="">Use supplier default</option>
-          {taxCategories.map((c) => (
-            <option key={c.code} value={c.code}>
-              {c.label}
-            </option>
-          ))}
-        </select>
+          onChange={(val) =>
+            setSupplierForm({ ...supplierForm, taxCategoryOverride: val, aitRateOverride: "", vdsRateOverride: "" })
+          }
+          placeholder="Use supplier default"
+          options={taxCategories.map((c) => ({ value: c.code, label: c.label }))}
+          aria-label="Override the supplier's default tax category for this single payment"
+        />
         <input
           type="number"
           step="0.1"
@@ -433,7 +726,7 @@ function DueCollection() {
           value={supplierForm.withholdingNote}
           onChange={(e) => setSupplierForm({ ...supplierForm, withholdingNote: e.target.value })}
         />
-        <SubmitButton loading={submittingSupplier} loadingLabel="Posting payment…">
+        <SubmitButton loading={submittingSupplier} loadingLabel="Posting payment…" disabled={!canPaySupplier || fiscalBlocked}>
           Pay supplier
         </SubmitButton>
       </form>

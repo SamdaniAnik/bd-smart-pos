@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
-import { notifyActionRequired, notifySuccess } from "../utils/notify";
+import { notifyActionRequired, notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { formatBDT } from "../utils/currency";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 function Accounting() {
   const [uiLang, setUiLang] = useState(() => getLang());
@@ -17,6 +20,14 @@ function Accounting() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canPostJournal = hasPermission("accounting.journal.create");
+
+  const requireJournalCreate = () => {
+    if (canPostJournal) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "accounting.journal.create" }));
+    return false;
+  };
 
   const [accounts, setAccounts] = useState([]);
   const [costCenters, setCostCenters] = useState([]);
@@ -143,6 +154,7 @@ function Accounting() {
 
   const submitJournal = async (e) => {
     e.preventDefault();
+    if (!requireJournalCreate()) return;
     const lines = (journalForm.lines || [])
       .map((l) => ({
         accountId: Number(l.accountId),
@@ -638,6 +650,7 @@ function Accounting() {
             {tt("accManualJournalEntry")}
           </h2>
           <p className="accounting-panel__lead">{tt("accJournalLead")}</p>
+          <PermissionBanner show={!canPostJournal} code="accounting.journal.create" tt={tt} />
           <form onSubmit={submitJournal}>
             <div className="form-grid">
               <label>
@@ -650,18 +663,16 @@ function Accounting() {
               </label>
               <label>
                 {tt("accCostCenterOptional")}
-                <select
+                <SearchSelect
                   className="form-select-sm"
                   value={journalForm.costCenterId}
-                  onChange={(e) => setJournalForm((p) => ({ ...p, costCenterId: e.target.value }))}
-                >
-                  <option value="">{tt("accNone")}</option>
-                  {costCenters.map((cc) => (
-                    <option key={cc.id} value={cc.id}>
-                      {cc.code} — {cc.name}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(val) => setJournalForm((p) => ({ ...p, costCenterId: val }))}
+                  placeholder={tt("accNone")}
+                  options={costCenters.map((cc) => ({
+                    value: String(cc.id),
+                    label: `${cc.code} — ${cc.name}`,
+                  }))}
+                />
               </label>
               <div style={{ gridColumn: "1 / -1" }}>
                 <table className="data-table">
@@ -677,18 +688,16 @@ function Accounting() {
                     {journalForm.lines.map((line, idx) => (
                       <tr key={idx}>
                         <td>
-                          <select
+                          <SearchSelect
                             className="form-select-sm"
                             value={line.accountId}
-                            onChange={(e) => updateLine(idx, "accountId", e.target.value)}
-                          >
-                            <option value="">{tt("accSelectAccount")}</option>
-                            {accounts.map((a) => (
-                              <option key={a.id} value={a.id}>
-                                {a.code} — {a.name}
-                              </option>
-                            ))}
-                          </select>
+                            onChange={(val) => updateLine(idx, "accountId", val)}
+                            placeholder={tt("accSelectAccount")}
+                            options={accounts.map((a) => ({
+                              value: String(a.id),
+                              label: `${a.code} — ${a.name}`,
+                            }))}
+                          />
                         </td>
                         <td>
                           <input
@@ -730,7 +739,7 @@ function Accounting() {
                       status: totals.balanced ? tt("accBalanced") : tt("accNotBalanced"),
                     })}
                   </span>
-                  <button type="submit" disabled={posting}>
+                  <button type="submit" disabled={posting || !canPostJournal}>
                     {posting ? tt("accPosting") : tt("accPostJournal")}
                   </button>
                 </div>

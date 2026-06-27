@@ -1,4 +1,8 @@
 const prisma = require("../utils/prisma");
+const { resolveCategoryDepartment } = require("../constants/retailDepartments");
+const saleUnits = require("../constants/saleUnits");
+const { parseScaleBarcode, pluLookupCandidates } = require("../utils/pluBarcodeUtil");
+const { parseListQuery, pagedResult } = require("../utils/listQuery");
 
 /** Load variants in a separate query so a stale Prisma client cannot fail on `include: { variants }`. */
 const VARIANTS_MAX_PER_PRODUCT = 200;
@@ -39,6 +43,238 @@ function normalizeAttributeValues(input) {
     if (!key) continue;
     out[key] = value;
   }
+  return out;
+}
+
+const PRODUCT_CONDITIONS = ["NEW", "REFURBISHED", "USED"];
+function normalizeProductCondition(input) {
+  const v = String(input || "").trim().toUpperCase();
+  return PRODUCT_CONDITIONS.includes(v) ? v : null;
+}
+
+function normalizeTags(input) {
+  const rows = Array.isArray(input)
+    ? input
+    : String(input || "")
+        .split(/[,\n]/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+  return rows.slice(0, 30).map((x) => String(x).slice(0, 64));
+}
+
+function optStr(value, max = 191) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return s ? s.slice(0, max) : null;
+}
+
+function optText(value, max = 8000) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return s ? s.slice(0, max) : null;
+}
+
+function optNum(value) {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function optInt(value) {
+  const n = optNum(value);
+  if (n == null) return null;
+  return Math.max(0, Math.floor(n));
+}
+
+async function resolveCategoryLink(branchId, body) {
+  const categoryIdRaw = body.categoryId;
+  if (categoryIdRaw != null && String(categoryIdRaw).trim() !== "") {
+    const id = Number(categoryIdRaw);
+    if (!Number.isNaN(id) && id > 0) {
+      const cat = await prisma.productCategory.findFirst({ where: { id, branchId } });
+      if (cat) return { categoryId: cat.id, category: cat.name };
+    }
+  }
+  const name = body.category != null ? String(body.category || "").trim() : "";
+  if (!name) return { categoryId: null, category: null };
+  const cat = await prisma.productCategory.findFirst({
+    where: { branchId, name: { equals: name } },
+  });
+  return { categoryId: cat?.id ?? null, category: name };
+}
+
+async function resolveSaleUnitFields(branchId, body, categoryLink) {
+  let categoryRow = null;
+  if (categoryLink?.categoryId) {
+    categoryRow = await prisma.productCategory.findFirst({
+      where: { id: categoryLink.categoryId, branchId },
+    });
+  }
+  const dept = resolveCategoryDepartment(categoryLink?.category || body.category, categoryRow);
+  const requested = saleUnits.normalizeSaleUnit(body.saleUnit || body.unitOfMeasure || "");
+  const defaultUnit = saleUnits.getDefaultSaleUnitForDepartment(dept);
+  const finalUnit =
+    requested && saleUnits.validateSaleUnitForDepartment(requested, dept) ? requested : defaultUnit;
+  const sellByWt = saleUnits.syncSellByWeightFromSaleUnit(finalUnit, body.sellByWeight);
+  let allowed = Array.isArray(body.allowedSaleUnits) ? body.allowedSaleUnits : null;
+  if (allowed?.length) {
+    allowed = [
+      ...new Set(
+        allowed
+          .map((x) => saleUnits.normalizeSaleUnit(x))
+          .filter((x) => saleUnits.validateSaleUnitForDepartment(x, dept))
+      ),
+    ];
+  }
+  if (!allowed?.length) {
+    allowed = saleUnits.getAllowedSaleUnitsForDepartment(dept);
+  }
+  if (!allowed.includes(finalUnit)) {
+    allowed = [finalUnit, ...allowed];
+  }
+  return {
+    saleUnit: finalUnit,
+    unitOfMeasure: finalUnit,
+    sellByWeight: sellByWt,
+    allowedSaleUnits: allowed,
+  };
+}
+
+function buildProductData(body, { sellByWt, hasVa, normalizedDiscountType, saleUnitFields }) {
+  const unitFields = saleUnitFields || {};
+  const resolvedSellByWt =
+    unitFields.sellByWeight !== undefined ? unitFields.sellByWeight : sellByWt;
+  return {
+    name: String(body.name || "").trim(),
+    nameBn: optStr(body.nameBn, 191),
+    description: optText(body.description, 12000),
+    shortDescription: optStr(body.shortDescription, 500),
+    manufacturer: optStr(body.manufacturer, 191),
+    countryOfOrigin: optStr(body.countryOfOrigin, 64),
+    genericName: optStr(body.genericName, 191),
+    strength: optStr(body.strength, 64),
+    dosageForm: optStr(body.dosageForm, 64),
+    drugRegNo: optStr(body.drugRegNo, 64),
+    mrp: Math.max(0, Number(body.mrp || 0)),
+    tags: normalizeTags(body.tags),
+    isActive: body.isActive !== false,
+    internalNotes: optText(body.internalNotes, 8000),
+    weightGrams: optNum(body.weightGrams),
+    shelfLifeDays: optInt(body.shelfLifeDays),
+    storageCondition: optStr(body.storageCondition, 64),
+    unitPrice: Number(body.unitPrice || 0),
+    price: Number(body.price),
+    stock: hasVa ? 0 : Number(body.stock || 0),
+    sku: body.sku || null,
+    barcode: body.barcode ? String(body.barcode).trim().slice(0, 191) : null,
+    imageUrl: body.imageUrl ? String(body.imageUrl).trim().slice(0, 500) : null,
+    size: optStr(body.size, 191),
+    color: optStr(body.color, 191),
+    brand: optStr(body.brand, 191),
+    model: optStr(body.model, 191),
+    specification: optText(body.specification, 4000),
+    attributeValues: normalizeAttributeValues(body.attributeValues),
+    imageGallery: normalizeImageGallery(body.imageGallery),
+    hsCode: optStr(body.hsCode, 32),
+    unitOfMeasure: unitFields.unitOfMeasure || optStr(body.unitOfMeasure, 16) || "PCS",
+    saleUnit: unitFields.saleUnit || optStr(body.saleUnit, 16) || null,
+    allowedSaleUnits: unitFields.allowedSaleUnits || null,
+    vatRate: Number(body.vatRate || 0),
+    reorderLevel: Number(body.reorderLevel || 0),
+    defaultDiscountType: normalizedDiscountType,
+    defaultDiscountValue: Number(body.defaultDiscountValue || 0),
+    batchTracked: Boolean(body.batchTracked),
+    trackExpiry: Boolean(body.trackExpiry),
+    trackSerial: Boolean(body.trackSerial),
+    trackImei: Boolean(body.trackImei),
+    requiresKyc: Boolean(body.requiresKyc),
+    warrantyDays:
+      body.warrantyDays != null && body.warrantyDays !== ""
+        ? Math.max(0, Math.min(3650, Number(body.warrantyDays)))
+        : null,
+    sellByWeight: resolvedSellByWt,
+    stockKg: resolvedSellByWt ? Math.max(0, Number(body.stockKg || 0)) : 0,
+    hasVariants: hasVa,
+    isRawMaterial: Boolean(body.isRawMaterial),
+    isManufactured: Boolean(body.isManufactured),
+    sdRate: Math.min(100, Math.max(0, Number(body.sdRate || 0))),
+    nbrProductCode: optStr(body.nbrProductCode, 32),
+    bstiCertNo: optStr(body.bstiCertNo, 64),
+    isHalalCertified: Boolean(body.isHalalCertified),
+    halalCertNo: optStr(body.halalCertNo, 64),
+    importerName: optStr(body.importerName, 191),
+    importerAddress: optText(body.importerAddress, 1000),
+    productCondition: normalizeProductCondition(body.productCondition),
+    purchaseUnit: optStr(body.purchaseUnit, 16),
+    unitsPerPack: optInt(body.unitsPerPack),
+    packsPerCarton: optInt(body.packsPerCarton),
+    netWeightGrams: optNum(body.netWeightGrams),
+    grossWeightGrams: optNum(body.grossWeightGrams),
+    lengthCm: optNum(body.lengthCm),
+    widthCm: optNum(body.widthCm),
+    heightCm: optNum(body.heightCm),
+    minOrderQty: optInt(body.minOrderQty),
+    maxOrderQty: optInt(body.maxOrderQty),
+    leadTimeDays: optInt(body.leadTimeDays),
+  };
+}
+
+const LEGACY_PRODUCT_FIELD_STRIPS = [
+  "nameBn",
+  "description",
+  "shortDescription",
+  "manufacturer",
+  "countryOfOrigin",
+  "genericName",
+  "strength",
+  "dosageForm",
+  "drugRegNo",
+  "mrp",
+  "tags",
+  "isActive",
+  "internalNotes",
+  "weightGrams",
+  "shelfLifeDays",
+  "storageCondition",
+  "hsCode",
+  "unitOfMeasure",
+  "saleUnit",
+  "allowedSaleUnits",
+  "size",
+  "color",
+  "brand",
+  "model",
+  "specification",
+  "attributeValues",
+  "imageGallery",
+  "barcode",
+  "imageUrl",
+  "categoryId",
+  "sdRate",
+  "nbrProductCode",
+  "bstiCertNo",
+  "isHalalCertified",
+  "halalCertNo",
+  "importerName",
+  "importerAddress",
+  "productCondition",
+  "purchaseUnit",
+  "unitsPerPack",
+  "packsPerCarton",
+  "netWeightGrams",
+  "grossWeightGrams",
+  "lengthCm",
+  "widthCm",
+  "heightCm",
+  "minOrderQty",
+  "maxOrderQty",
+  "leadTimeDays",
+  "trackImei",
+];
+
+function stripLegacyProductFields(data) {
+  const out = { ...data };
+  for (const key of LEGACY_PRODUCT_FIELD_STRIPS) delete out[key];
   return out;
 }
 
@@ -162,22 +398,12 @@ async function attachPriceListsToProduct(branchId, product) {
 exports.createProduct = async (req, res) => {
   try {
     const branchId = req.branchId || Number(req.body.branchId || 1);
+    const body = req.body || {};
     const {
       name,
       unitPrice,
       price,
       stock,
-      category,
-      sku,
-      barcode,
-      imageUrl,
-      size,
-      color,
-      brand,
-      model,
-      specification,
-      attributeValues,
-      imageGallery,
       vatRate,
       defaultDiscountType,
       defaultDiscountValue,
@@ -186,7 +412,7 @@ exports.createProduct = async (req, res) => {
       sellByWeight,
       stockKg,
       hasVariants,
-    } = req.body;
+    } = body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Product name must be at least 2 characters" });
     }
@@ -203,18 +429,20 @@ exports.createProduct = async (req, res) => {
       branchId,
       unitPrice: Number(unitPrice || 0),
       sellingPrice: Number(price),
-      category,
+      category: body.category,
     });
     if (!marginCheck.ok) return res.status(400).json({ error: marginCheck.message });
-    const sellByWt = Boolean(sellByWeight);
+    const categoryLink = await resolveCategoryLink(branchId, body);
+    const saleUnitFields = await resolveSaleUnitFields(branchId, body, categoryLink);
+    const sellByWt = saleUnitFields.sellByWeight;
     const kgStock = Math.max(0, Number(stockKg || 0));
     const hasVa = Boolean(hasVariants);
     if (sellByWt && hasVa) {
       return res.status(400).json({ error: "Sell-by-weight and size/color variants cannot both be enabled" });
     }
-    if ((sellByWt || hasVa) && Boolean(batchTracked)) {
+    if (sellByWt && (Boolean(batchTracked) || Boolean(body.trackExpiry))) {
       return res.status(400).json({
-        error: "Batch/expiry tracking is not supported yet for weighed or variant items — disable batch tracking first",
+        error: "Batch/expiry tracking cannot be used with sell-by-weight products",
       });
     }
     const normalizedDiscountType = defaultDiscountType || null;
@@ -230,46 +458,18 @@ exports.createProduct = async (req, res) => {
 
     const createData = {
       branchId,
-      name,
-      unitPrice: Number(unitPrice || 0),
-      price: Number(price),
-      stock: hasVa ? 0 : Number(stock || 0),
-      category,
-      sku: sku || null,
-      barcode: barcode ? String(barcode).trim().slice(0, 191) : null,
-      imageUrl: imageUrl ? String(imageUrl).trim().slice(0, 500) : null,
-      size: size ? String(size).trim().slice(0, 191) : null,
-      color: color ? String(color).trim().slice(0, 191) : null,
-      brand: brand ? String(brand).trim().slice(0, 191) : null,
-      model: model ? String(model).trim().slice(0, 191) : null,
-      specification: specification ? String(specification).trim().slice(0, 4000) : null,
-      attributeValues: normalizeAttributeValues(attributeValues),
-      imageGallery: normalizeImageGallery(imageGallery),
-      vatRate: Number(vatRate || 0),
-      reorderLevel: Number(reorderLevel || 0),
-      defaultDiscountType: normalizedDiscountType,
-      defaultDiscountValue: Number(defaultDiscountValue || 0),
-      batchTracked: Boolean(batchTracked),
-      sellByWeight: sellByWt,
-      stockKg: sellByWt ? kgStock : 0,
-      hasVariants: hasVa,
+      ...buildProductData(
+        { ...body, stock, vatRate: body.vatRate, attributeValues: body.attributeValues, imageGallery: body.imageGallery },
+        { sellByWt, hasVa, normalizedDiscountType, saleUnitFields }
+      ),
+      ...categoryLink,
     };
     let product;
     try {
       product = await prisma.product.create({ data: createData });
     } catch (e) {
       if (!isMissingColumnError(e)) throw e;
-      const fallbackData = { ...createData };
-      delete fallbackData.size;
-      delete fallbackData.color;
-      delete fallbackData.brand;
-      delete fallbackData.model;
-      delete fallbackData.specification;
-      delete fallbackData.attributeValues;
-      delete fallbackData.imageGallery;
-      delete fallbackData.barcode;
-      delete fallbackData.imageUrl;
-      product = await prisma.product.create({ data: fallbackData });
+      product = await prisma.product.create({ data: stripLegacyProductFields(createData) });
     }
 
     res.status(201).json(product);
@@ -286,11 +486,46 @@ exports.getProducts = async (req, res) => {
     const branchId = req.branchId || Number(req.query.branchId || 1);
     const includeVariants = String(req.query.include || "").includes("variants");
     const includePriceLists = String(req.query.include || "").toLowerCase().includes("pricelists");
+
+    const lq = parseListQuery(req, {
+      searchableFields: [
+        "name", "nameBn", "sku", "barcode", "category", "brand", "manufacturer",
+        "genericName", "model", "size", "color", "specification", "drugRegNo",
+        "strength", "dosageForm", "hsCode", "countryOfOrigin",
+        "nbrProductCode", "bstiCertNo", "importerName",
+      ],
+      filterableFields: ["category", "brand", "isActive", "batchTracked"],
+      sortableFields: [
+        "name", "sku", "category", "price", "unitPrice", "mrp", "stock",
+        "reorderLevel", "vatRate", "createdAt",
+      ],
+      defaultSort: "createdAt",
+      defaultSortDir: "desc",
+      defaultPageSize: 10,
+    });
+
+    const where = { branchId };
+    if (String(req.query.activeOnly || "").toLowerCase() === "true") {
+      where.isActive = true;
+    }
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    // Backward compatible: only paginate + wrap when the client opts in.
+    if (lq.paged) {
+      const [products, total] = await prisma.$transaction([
+        prisma.product.findMany({ where, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.product.count({ where }),
+      ]);
+      if (includeVariants) await attachVariantsToProducts(branchId, products);
+      if (includePriceLists) {
+        await Promise.all(products.map((p) => attachPriceListsToProduct(branchId, p)));
+      }
+      return res.json(pagedResult({ data: products, total, page: lq.page, pageSize: lq.pageSize }));
+    }
+
     const products = await prisma.product.findMany({
-      where: { branchId },
-      orderBy: {
-        createdAt: "desc",
-      },
+      where,
+      orderBy: lq.orderBy || { createdAt: "desc" },
     });
     if (includeVariants) {
       await attachVariantsToProducts(branchId, products);
@@ -305,6 +540,95 @@ exports.getProducts = async (req, res) => {
   }
 };
 
+async function resolveProductByScanCode(branchId, code) {
+  const scanCode = String(code || "").trim();
+  if (!scanCode) return null;
+
+  const variantHit = await prisma.productVariant.findFirst({
+    where: { branchId, barcode: scanCode },
+    include: { product: true },
+  });
+  if (variantHit?.product?.branchId === branchId) {
+    return {
+      product: variantHit.product,
+      matchedVariant: {
+        id: variantHit.id,
+        label: variantHit.label,
+        barcode: variantHit.barcode,
+        sku: variantHit.sku,
+        stock: variantHit.stock,
+        priceOverride: variantHit.priceOverride,
+      },
+    };
+  }
+
+  if (prisma.productBarcode) {
+    try {
+      const aliasHit = await prisma.productBarcode.findFirst({
+        where: { branchId, barcode: scanCode },
+        include: { product: true, productVariant: true },
+      });
+      if (aliasHit?.product?.branchId === branchId) {
+        return {
+          product: aliasHit.product,
+          matchedBarcodeAlias: {
+            id: aliasHit.id,
+            barcode: aliasHit.barcode,
+            note: aliasHit.note || "",
+          },
+          ...(aliasHit.productVariant
+            ? {
+                matchedVariant: {
+                  id: aliasHit.productVariant.id,
+                  label: aliasHit.productVariant.label,
+                  barcode: aliasHit.productVariant.barcode,
+                  sku: aliasHit.productVariant.sku,
+                  stock: aliasHit.productVariant.stock,
+                  priceOverride: aliasHit.productVariant.priceOverride,
+                  imageUrl: aliasHit.productVariant.imageUrl || null,
+                },
+              }
+            : {}),
+        };
+      }
+    } catch (e) {
+      if (!isMissingTableError(e, "productbarcode")) throw e;
+    }
+  }
+
+  let product = null;
+  try {
+    product = await prisma.product.findFirst({
+      where: {
+        branchId,
+        OR: [{ sku: scanCode }, { barcode: scanCode }, { name: { contains: scanCode } }],
+      },
+      orderBy: { createdAt: "desc" },
+    });
+  } catch (e) {
+    if (!isMissingColumnError(e, "barcode")) throw e;
+    product = await prisma.product.findFirst({
+      where: {
+        branchId,
+        OR: [{ sku: scanCode }, { name: { contains: scanCode } }],
+      },
+      orderBy: { createdAt: "desc" },
+    });
+  }
+
+  if (!product) return null;
+  return { product };
+}
+
+async function enrichProductScanResponse(branchId, payload) {
+  const product = payload.product;
+  await attachVariantsToProduct(branchId, product);
+  await attachBarcodesToProduct(branchId, product);
+  await attachPriceListsToProduct(branchId, product);
+  const { product: _p, ...rest } = payload;
+  return { ...product, ...rest };
+}
+
 exports.findProductByCode = async (req, res) => {
   try {
     const branchId = req.branchId || Number(req.query.branchId || 1);
@@ -313,93 +637,36 @@ exports.findProductByCode = async (req, res) => {
       return res.status(400).json({ error: "Barcode/SKU code is required" });
     }
 
-    const variantHit = await prisma.productVariant.findFirst({
-      where: { branchId, barcode: code },
-      include: { product: true },
+    const branchRow = await prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { scalePluDigits: true },
     });
-    if (variantHit?.product?.branchId === branchId) {
-      const product = variantHit.product;
-      await attachPriceListsToProduct(branchId, product);
-      return res.json({
-        ...product,
-        matchedVariant: {
-          id: variantHit.id,
-          label: variantHit.label,
-          barcode: variantHit.barcode,
-          sku: variantHit.sku,
-          stock: variantHit.stock,
-          priceOverride: variantHit.priceOverride,
-        },
-      });
-    }
-    if (prisma.productBarcode) {
-      try {
-        const aliasHit = await prisma.productBarcode.findFirst({
-          where: { branchId, barcode: code },
-          include: { product: true, productVariant: true },
-        });
-        if (aliasHit?.product?.branchId === branchId) {
-          const product = aliasHit.product;
-          await attachPriceListsToProduct(branchId, product);
-          return res.json({
-            ...product,
-            matchedBarcodeAlias: {
-              id: aliasHit.id,
-              barcode: aliasHit.barcode,
-              note: aliasHit.note || "",
-            },
-            ...(aliasHit.productVariant
-              ? {
-                  matchedVariant: {
-                    id: aliasHit.productVariant.id,
-                    label: aliasHit.productVariant.label,
-                    barcode: aliasHit.productVariant.barcode,
-                    sku: aliasHit.productVariant.sku,
-                    stock: aliasHit.productVariant.stock,
-                    priceOverride: aliasHit.productVariant.priceOverride,
-                    imageUrl: aliasHit.productVariant.imageUrl || null,
-                  },
-                }
-              : {}),
-          });
-        }
-      } catch (e) {
-        if (!isMissingTableError(e, "productbarcode")) throw e;
+    const scale = parseScaleBarcode(code, branchRow?.scalePluDigits);
+    const lookupCodes = scale
+      ? pluLookupCandidates(scale.plu, scale.pluBlock)
+      : [code];
+
+    for (const scanCode of lookupCodes) {
+      const hit = await resolveProductByScanCode(branchId, scanCode);
+      if (!hit) continue;
+      const body = await enrichProductScanResponse(branchId, hit);
+      if (scale) {
+        body.scaleScan = {
+          weightKg: scale.weightKg,
+          plu: scale.plu,
+          originalCode: code,
+        };
       }
+      return res.json(body);
     }
 
-    let product = null;
-    try {
-      product = await prisma.product.findFirst({
-        where: {
-          branchId,
-          OR: [{ sku: code }, { barcode: code }, { name: { contains: code } }],
-        },
-        orderBy: {
-          createdAt: "desc",
-        },
-      });
-    } catch (e) {
-      if (!isMissingColumnError(e, "barcode")) throw e;
-      product = await prisma.product.findFirst({
-        where: {
-          branchId,
-          OR: [{ sku: code }, { name: { contains: code } }],
-        },
-        orderBy: {
-          createdAt: "desc",
-        },
+    if (scale) {
+      return res.status(404).json({
+        error: `No product linked to scale PLU ${scale.plu}. Set product barcode/SKU to match the PLU on the scale label.`,
       });
     }
 
-    if (!product) {
-      return res.status(404).json({ error: "Product not found" });
-    }
-
-    await attachVariantsToProduct(branchId, product);
-    await attachBarcodesToProduct(branchId, product);
-    await attachPriceListsToProduct(branchId, product);
-    res.json(product);
+    return res.status(404).json({ error: "Product not found" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -443,23 +710,13 @@ exports.updateProduct = async (req, res) => {
       return res.status(404).json({ error: "Product not found" });
     }
 
+    const body = req.body || {};
     const {
       name,
       unitPrice,
       price,
       stock,
       category,
-      sku,
-      barcode,
-      imageUrl,
-      size,
-      color,
-      brand,
-      model,
-      specification,
-      attributeValues,
-      imageGallery,
-      vatRate,
       defaultDiscountType,
       defaultDiscountValue,
       reorderLevel,
@@ -467,7 +724,7 @@ exports.updateProduct = async (req, res) => {
       sellByWeight,
       stockKg,
       hasVariants,
-    } = req.body;
+    } = body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Product name must be at least 2 characters" });
     }
@@ -497,45 +754,54 @@ exports.updateProduct = async (req, res) => {
     if (normalizedDiscountType === "PERCENT" && Number(defaultDiscountValue || 0) > 100) {
       return res.status(400).json({ error: "Default percent discount cannot exceed 100" });
     }
-    const sellByWt =
-      typeof sellByWeight === "boolean" ? sellByWeight : Boolean(existing.sellByWeight);
+    const categoryLink = await resolveCategoryLink(branchId, {
+      category: category != null ? category : existing.category,
+      categoryId: body.categoryId != null ? body.categoryId : existing.categoryId,
+    });
+    const saleUnitFields = await resolveSaleUnitFields(
+      branchId,
+      {
+        ...body,
+        saleUnit: body.saleUnit ?? body.unitOfMeasure ?? existing.saleUnit ?? existing.unitOfMeasure,
+        unitOfMeasure: body.unitOfMeasure ?? existing.unitOfMeasure,
+        sellByWeight:
+          typeof sellByWeight === "boolean" ? sellByWeight : Boolean(existing.sellByWeight),
+        category: category != null ? category : existing.category,
+      },
+      categoryLink
+    );
+    const sellByWt = saleUnitFields.sellByWeight;
     const kgStock = Number(stockKg != null ? stockKg : existing.stockKg ?? 0);
     const hasVa = typeof hasVariants === "boolean" ? hasVariants : Boolean(existing.hasVariants);
     const nextBatch =
       typeof batchTracked === "boolean" ? batchTracked : Boolean(existing.batchTracked);
+    const nextTrackExpiry =
+      typeof body.trackExpiry === "boolean" ? body.trackExpiry : Boolean(existing.trackExpiry);
     if (sellByWt && hasVa) {
       return res.status(400).json({ error: "Sell-by-weight and size/color variants cannot both be enabled" });
     }
-    if ((sellByWt || hasVa) && nextBatch) {
+    if (sellByWt && (nextBatch || nextTrackExpiry)) {
       return res.status(400).json({
-        error: "Batch/expiry tracking is not supported yet for weighed or variant items — disable batch tracking first",
+        error: "Batch/expiry tracking cannot be used with sell-by-weight products",
       });
     }
 
     const updateData = {
-      name: String(name).trim(),
-      unitPrice: Number(unitPrice ?? existing.unitPrice ?? 0),
-      price: Number(price),
-      stock: hasVa ? 0 : Number(stock),
-      category: category || null,
-      sku: sku || null,
-      barcode: barcode ? String(barcode).trim().slice(0, 191) : null,
-      imageUrl: imageUrl ? String(imageUrl).trim().slice(0, 500) : null,
-      size: size ? String(size).trim().slice(0, 191) : null,
-      color: color ? String(color).trim().slice(0, 191) : null,
-      brand: brand ? String(brand).trim().slice(0, 191) : null,
-      model: model ? String(model).trim().slice(0, 191) : null,
-      specification: specification ? String(specification).trim().slice(0, 4000) : null,
-      attributeValues: normalizeAttributeValues(attributeValues),
-      imageGallery: normalizeImageGallery(imageGallery),
-      vatRate: Number(vatRate || 0),
-      reorderLevel: Number(reorderLevel || 0),
-      defaultDiscountType: normalizedDiscountType,
-      defaultDiscountValue: Number(defaultDiscountValue || 0),
-      batchTracked: nextBatch,
-      sellByWeight: sellByWt,
-      stockKg: sellByWt ? Math.max(0, kgStock) : 0,
-      hasVariants: hasVa,
+      ...buildProductData(
+        {
+          ...body,
+          name,
+          unitPrice: unitPrice ?? existing.unitPrice,
+          price,
+          stock,
+          vatRate: body.vatRate != null ? body.vatRate : existing.vatRate,
+          attributeValues: body.attributeValues,
+          imageGallery: body.imageGallery,
+          isActive: body.isActive !== undefined ? body.isActive : existing.isActive !== false,
+        },
+        { sellByWt, hasVa, normalizedDiscountType, saleUnitFields }
+      ),
+      ...categoryLink,
     };
     let product;
     try {
@@ -545,19 +811,9 @@ exports.updateProduct = async (req, res) => {
       });
     } catch (e) {
       if (!isMissingColumnError(e)) throw e;
-      const fallbackData = { ...updateData };
-      delete fallbackData.size;
-      delete fallbackData.color;
-      delete fallbackData.brand;
-      delete fallbackData.model;
-      delete fallbackData.specification;
-      delete fallbackData.attributeValues;
-      delete fallbackData.imageGallery;
-      delete fallbackData.barcode;
-      delete fallbackData.imageUrl;
       product = await prisma.product.update({
         where: { id },
-        data: fallbackData,
+        data: stripLegacyProductFields(updateData),
       });
     }
 

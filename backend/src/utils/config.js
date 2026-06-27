@@ -51,6 +51,24 @@ const allowedOrigins = readList("ALLOWED_ORIGINS", {
   defaultValue: isProd ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"],
 });
 
+// Fail fast in production on weak/default operational secrets. These are read
+// via process.env at their call sites; we only validate here so a misconfigured
+// deployment refuses to boot instead of silently using guessable values.
+if (isProd) {
+  const managerPin = process.env.MANAGER_APPROVAL_PIN;
+  if (!managerPin || managerPin.trim() === "" || managerPin.trim() === "1234") {
+    throw new Error(
+      "[config] MANAGER_APPROVAL_PIN must be set to a strong, non-default value in production (the default \"1234\" is not allowed)."
+    );
+  }
+  const otpSalt = process.env.LOYALTY_OTP_SALT;
+  if (!otpSalt || otpSalt.trim().length < 16) {
+    throw new Error(
+      "[config] LOYALTY_OTP_SALT must be set to a random value of at least 16 characters in production."
+    );
+  }
+}
+
 const config = Object.freeze({
   env: process.env.NODE_ENV || "development",
   isProd,
@@ -65,6 +83,20 @@ const config = Object.freeze({
     loginMax: readInt("RATE_LIMIT_LOGIN_MAX", { defaultValue: 10 }),
     bootstrapWindowMs: readInt("RATE_LIMIT_BOOTSTRAP_WINDOW_MS", { defaultValue: 60 * 60 * 1000 }),
     bootstrapMax: readInt("RATE_LIMIT_BOOTSTRAP_MAX", { defaultValue: 5 }),
+    // Generous global ceiling per IP — high enough not to disrupt a busy
+    // multi-terminal store behind one NAT, low enough to blunt scraping/DoS.
+    apiWindowMs: readInt("RATE_LIMIT_API_WINDOW_MS", { defaultValue: 15 * 60 * 1000 }),
+    apiMax: readInt("RATE_LIMIT_API_MAX", { defaultValue: 5000 }),
+    // Strict ceiling for public OTP requests (SMS cost / OTP-bombing abuse).
+    otpWindowMs: readInt("RATE_LIMIT_OTP_WINDOW_MS", { defaultValue: 15 * 60 * 1000 }),
+    otpMax: readInt("RATE_LIMIT_OTP_MAX", { defaultValue: 20 }),
+  },
+  security: {
+    // Optional shared secret for verifying provider payment callbacks. When set,
+    // the MFS callback endpoint requires a matching x-callback-secret header or
+    // ?secret= query param. Leave unset to accept callbacks (still re-verified
+    // against the provider before a session is marked paid).
+    mfsCallbackSecret: readString("MFS_CALLBACK_SECRET", { required: false }),
   },
   bootstrap: {
     // Optional shared secret required to call /api/bootstrap/seed.

@@ -1,6 +1,7 @@
 const prisma = require("../../utils/prisma");
 const { writeAuditLog } = require("../../utils/audit");
 const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
 
 function generateGiftCode() {
   return `GC-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`.toUpperCase();
@@ -67,13 +68,29 @@ exports.listGiftCards = async (req, res) => {
   try {
     const branchId = req.branchId;
     const status = String(req.query.status || "").trim();
+    const lq = parseListQuery(req, {
+      searchableFields: ["code"],
+      sortableFields: ["id", "code", "balance", "status", "expiresAt", "createdAt"],
+      defaultSort: "id",
+      defaultSortDir: "desc",
+    });
     const where = {
       branchId,
       ...(status ? { status } : {}),
     };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    if (lq.paged) {
+      const [rows, total] = await prisma.$transaction([
+        prisma.giftCard.findMany({ where, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.giftCard.count({ where }),
+      ]);
+      return res.json(pagedResult({ data: rows, total, page: lq.page, pageSize: lq.pageSize }));
+    }
+
     const rows = await prisma.giftCard.findMany({
       where,
-      orderBy: { id: "desc" },
+      orderBy: lq.orderBy || { id: "desc" },
       take: 500,
     });
     res.json(rows);

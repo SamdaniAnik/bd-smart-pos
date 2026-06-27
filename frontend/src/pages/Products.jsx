@@ -1,19 +1,34 @@
-import { useEffect, useMemo, useState } from "react";
-import Select from "react-select";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import SearchSelect from "../components/SearchSelect";
+import useServerTable from "../hooks/useServerTable";
 import JsBarcode from "jsbarcode";
-import { notifyActionRequired } from "../utils/notify";
-import { createSearchSelectStyles } from "../utils/selectStyles";
+import { notifyActionRequired, notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { getLang, t } from "../i18n";
-
-const SEARCH_SELECT_STYLES = createSearchSelectStyles(38);
-const CATEGORY_ATTRIBUTE_PRESETS = {
-  APPAREL: ["size", "color", "material", "fit"],
-  ELECTRONICS: ["brand", "model", "specification", "warranty"],
-  FOOTWEAR: ["size", "color", "gender", "material"],
-  GROCERY: ["brand", "pack_size", "origin"],
-};
+import {
+  APPAREL_SIZE_PRESETS,
+  CATEGORY_ATTRIBUTE_PRESETS,
+  GROCERY_CATEGORY_CHIPS,
+  isApparelCategory,
+  isPharmacyCategory,
+} from "../constants/retailDepartments";
+import ProductFormSections from "../components/ProductFormSections";
+import {
+  EMPTY_PRODUCT_FORM,
+  productFormToPayload,
+  rowToProductForm,
+  STORAGE_OPTIONS,
+} from "../utils/productMasterForm";
+import { SALE_UNIT_LABEL_KEYS } from "../constants/saleUnits";
+import { formatProductStockDisplay } from "../utils/formatSaleLineQty";
+import {
+  consumePendingLabelQueue,
+  mergeIntoLabelQueue,
+  writeLabelQueue,
+} from "../utils/labelPrintQueue";
 
 function Products() {
   const [uiLang, setUiLang] = useState(() => getLang());
@@ -27,33 +42,19 @@ function Products() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canManageProducts = hasPermission("product.create");
+
+  const requireProductCreate = () => {
+    if (canManageProducts) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "product.create" }));
+    return false;
+  };
 
   const [products, setProducts] = useState([]);
   const [productCategories, setProductCategories] = useState([]);
-  const [form, setForm] = useState({
-    name: "",
-    unitPrice: "",
-    price: "",
-    stock: "",
-    category: "",
-    sku: "",
-    barcode: "",
-    imageUrl: "",
-    size: "",
-    color: "",
-    brand: "",
-    model: "",
-    specification: "",
-    imageGalleryText: "",
-    vatRate: "",
-    reorderLevel: "",
-    defaultDiscountType: "",
-    defaultDiscountValue: "",
-    batchTracked: false,
-    sellByWeight: false,
-    stockKg: "",
-    hasVariants: false,
-  });
+  const [form, setForm] = useState({ ...EMPTY_PRODUCT_FORM });
+  const [formSection, setFormSection] = useState("identity");
   const [variantDraft, setVariantDraft] = useState({
     label: "",
     sku: "",
@@ -82,14 +83,17 @@ function Products() {
   const [bulkLabelQty, setBulkLabelQty] = useState(1);
   const [bulkCategory, setBulkCategory] = useState("");
   const [bulkLowStockOnly, setBulkLowStockOnly] = useState(false);
+  const [labelAisleFilter, setLabelAisleFilter] = useState("");
   const [sheetTemplate, setSheetTemplate] = useState("free");
   const [productsTab, setProductsTab] = useState("form");
   const [categoryForm, setCategoryForm] = useState({
     id: "",
     name: "",
+    department: "",
     attributeSetText: "",
     minMarginPct: "",
   });
+  const [seedingCategories, setSeedingCategories] = useState(false);
 
   const selectedLabelProducts = useMemo(
     () => products.filter((p) => Number(labelQtyByProduct[p.id] || 0) > 0),
@@ -127,10 +131,21 @@ function Products() {
     ) {
       return Number(selectedCategoryConfig.minMarginPct);
     }
-    if (selectedCategoryKey === "APPAREL") return 15;
+    if (selectedCategoryKey === "APPAREL" || selectedCategoryKey === "FOOTWEAR") return 15;
     if (selectedCategoryKey === "ELECTRONICS") return 20;
+    if (isPharmacyCategory(selectedCategoryKey)) return 12;
+    if (selectedCategoryKey === "GROCERY" || selectedCategoryKey === "DAIRY") return 8;
     return 10;
   }, [selectedCategoryKey, selectedCategoryConfig]);
+  const categoryRetailHint = useMemo(() => {
+    if (isPharmacyCategory(selectedCategoryKey)) {
+      return form.batchTracked ? null : "pharmacy";
+    }
+    if (isApparelCategory(selectedCategoryKey)) {
+      return form.hasVariants ? null : "apparel";
+    }
+    return null;
+  }, [selectedCategoryKey, form.batchTracked, form.hasVariants]);
   const marginPreviewPct = useMemo(() => {
     const unit = Number(form.unitPrice || 0);
     const selling = Number(form.price || 0);
@@ -147,6 +162,28 @@ function Products() {
     setProductCategories(Array.isArray(categoriesRes.data) ? categoriesRes.data : []);
   };
 
+  // Server-driven data source for the product list table (backend search/sort/paging).
+  const fetchProductPage = useCallback(async (q) => {
+    const res = await api.get("/products", {
+      params: {
+        include: "variants",
+        paged: true,
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const productsTable = useServerTable(fetchProductPage, {
+    pageSize: 10,
+    sortKey: "createdAt",
+    sortDir: "desc",
+  });
+
   const refreshSelectedProduct = async (id) => {
     if (!id) return;
     const res = await api.get(`/products/${id}`);
@@ -160,45 +197,36 @@ function Products() {
     return () => clearTimeout(timer);
   }, []);
 
+  useEffect(() => {
+    if (!products.length) return;
+    const pending = consumePendingLabelQueue();
+    if (pending.tab === "labels") setProductsTab("labels");
+    if (pending.aisle) {
+      setLabelAisleFilter(pending.aisle);
+      setBulkCategory(pending.aisle);
+    }
+    const queueIds = Object.keys(pending.queue || {});
+    if (!queueIds.length) return;
+    setLabelQtyByProduct((prev) => {
+      const next = { ...prev };
+      for (const [id, qty] of Object.entries(pending.queue)) {
+        const n = Math.max(1, Math.floor(Number(qty || 1)));
+        next[Number(id)] = Math.max(Number(next[Number(id)] || 0), n);
+      }
+      return next;
+    });
+  }, [products.length]);
+
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!requireProductCreate()) return;
     if (marginPreviewPct < minMarginPct) {
       notifyActionRequired(
         `Minimum margin for ${form.category || "this category"} is ${minMarginPct}%. Current margin ${marginPreviewPct.toFixed(2)}%.`
       );
       return;
     }
-    const imageGallery = String(form.imageGalleryText || "")
-      .split(/[\n,]/)
-      .map((x) => x.trim())
-      .filter(Boolean)
-      .slice(0, 20);
-
-    const payload = {
-      name: form.name,
-      unitPrice: Number(form.unitPrice || 0),
-      price: Number(form.price),
-      stock: Number(form.stock),
-      category: form.category,
-      sku: form.sku || null,
-      barcode: form.barcode || null,
-      imageUrl: form.imageUrl || null,
-      size: form.size || null,
-      color: form.color || null,
-      brand: form.brand || null,
-      model: form.model || null,
-      specification: form.specification || null,
-      attributeValues: attributeDraft || {},
-      imageGallery,
-      vatRate: Number(form.vatRate || 0),
-      reorderLevel: Number(form.reorderLevel || 0),
-      defaultDiscountType: form.defaultDiscountType || null,
-      defaultDiscountValue: Number(form.defaultDiscountValue || 0),
-      batchTracked: Boolean(form.batchTracked),
-      sellByWeight: Boolean(form.sellByWeight),
-      stockKg: Number(form.stockKg || 0),
-      hasVariants: Boolean(form.hasVariants),
-    };
+    const payload = productFormToPayload(form, attributeDraft);
 
     if (editingId) {
       await api.put(`/products/${editingId}`, payload);
@@ -206,30 +234,8 @@ function Products() {
       await api.post("/products", payload);
     }
 
-    setForm({
-      name: "",
-      unitPrice: "",
-      price: "",
-      stock: "",
-      category: "",
-      sku: "",
-      barcode: "",
-      imageUrl: "",
-      size: "",
-      color: "",
-      brand: "",
-      model: "",
-      specification: "",
-      imageGalleryText: "",
-      vatRate: "",
-      reorderLevel: "",
-      defaultDiscountType: "",
-      defaultDiscountValue: "",
-      batchTracked: false,
-      sellByWeight: false,
-      stockKg: "",
-      hasVariants: false,
-    });
+    setForm({ ...EMPTY_PRODUCT_FORM });
+    setFormSection("identity");
     setEditingId(null);
     setSelected(null);
     setBarcodeAliasDraft({ barcode: "", note: "", variantId: "" });
@@ -237,35 +243,14 @@ function Products() {
     setPriceListDraft({ priceType: "RETAIL", amount: "", effectiveFrom: "", effectiveTo: "", note: "" });
 
     fetchProducts();
+    productsTable.refresh();
   };
 
   const handleEdit = (row) => {
     setEditingId(row.id);
     setSelected(row);
-    setForm({
-      name: row.name || "",
-      unitPrice: row.unitPrice ?? "",
-      price: row.price ?? "",
-      stock: row.stock ?? "",
-      category: row.category || "",
-      sku: row.sku || "",
-      barcode: row.barcode || "",
-      imageUrl: row.imageUrl || "",
-      size: row.size || "",
-      color: row.color || "",
-      brand: row.brand || "",
-      model: row.model || "",
-      specification: row.specification || "",
-      imageGalleryText: Array.isArray(row.imageGallery) ? row.imageGallery.join("\n") : "",
-      vatRate: row.vatRate ?? "",
-      reorderLevel: row.reorderLevel ?? "",
-      defaultDiscountType: row.defaultDiscountType || "",
-      defaultDiscountValue: row.defaultDiscountValue ?? "",
-      batchTracked: Boolean(row.batchTracked),
-      sellByWeight: Boolean(row.sellByWeight),
-      stockKg: row.stockKg ?? "",
-      hasVariants: Boolean(row.hasVariants),
-    });
+    setForm(rowToProductForm(row));
+    setFormSection("identity");
     setAttributeDraft(
       row && row.attributeValues && typeof row.attributeValues === "object" && !Array.isArray(row.attributeValues)
         ? row.attributeValues
@@ -287,41 +272,26 @@ function Products() {
 
   const handleCancelEdit = () => {
     setEditingId(null);
-    setForm({
-      name: "",
-      unitPrice: "",
-      price: "",
-      stock: "",
-      category: "",
-      sku: "",
-      barcode: "",
-      imageUrl: "",
-      size: "",
-      color: "",
-      brand: "",
-      model: "",
-      specification: "",
-      imageGalleryText: "",
-      vatRate: "",
-      reorderLevel: "",
-      defaultDiscountType: "",
-      defaultDiscountValue: "",
-      batchTracked: false,
-      sellByWeight: false,
-      stockKg: "",
-      hasVariants: false,
-    });
+    setForm({ ...EMPTY_PRODUCT_FORM });
+    setFormSection("identity");
     setBarcodeAliasDraft({ barcode: "", note: "", variantId: "" });
     setAttributeDraft({});
     setPriceListDraft({ priceType: "RETAIL", amount: "", effectiveFrom: "", effectiveTo: "", note: "" });
   };
 
+  const showPharmacySection = useMemo(
+    () => isPharmacyCategory(selectedCategoryKey) || Boolean(form.genericName || form.drugRegNo),
+    [selectedCategoryKey, form.genericName, form.drugRegNo]
+  );
+
   const handleDelete = async (row) => {
+    if (!requireProductCreate()) return;
     if (!window.confirm(tt("prodConfirmDeleteProduct", { name: row.name }))) return;
     await api.delete(`/products/${row.id}`);
     if (selected?.id === row.id) setSelected(null);
     if (editingId === row.id) handleCancelEdit();
     fetchProducts();
+    productsTable.refresh();
   };
 
   const setLabelQty = (productId, qty) => {
@@ -365,15 +335,30 @@ function Products() {
         const variantRows =
           row.hasVariants && Array.isArray(row.variants) && row.variants.length ? row.variants : null;
 
-        const makeSlices = (name, metaCode, unitPrice, codeForBarcode) => {
+        const unitLabelFor = (prod) => {
+          const code = prod.saleUnit || prod.unitOfMeasure || "";
+          const key = SALE_UNIT_LABEL_KEYS[code];
+          return key ? tt(key) : code || "";
+        };
+
+        const makeSlices = (name, metaCode, unitPrice, codeForBarcode, extra = {}) => {
           const barcodeSvg = createBarcodeSvg(codeForBarcode);
+          const mrpLine =
+            Number(extra.mrp || 0) > 0
+              ? `<div class="mrp">${tt("prodLabelMrp")}: ৳${Number(extra.mrp).toFixed(2)}</div>`
+              : "";
+          const unitLine = extra.unitLabel
+            ? `<div class="unit">${escapeLabel(extra.unitLabel)}</div>`
+            : "";
           return Array.from({ length: qty }).map(
             (_, idx) => `
           <div class="label">
             <div class="name">${escapeLabel(name)}</div>
             <div class="barcode">${barcodeSvg}</div>
             <div class="meta">${escapeLabel(metaCode)}</div>
-            <div class="price">৳${Number(unitPrice || 0).toFixed(2)}</div>
+            ${unitLine}
+            ${mrpLine}
+            <div class="price">৳${Number(unitPrice || 0).toFixed(2)}${extra.priceSuffix || ""}</div>
             <div class="pack">${tt("prodLabelUnitPack", { cur: idx + 1, total: qty })}</div>
           </div>
         `
@@ -389,12 +374,21 @@ function Products() {
               v.priceOverride != null && v.priceOverride !== ""
                 ? Number(v.priceOverride)
                 : Number(row.price || 0);
-            return makeSlices(lbl, code, unit, code);
+            return makeSlices(lbl, code, unit, code, {
+              mrp: row.mrp,
+              unitLabel: unitLabelFor(row),
+            });
           });
         }
 
-        const code = row.sku || `P-${row.id}`;
-        return makeSlices(row.name, code, row.price || 0, code);
+        const code =
+          String(row.barcode || "").trim() || String(row.sku || "").trim() || `P-${row.id}`;
+        const priceSuffix = row.sellByWeight ? "/kg" : "";
+        return makeSlices(row.name, code, row.price || 0, code, {
+          mrp: row.mrp,
+          unitLabel: unitLabelFor(row),
+          priceSuffix,
+        });
       })
       .join("");
     const sheetClass =
@@ -418,6 +412,7 @@ function Products() {
             .barcode { height: 10mm; display: flex; align-items: center; }
             .barcode svg { width: 100%; height: 100%; }
             .meta { font-size: 9px; }
+            .unit, .mrp { font-size: 8px; color: #444; }
             .price { font-size: 10px; font-weight: 700; }
             .pack { font-size: 8px; color: #64748b; }
           </style>
@@ -434,10 +429,36 @@ function Products() {
     w.document.close();
   };
 
+  const queueAisleLabels = (aisleId) => {
+    const aisle = String(aisleId || "").trim().toUpperCase();
+    if (!aisle) return;
+    const qty = Math.max(1, Math.floor(Number(bulkLabelQty || 1)));
+    const matched = products.filter((row) => String(row.category || "").trim().toUpperCase() === aisle);
+    if (!matched.length) {
+      notifyActionRequired(tt("prodNotifyBulkNoMatch"));
+      return;
+    }
+    const queueEntries = matched.map((row) => ({ productId: row.id, qty }));
+    const merged = mergeIntoLabelQueue(queueEntries);
+    setLabelQtyByProduct((prev) => {
+      const next = { ...prev };
+      matched.forEach((row) => {
+        next[row.id] = qty;
+      });
+      return next;
+    });
+    writeLabelQueue(merged);
+    setLabelAisleFilter(aisle);
+    setBulkCategory(aisle);
+    setProductsTab("labels");
+    notifySuccess(tt("prodLabelQueueAisleDone", { n: matched.length, aisle }));
+  };
+
   const applyBulkSelection = () => {
     const qty = Math.max(1, Math.floor(Number(bulkLabelQty || 1)));
+    const aisle = String(labelAisleFilter || bulkCategory || "").trim().toUpperCase();
     const matched = products.filter((row) => {
-      const categoryOk = !bulkCategory || String(row.category || "").trim() === bulkCategory;
+      const categoryOk = !aisle || String(row.category || "").trim().toUpperCase() === aisle;
       const lowStockOk = !bulkLowStockOnly || Number(row.stock || 0) <= Number(row.reorderLevel || 0);
       return categoryOk && lowStockOk;
     });
@@ -459,11 +480,56 @@ function Products() {
   };
 
   const resetCategoryForm = () => {
-    setCategoryForm({ id: "", name: "", attributeSetText: "", minMarginPct: "" });
+    setCategoryForm({ id: "", name: "", department: "", attributeSetText: "", minMarginPct: "" });
+  };
+
+  const seedRetailCategories = async () => {
+    setSeedingCategories(true);
+    try {
+      const res = await api.post("/master/product-categories/seed-retail");
+      await fetchProducts();
+      notifySuccess(
+        tt("prodRetailSeedDone", {
+          created: res.data?.created ?? 0,
+          updated: res.data?.updated ?? 0,
+        })
+      );
+    } catch (err) {
+      notifyActionRequired(err?.response?.data?.error || tt("prodRetailSeedFailed"));
+    } finally {
+      setSeedingCategories(false);
+    }
+  };
+
+  const applyApparelSizePresets = async () => {
+    setForm((f) => ({ ...f, hasVariants: true, sellByWeight: false, stockKg: "" }));
+    if (!selected?.id) {
+      notifyActionRequired(tt("prodApparelSizesAfterSave"));
+      return;
+    }
+    const color = String(form.color || "Default").trim() || "Default";
+    const baseSku = String(form.sku || form.name || "SKU")
+      .trim()
+      .replace(/\s+/g, "-")
+      .slice(0, 24);
+    for (const size of APPAREL_SIZE_PRESETS) {
+      await api.post(`/products/${selected.id}/variants`, {
+        label: `${size} / ${color}`,
+        sku: baseSku ? `${baseSku}-${size}` : null,
+        barcode: null,
+        stock: 0,
+        priceOverride: null,
+        imageUrl: null,
+      });
+    }
+    await refreshSelectedProduct(selected.id);
+    await fetchProducts();
+    notifySuccess(tt("prodApparelSizesAdded"));
   };
 
   const saveCategory = async (e) => {
     e.preventDefault();
+    if (!requireProductCreate()) return;
     const name = String(categoryForm.name || "").trim();
     if (!name) return;
     const attributeSet = String(categoryForm.attributeSetText || "")
@@ -472,6 +538,7 @@ function Products() {
       .filter(Boolean);
     const payload = {
       name,
+      department: String(categoryForm.department || "").trim() || null,
       attributeSet,
       minMarginPct:
         String(categoryForm.minMarginPct || "").trim() !== ""
@@ -491,6 +558,7 @@ function Products() {
     setCategoryForm({
       id: row.id,
       name: row.name || "",
+      department: row.department || "",
       attributeSetText: Array.isArray(row.attributeSet) ? row.attributeSet.join(", ") : "",
       minMarginPct:
         row.minMarginPct != null && Number.isFinite(Number(row.minMarginPct))
@@ -500,6 +568,7 @@ function Products() {
   };
 
   const deleteCategory = async (row) => {
+    if (!requireProductCreate()) return;
     if (!window.confirm(tt("prodCategoryDeleteConfirm", { name: row.name }))) return;
     await api.delete(`/master/product-categories/${row.id}`);
     if (String(categoryForm.id || "") === String(row.id)) resetCategoryForm();
@@ -513,6 +582,36 @@ function Products() {
     return ((selling - unit) / selling) * 100;
   };
 
+  const storageLabel = (code) => {
+    const opt = STORAGE_OPTIONS.find((o) => o.value === String(code || ""));
+    return opt ? tt(opt.labelKey) : code || "-";
+  };
+
+  const conditionLabel = (code) => {
+    const map = {
+      NEW: tt("prodConditionNew"),
+      REFURBISHED: tt("prodConditionRefurbished"),
+      USED: tt("prodConditionUsed"),
+    };
+    return map[String(code || "").toUpperCase()] || "-";
+  };
+
+  const packingLabel = (row) => {
+    const unit = String(row?.purchaseUnit || "").trim();
+    const perPack = Number(row?.unitsPerPack || 0);
+    const perCarton = Number(row?.packsPerCarton || 0);
+    const parts = [];
+    if (unit) parts.push(unit);
+    if (perPack > 0) parts.push(tt("prodPackUnitsPerPack", { n: perPack }));
+    if (perCarton > 0) parts.push(tt("prodPackPacksPerCarton", { n: perCarton }));
+    return parts.length ? parts.join(" · ") : "-";
+  };
+
+  const dimensionsLabel = (row) => {
+    const fmt = (v) => (v != null && v !== "" ? Number(v) : "—");
+    return `${fmt(row?.lengthCm)} × ${fmt(row?.widthCm)} × ${fmt(row?.heightCm)} cm`;
+  };
+
   return (
     <div className="page-stack">
       <div className="page-header">
@@ -521,6 +620,8 @@ function Products() {
           <div className="page-subtitle">{tt("productsPageSubtitle")}</div>
         </div>
       </div>
+
+      <PermissionBanner show={!canManageProducts} code="product.create" tt={tt} />
 
       <div className="pos-tabs">
         <div className="pos-tablist" role="tablist" aria-label={tt("productsTabsAria")}>
@@ -562,19 +663,55 @@ function Products() {
         <p className="text-muted" style={{ marginTop: -2 }}>
           {tt("prodLabelsHelp")}
         </p>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+          <button
+            type="button"
+            className={`pos-dept-chip${!labelAisleFilter ? " active" : ""}`}
+            onClick={() => {
+              setLabelAisleFilter("");
+              setBulkCategory("");
+            }}
+          >
+            {tt("prodLabelAllAisles")}
+          </button>
+          {GROCERY_CATEGORY_CHIPS.map((cat) => (
+            <button
+              key={cat.id}
+              type="button"
+              className={`pos-dept-chip${labelAisleFilter === cat.id ? " active" : ""}`}
+              onClick={() => queueAisleLabels(cat.id)}
+              title={tt("prodLabelQueueAisleHint")}
+            >
+              {tt(cat.labelKey)}
+            </button>
+          ))}
+        </div>
         <div className="form-grid">
-          <select className="form-select-sm" value={labelSize} onChange={(e) => setLabelSize(e.target.value)}>
-            <option value="50x30">{tt("prodOpt5030")}</option>
-            <option value="40x25">{tt("prodOpt4025")}</option>
-            <option value="60x40">{tt("prodOpt6040")}</option>
-          </select>
-          <select className="form-select-sm" value={sheetTemplate} onChange={(e) => setSheetTemplate(e.target.value)}>
-            <option value="free">{tt("prodOptLayoutFree")}</option>
-            <option value="a4_3x8">{tt("prodOptA4_3x8")}</option>
-            <option value="a4_4x10">{tt("prodOptA4_4x10")}</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={labelSize}
+            onChange={(val) => setLabelSize(val || "50x30")}
+            options={[
+              { value: "50x30", label: tt("prodOpt5030") },
+              { value: "40x25", label: tt("prodOpt4025") },
+              { value: "60x40", label: tt("prodOpt6040") },
+            ]}
+            isClearable={false}
+          />
+          <SearchSelect
+            className="form-select-sm"
+            value={sheetTemplate}
+            onChange={(val) => setSheetTemplate(val || "free")}
+            options={[
+              { value: "free", label: tt("prodOptLayoutFree") },
+              { value: "a4_3x8", label: tt("prodOptA4_3x8") },
+              { value: "a4_4x10", label: tt("prodOptA4_4x10") },
+            ]}
+            isClearable={false}
+          />
           <button type="button" onClick={printLabels}>
             {tt("prodPrintLabels", { n: selectedLabelProducts.length })}
+            {labelAisleFilter ? ` · ${labelAisleFilter}` : ""}
           </button>
           <button type="button" className="btn-secondary" onClick={clearLabelSelection}>
             {tt("prodClearLabels")}
@@ -586,22 +723,12 @@ function Products() {
             value={bulkLabelQty}
             onChange={(e) => setBulkLabelQty(e.target.value)}
           />
-          <Select
+          <SearchSelect
             className="form-select-sm"
-            value={
-              bulkCategory
-                ? { value: bulkCategory, label: bulkCategory }
-                : { value: "", label: tt("prodAllCategories") }
-            }
-            options={[
-              { value: "", label: tt("prodAllCategories") },
-              ...categories.map((c) => ({ value: c, label: c })),
-            ]}
-            onChange={(opt) => setBulkCategory(opt?.value || "")}
+            value={bulkCategory}
+            onChange={(val) => setBulkCategory(val)}
             placeholder={tt("prodAllCategories")}
-            isClearable={false}
-            isSearchable
-            styles={SEARCH_SELECT_STYLES}
+            options={categories.map((c) => ({ value: c, label: c }))}
           />
           <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <input
@@ -625,12 +752,34 @@ function Products() {
         <p className="text-muted" style={{ marginTop: -2 }}>
           {tt("prodCategoryAdminHelp")}
         </p>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            disabled={seedingCategories}
+            onClick={seedRetailCategories}
+          >
+            {seedingCategories ? tt("settingsLoading") : tt("prodRetailSeedBtn")}
+          </button>
+        </div>
         <form onSubmit={saveCategory} className="form-grid" style={{ marginBottom: 12 }}>
           <input
             placeholder={tt("prodCategoryNamePlaceholder")}
             value={categoryForm.name}
             onChange={(e) => setCategoryForm((p) => ({ ...p, name: e.target.value }))}
             required
+          />
+          <SearchSelect
+            className="form-select-sm"
+            value={categoryForm.department}
+            onChange={(val) => setCategoryForm((p) => ({ ...p, department: val }))}
+            placeholder={tt("prodCategoryDeptAuto")}
+            options={[
+              { value: "GROCERY", label: tt("retailDeptGrocery") },
+              { value: "PHARMACY", label: tt("retailDeptPharmacy") },
+              { value: "APPAREL", label: tt("retailDeptApparel") },
+              { value: "GENERAL", label: tt("prodCategoryDeptGeneral") },
+            ]}
           />
           <input
             placeholder={tt("prodCategoryMinMarginPlaceholder")}
@@ -648,7 +797,7 @@ function Products() {
             value={categoryForm.attributeSetText}
             onChange={(e) => setCategoryForm((p) => ({ ...p, attributeSetText: e.target.value }))}
           />
-          <button type="submit">{categoryForm.id ? tt("prodCategoryUpdateAction") : tt("prodCategoryAddAction")}</button>
+          <button type="submit" disabled={!canManageProducts}>{categoryForm.id ? tt("prodCategoryUpdateAction") : tt("prodCategoryAddAction")}</button>
           {categoryForm.id ? (
             <button type="button" className="btn-secondary" onClick={resetCategoryForm}>
               {tt("settingsCancel")}
@@ -661,6 +810,18 @@ function Products() {
           searchableKeys={["name"]}
           columns={[
             { key: "name", label: tt("prodCategoryColumnCategory") },
+            {
+              key: "department",
+              label: tt("prodCategoryColumnDept"),
+              render: (v) => {
+                const d = String(v || "").toUpperCase();
+                if (d === "GROCERY") return tt("retailDeptGrocery");
+                if (d === "PHARMACY") return tt("retailDeptPharmacy");
+                if (d === "APPAREL") return tt("retailDeptApparel");
+                if (d === "GENERAL") return tt("prodCategoryDeptGeneral");
+                return tt("na");
+              },
+            },
             {
               key: "attributeSet",
               label: tt("prodCategoryColumnAttributes"),
@@ -688,192 +849,33 @@ function Products() {
           ]}
         />
       </div>
-      <form onSubmit={handleSubmit} className="form-grid">
-        <input
-          placeholder={tt("prodPhName")}
-          value={form.name}
-          onChange={(e) => setForm({ ...form, name: e.target.value })}
+      <form onSubmit={handleSubmit} className="form-grid product-master-form">
+        <ProductFormSections
+          tt={tt}
+          formSection={formSection}
+          setFormSection={setFormSection}
+          form={form}
+          setForm={setForm}
+          categories={categories}
+          productCategories={productCategories}
+          selectedCategoryKey={selectedCategoryKey}
+          selectedAttributeKeys={selectedAttributeKeys}
+          attributeDraft={attributeDraft}
+          setAttributeDraft={setAttributeDraft}
+          categoryRetailHint={categoryRetailHint}
+          minMarginPct={minMarginPct}
+          marginPreviewPct={marginPreviewPct}
+          showPharmacySection={showPharmacySection}
+          onEnableBatch={() =>
+            setForm((f) => ({ ...f, batchTracked: true, hasVariants: false, sellByWeight: false }))
+          }
+          onAddSizeRun={() => void applyApparelSizePresets()}
         />
-
-        <input
-          placeholder={tt("prodPhUnitPrice")}
-          type="number"
-          value={form.unitPrice}
-          onChange={(e) => setForm({ ...form, unitPrice: e.target.value })}
-        />
-
-        <input
-          placeholder={tt("prodPhSellingPrice")}
-          type="number"
-          value={form.price}
-          onChange={(e) => setForm({ ...form, price: e.target.value })}
-        />
-
-        <input
-          placeholder={tt("prodPhStock")}
-          type="number"
-          value={form.stock}
-          onChange={(e) => setForm({ ...form, stock: e.target.value })}
-        />
-
-        <input
-          placeholder={tt("prodPhCategory")}
-          value={form.category}
-          list="product-category-options"
-          onChange={(e) => setForm({ ...form, category: e.target.value })}
-        />
-        <datalist id="product-category-options">
-          {categories.map((cat) => (
-            <option key={cat} value={cat} />
-          ))}
-        </datalist>
-        <input
-          placeholder={tt("prodPhSku")}
-          value={form.sku}
-          onChange={(e) => setForm({ ...form, sku: e.target.value })}
-        />
-        <input
-          placeholder={tt("prodPhBarcode")}
-          value={form.barcode}
-          onChange={(e) => setForm({ ...form, barcode: e.target.value })}
-        />
-        <input
-          placeholder={tt("prodPhImageUrl")}
-          value={form.imageUrl}
-          onChange={(e) => setForm({ ...form, imageUrl: e.target.value })}
-        />
-        <input
-          placeholder={tt("prodPhSize")}
-          value={form.size}
-          onChange={(e) => setForm({ ...form, size: e.target.value })}
-        />
-        <input
-          placeholder={tt("prodPhColor")}
-          value={form.color}
-          onChange={(e) => setForm({ ...form, color: e.target.value })}
-        />
-        <input
-          placeholder={tt("prodPhBrand")}
-          value={form.brand}
-          onChange={(e) => setForm({ ...form, brand: e.target.value })}
-        />
-        <input
-          placeholder={tt("prodPhModel")}
-          value={form.model}
-          onChange={(e) => setForm({ ...form, model: e.target.value })}
-        />
-        <input
-          placeholder={tt("prodPhSpecification")}
-          value={form.specification}
-          onChange={(e) => setForm({ ...form, specification: e.target.value })}
-        />
-        <textarea
-          placeholder="Image gallery URLs (comma/newline separated)"
-          value={form.imageGalleryText}
-          onChange={(e) => setForm({ ...form, imageGalleryText: e.target.value })}
-          rows={3}
-          style={{ gridColumn: "1 / -1" }}
-        />
-        {selectedAttributeKeys.length ? (
-          <div className="form-grid" style={{ gridColumn: "1 / -1" }}>
-            {selectedAttributeKeys.map((key) => (
-              <input
-                key={`attr-${key}`}
-                placeholder={`Attribute: ${key}`}
-                value={attributeDraft[key] || ""}
-                onChange={(e) =>
-                  setAttributeDraft((prev) => ({
-                    ...prev,
-                    [key]: e.target.value,
-                  }))
-                }
-              />
-            ))}
-          </div>
-        ) : null}
-        <input
-          placeholder={tt("prodPhVat")}
-          type="number"
-          value={form.vatRate}
-          onChange={(e) => setForm({ ...form, vatRate: e.target.value })}
-        />
-        <div style={{ alignSelf: "center", fontSize: 12, color: marginPreviewPct < minMarginPct ? "#b91c1c" : "#166534" }}>
-          Margin {marginPreviewPct.toFixed(2)}% (min {minMarginPct}%)
-        </div>
-        <input
-          placeholder={tt("prodPhReorder")}
-          type="number"
-          min={0}
-          value={form.reorderLevel}
-          onChange={(e) => setForm({ ...form, reorderLevel: e.target.value })}
-        />
-        <select
-          className="form-select-sm"
-          value={form.defaultDiscountType}
-          onChange={(e) => setForm({ ...form, defaultDiscountType: e.target.value })}
-        >
-          <option value="">{tt("prodDiscNone")}</option>
-          <option value="PERCENT">{tt("prodDiscPercent")}</option>
-          <option value="AMOUNT">{tt("prodDiscAmount")}</option>
-        </select>
-        <input
-          placeholder={tt("prodPhDiscVal")}
-          type="number"
-          value={form.defaultDiscountValue}
-          onChange={(e) => setForm({ ...form, defaultDiscountValue: e.target.value })}
-        />
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={form.batchTracked}
-            onChange={(e) => setForm({ ...form, batchTracked: e.target.checked })}
-            style={{ width: "auto" }}
-          />
-          {tt("prodBatchFefo")}
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={form.sellByWeight}
-            onChange={(e) =>
-              setForm((f) => ({
-                ...f,
-                sellByWeight: e.target.checked,
-                ...(e.target.checked ? { hasVariants: false } : {}),
-              }))
-            }
-            style={{ width: "auto" }}
-          />
-          {tt("prodSellByKg")}
-        </label>
-        <input
-          placeholder={tt("prodPhStockKg")}
-          type="number"
-          min={0}
-          step={0.001}
-          value={form.stockKg}
-          disabled={!form.sellByWeight}
-          onChange={(e) => setForm({ ...form, stockKg: e.target.value })}
-        />
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={form.hasVariants}
-            onChange={(e) =>
-              setForm((f) => ({
-                ...f,
-                hasVariants: e.target.checked,
-                ...(e.target.checked ? { sellByWeight: false, stockKg: "" } : {}),
-              }))
-            }
-            style={{ width: "auto" }}
-          />
-          {tt("prodHasVariants")}
-        </label>
-
-        <button type="submit">{editingId ? tt("prodUpdateProduct") : tt("prodAddProduct")}</button>
+        <button type="submit" style={{ gridColumn: "1 / -1" }} disabled={!canManageProducts}>
+          {editingId ? tt("prodUpdateProduct") : tt("prodAddProduct")}
+        </button>
         {editingId ? (
-          <button type="button" className="btn-secondary" onClick={handleCancelEdit}>
+          <button type="button" className="btn-secondary" onClick={handleCancelEdit} style={{ gridColumn: "1 / -1" }}>
             {tt("settingsCancel")}
           </button>
         ) : null}
@@ -884,8 +886,14 @@ function Products() {
       {productsTab === "list" ? (
       <DataTable
         title={tt("prodListTitle")}
-        rows={products}
-        searchableKeys={["name", "sku", "barcode", "category", "size", "color", "brand", "model", "specification"]}
+        rows={productsTable.rows}
+        serverMode
+        totalRows={productsTable.total}
+        loading={productsTable.loading}
+        onQueryChange={productsTable.onQueryChange}
+        initialSort="createdAt"
+        initialSortDir="desc"
+        pageSize={10}
         filters={[
           {
             key: "category",
@@ -900,6 +908,7 @@ function Products() {
           {
             key: "labelQty",
             label: tt("prodColLabelQty"),
+            searchable: false,
             render: (_, row) => (
               <input
                 type="number"
@@ -911,33 +920,48 @@ function Products() {
             ),
           },
           { key: "name", label: tt("prodLblName") },
+          { key: "nameBn", label: tt("prodLblNameBn"), render: (v) => v || "-" },
           { key: "sku", label: tt("prodLblSku"), render: (v) => v || "-" },
           { key: "barcode", label: tt("prodLblBarcode"), render: (v) => v || "-" },
           { key: "category", label: tt("prodLblCategory"), render: (v) => v || "-" },
+          { key: "manufacturer", label: tt("prodLblManufacturer"), render: (v) => v || "-" },
+          { key: "genericName", label: tt("prodLblGenericName"), render: (v) => v || "-" },
+          {
+            key: "mrp",
+            label: tt("prodLblMrp"),
+            searchable: false,
+            render: (v) => (v != null && Number(v) > 0 ? `৳${Number(v).toFixed(2)}` : "-"),
+          },
+          {
+            key: "isActive",
+            label: tt("prodLblActive"),
+            searchable: false,
+            render: (v) => (v === false ? tt("prodNo") : tt("prodYes")),
+          },
           { key: "brand", label: tt("prodLblBrand"), render: (v) => v || "-" },
           { key: "model", label: tt("prodLblModel"), render: (v) => v || "-" },
           { key: "size", label: tt("prodLblSize"), render: (v) => v || "-" },
           { key: "color", label: tt("prodLblColor"), render: (v) => v || "-" },
           { key: "specification", label: tt("prodLblSpecification"), render: (v) => v || "-" },
-          { key: "unitPrice", label: tt("prodLblUnitPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
-          { key: "price", label: tt("prodLblSellingPrice"), render: (v) => `৳${Number(v).toFixed(2)}` },
-          { key: "profitMargin", label: tt("prodLblProfitMargin"), render: (_, row) => `${getProfitMarginPct(row).toFixed(2)}%` },
+          { key: "unitPrice", label: tt("prodLblUnitPrice"), searchable: false, render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+          { key: "price", label: tt("prodLblSellingPrice"), searchable: false, render: (v) => `৳${Number(v).toFixed(2)}` },
+          { key: "profitMargin", label: tt("prodLblProfitMargin"), searchable: false, render: (_, row) => `${getProfitMarginPct(row).toFixed(2)}%` },
           {
             key: "stock",
             label: tt("prodLblStock"),
+            searchable: false,
             render: (_, row) =>
-              row.sellByWeight
-                ? `${Number(row.stockKg || 0).toFixed(3)} ${tt("dashKgTag")}`
-                : row.hasVariants
-                  ? tt("prodVariantCount", { n: row.variants?.length || 0 })
-                  : row.stock,
+              row.hasVariants
+                ? tt("prodVariantCount", { n: row.variants?.length || 0 })
+                : formatProductStockDisplay(row, tt),
           },
-          { key: "reorderLevel", label: tt("prodLblReorder"), render: (v) => Number(v || 0) },
-          { key: "vatRate", label: tt("prodLblVat"), render: (v) => `${v}%` },
-          { key: "batchTracked", label: tt("prodColBatch"), render: (v) => (v ? tt("prodYes") : "-") },
+          { key: "reorderLevel", label: tt("prodLblReorder"), searchable: false, render: (v) => Number(v || 0) },
+          { key: "vatRate", label: tt("prodLblVat"), searchable: false, render: (v) => `${v}%` },
+          { key: "batchTracked", label: tt("prodColBatch"), searchable: false, render: (v) => (v ? tt("prodYes") : "-") },
           {
             key: "defaultDiscountType",
             label: tt("prodColDefaultDiscount"),
+            searchable: false,
             render: (v, row) =>
               v
                 ? v === "PERCENT"
@@ -954,8 +978,8 @@ function Products() {
                   {tt("prodPlusLabel")}
                 </button>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => handleDetails(row)}>{tt("actionDetails")}</button>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => { handleEdit(row); setProductsTab("form"); }}>{tt("actionEdit")}</button>
-                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)}>{tt("actionDelete")}</button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => { handleEdit(row); setProductsTab("form"); }} disabled={!canManageProducts}>{tt("actionEdit")}</button>
+                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)} disabled={!canManageProducts}>{tt("actionDelete")}</button>
               </div>
             ),
           },
@@ -974,28 +998,133 @@ function Products() {
       {selected ? (
         <div className="page-card" style={{ marginTop: 12 }}>
           <h4>{tt("prodDetailTitle")}</h4>
-          <p><strong>{tt("prodLblName")}:</strong> {selected.name}</p>
-          <p><strong>{tt("prodLblSku")}:</strong> {selected.sku || "-"}</p>
-          <p><strong>{tt("prodLblBarcode")}:</strong> {selected.barcode || "-"}</p>
-          <p>
-            <strong>{tt("prodLblBarcodeAliases")}:</strong>{" "}
-            {Array.isArray(selected.barcodes) && selected.barcodes.length
-              ? `${selected.barcodes.length}`
-              : tt("prodNoBarcodeAliases")}
-          </p>
-          <p><strong>{tt("prodLblCategory")}:</strong> {selected.category || "-"}</p>
-          <p><strong>{tt("prodLblImageUrl")}:</strong> {selected.imageUrl || "-"}</p>
+          <dl className="prod-detail-grid">
+            <div><dt>{tt("prodLblName")}</dt><dd>{selected.name}</dd></div>
+            <div><dt>{tt("prodLblNameBn")}</dt><dd>{selected.nameBn || "-"}</dd></div>
+            <div><dt>{tt("prodLblActive")}</dt><dd>{selected.isActive === false ? tt("prodNo") : tt("prodYes")}</dd></div>
+            <div><dt>{tt("prodLblSku")}</dt><dd>{selected.sku || "-"}</dd></div>
+            <div><dt>{tt("prodLblBarcode")}</dt><dd>{selected.barcode || "-"}</dd></div>
+            <div>
+              <dt>{tt("prodLblBarcodeAliases")}</dt>
+              <dd>
+                {Array.isArray(selected.barcodes) && selected.barcodes.length
+                  ? selected.barcodes.length
+                  : tt("prodNoBarcodeAliases")}
+              </dd>
+            </div>
+            <div><dt>{tt("prodLblCategory")}</dt><dd>{selected.category || "-"}</dd></div>
+            <div><dt>{tt("prodLblUom")}</dt><dd>{tt(SALE_UNIT_LABEL_KEYS[selected.saleUnit || selected.unitOfMeasure] || selected.saleUnit || selected.unitOfMeasure || "PCS")}</dd></div>
+            <div><dt>{tt("prodLblTags")}</dt><dd>{Array.isArray(selected.tags) && selected.tags.length ? selected.tags.join(", ") : "-"}</dd></div>
+            <div><dt>{tt("prodLblBrand")}</dt><dd>{selected.brand || "-"}</dd></div>
+            <div><dt>{tt("prodLblManufacturer")}</dt><dd>{selected.manufacturer || "-"}</dd></div>
+            <div><dt>{tt("prodLblModel")}</dt><dd>{selected.model || "-"}</dd></div>
+            <div><dt>{tt("prodPhCountry")}</dt><dd>{selected.countryOfOrigin || "-"}</dd></div>
+            <div><dt>{tt("prodLblGenericName")}</dt><dd>{selected.genericName || "-"}</dd></div>
+            <div><dt>{tt("prodPhStrength")}</dt><dd>{selected.strength || "-"}</dd></div>
+            <div><dt>{tt("prodPhDosageForm")}</dt><dd>{selected.dosageForm || "-"}</dd></div>
+            <div><dt>{tt("prodPhDrugRegNo")}</dt><dd>{selected.drugRegNo || "-"}</dd></div>
+            <div><dt>{tt("prodLblSize")}</dt><dd>{selected.size || "-"}</dd></div>
+            <div><dt>{tt("prodLblColor")}</dt><dd>{selected.color || "-"}</dd></div>
+            <div className="prod-detail-span"><dt>{tt("prodLblSpecification")}</dt><dd>{selected.specification || "-"}</dd></div>
+            <div><dt>{tt("prodLblUnitPrice")}</dt><dd>৳{Number(selected.unitPrice || 0).toFixed(2)}</dd></div>
+            <div><dt>{tt("prodLblSellingPrice")}</dt><dd>৳{Number(selected.price || 0).toFixed(2)}</dd></div>
+            <div><dt>{tt("prodLblMrp")}</dt><dd>{selected.mrp != null && Number(selected.mrp) > 0 ? `৳${Number(selected.mrp).toFixed(2)}` : "-"}</dd></div>
+            <div><dt>{tt("prodPhHsCode")}</dt><dd>{selected.hsCode || "-"}</dd></div>
+            <div><dt>{tt("prodLblProfitMargin")}</dt><dd>{getProfitMarginPct(selected).toFixed(2)}%</dd></div>
+            <div><dt>{tt("prodLblStock")}</dt><dd>{selected.stock}</dd></div>
+            <div><dt>{tt("prodLblReorder")}</dt><dd>{Number(selected.reorderLevel || 0)}</dd></div>
+            <div><dt>{tt("prodLblVat")}</dt><dd>{Number(selected.vatRate || 0)}%</dd></div>
+            <div><dt>{tt("prodLblStorage")}</dt><dd>{storageLabel(selected.storageCondition)}</dd></div>
+            <div><dt>{tt("prodPhWeightGrams")}</dt><dd>{selected.weightGrams != null ? selected.weightGrams : "-"}</dd></div>
+            <div><dt>{tt("prodPhShelfLife")}</dt><dd>{selected.shelfLifeDays != null ? selected.shelfLifeDays : "-"}</dd></div>
+            <div>
+              <dt>{tt("prodLblDefaultDisc")}</dt>
+              <dd>
+                {selected.defaultDiscountType
+                  ? selected.defaultDiscountType === "PERCENT"
+                    ? `${selected.defaultDiscountValue}%`
+                    : `৳${Number(selected.defaultDiscountValue || 0).toFixed(2)}`
+                  : "-"}
+              </dd>
+            </div>
+            <div><dt>{tt("prodLblBatch")}</dt><dd>{selected.batchTracked ? tt("prodYes") : tt("prodNo")}</dd></div>
+            <div>
+              <dt>{tt("prodLblSellKg")}</dt>
+              <dd>
+                {selected.sellByWeight ? tt("prodYes") : tt("prodNo")}
+                {selected.sellByWeight
+                  ? ` — ${tt("prodStockKgOnHand", { n: Number(selected.stockKg || 0).toFixed(3) })}`
+                  : ""}
+              </dd>
+            </div>
+            <div><dt>{tt("prodLblVariants")}</dt><dd>{selected.hasVariants ? tt("prodYes") : tt("prodNo")}</dd></div>
+            <div><dt>{tt("prodLblSd")}</dt><dd>{Number(selected.sdRate || 0)}%</dd></div>
+            <div><dt>{tt("prodLblNbrCode")}</dt><dd>{selected.nbrProductCode || "-"}</dd></div>
+            <div><dt>{tt("prodLblCondition")}</dt><dd>{conditionLabel(selected.productCondition)}</dd></div>
+            <div><dt>{tt("prodLblBsti")}</dt><dd>{selected.bstiCertNo || "-"}</dd></div>
+            <div>
+              <dt>{tt("prodLblHalal")}</dt>
+              <dd>
+                {selected.isHalalCertified ? tt("prodYes") : tt("prodNo")}
+                {selected.isHalalCertified && selected.halalCertNo ? ` — ${selected.halalCertNo}` : ""}
+              </dd>
+            </div>
+            {selected.importerName ? (
+              <div><dt>{tt("prodLblImporter")}</dt><dd>{selected.importerName}</dd></div>
+            ) : null}
+            {selected.importerAddress ? (
+              <div className="prod-detail-span"><dt>{tt("prodLblImporterAddress")}</dt><dd>{selected.importerAddress}</dd></div>
+            ) : null}
+            {selected.purchaseUnit || selected.unitsPerPack || selected.packsPerCarton ? (
+              <div><dt>{tt("prodLblPacking")}</dt><dd>{packingLabel(selected)}</dd></div>
+            ) : null}
+            {selected.netWeightGrams != null || selected.grossWeightGrams != null ? (
+              <div>
+                <dt>{tt("prodLblNetGross")}</dt>
+                <dd>
+                  {selected.netWeightGrams != null ? `${selected.netWeightGrams}g` : "-"}
+                  {" / "}
+                  {selected.grossWeightGrams != null ? `${selected.grossWeightGrams}g` : "-"}
+                </dd>
+              </div>
+            ) : null}
+            {selected.lengthCm != null || selected.widthCm != null || selected.heightCm != null ? (
+              <div><dt>{tt("prodLblDimensions")}</dt><dd>{dimensionsLabel(selected)}</dd></div>
+            ) : null}
+            {selected.minOrderQty != null || selected.maxOrderQty != null ? (
+              <div>
+                <dt>{tt("prodLblOrderQty")}</dt>
+                <dd>
+                  {selected.minOrderQty != null ? selected.minOrderQty : "-"}
+                  {" / "}
+                  {selected.maxOrderQty != null ? selected.maxOrderQty : "-"}
+                </dd>
+              </div>
+            ) : null}
+            {selected.leadTimeDays != null ? (
+              <div><dt>{tt("prodLblLeadTime")}</dt><dd>{tt("prodLeadTimeDays", { n: selected.leadTimeDays })}</dd></div>
+            ) : null}
+            {selected.shortDescription ? (
+              <div className="prod-detail-span"><dt>{tt("prodLblShortDesc")}</dt><dd>{selected.shortDescription}</dd></div>
+            ) : null}
+            {selected.description ? (
+              <div className="prod-detail-span"><dt>{tt("prodLblDescription")}</dt><dd>{selected.description}</dd></div>
+            ) : null}
+            {selected.internalNotes ? (
+              <div className="prod-detail-span"><dt>{tt("prodLblInternalNotes")}</dt><dd>{selected.internalNotes}</dd></div>
+            ) : null}
+          </dl>
           {selected.imageUrl ? (
-            <p>
+            <div style={{ marginTop: 12 }}>
               <img
                 src={selected.imageUrl}
                 alt={selected.name || "product"}
                 style={{ maxWidth: 140, maxHeight: 140, borderRadius: 8, border: "1px solid #e2e8f0" }}
               />
-            </p>
+            </div>
           ) : null}
           {Array.isArray(selected.imageGallery) && selected.imageGallery.length ? (
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
               {selected.imageGallery.map((url, idx) => (
                 <img
                   key={`gallery-${idx}`}
@@ -1007,43 +1136,14 @@ function Products() {
             </div>
           ) : null}
           {selected.attributeValues && typeof selected.attributeValues === "object" ? (
-            <div style={{ marginBottom: 8 }}>
-              <strong>Attributes:</strong>{" "}
+            <div style={{ marginTop: 8 }}>
+              <strong>{tt("prodSectionAttributes")}:</strong>{" "}
               {Object.entries(selected.attributeValues)
                 .filter(([k, v]) => String(k || "").trim() && String(v || "").trim())
                 .map(([k, v]) => `${k}: ${v}`)
                 .join(" | ") || "-"}
             </div>
           ) : null}
-          <p><strong>{tt("prodLblBrand")}:</strong> {selected.brand || "-"}</p>
-          <p><strong>{tt("prodLblModel")}:</strong> {selected.model || "-"}</p>
-          <p><strong>{tt("prodLblSize")}:</strong> {selected.size || "-"}</p>
-          <p><strong>{tt("prodLblColor")}:</strong> {selected.color || "-"}</p>
-          <p><strong>{tt("prodLblSpecification")}:</strong> {selected.specification || "-"}</p>
-          <p><strong>{tt("prodLblUnitPrice")}:</strong> ৳{Number(selected.unitPrice || 0).toFixed(2)}</p>
-          <p><strong>{tt("prodLblSellingPrice")}:</strong> ৳{Number(selected.price || 0).toFixed(2)}</p>
-          <p><strong>{tt("prodLblProfitMargin")}:</strong> {getProfitMarginPct(selected).toFixed(2)}%</p>
-          <p><strong>{tt("prodLblStock")}:</strong> {selected.stock}</p>
-          <p><strong>{tt("prodLblReorder")}:</strong> {Number(selected.reorderLevel || 0)}</p>
-          <p><strong>{tt("prodLblVat")}:</strong> {Number(selected.vatRate || 0)}%</p>
-          <p>
-            <strong>{tt("prodLblDefaultDisc")}:</strong>{" "}
-            {selected.defaultDiscountType
-              ? `${selected.defaultDiscountType === "PERCENT" ? `${selected.defaultDiscountValue}%` : `৳${Number(selected.defaultDiscountValue || 0).toFixed(2)}`}`
-              : "-"}
-          </p>
-          <p>
-            <strong>{tt("prodLblBatch")}:</strong> {selected.batchTracked ? tt("prodYes") : tt("prodNo")}
-          </p>
-          <p>
-            <strong>{tt("prodLblSellKg")}:</strong> {selected.sellByWeight ? tt("prodYes") : tt("prodNo")}
-            {selected.sellByWeight
-              ? ` — ${tt("prodStockKgOnHand", { n: Number(selected.stockKg || 0).toFixed(3) })}`
-              : ""}
-          </p>
-          <p>
-            <strong>{tt("prodLblVariants")}:</strong> {selected.hasVariants ? tt("prodYes") : tt("prodNo")}
-          </p>
           {selected.hasVariants ? (
             <div style={{ marginTop: 12 }}>
               <h5 style={{ marginBottom: 8 }}>{tt("prodVariantBarcodes")}</h5>
@@ -1178,18 +1278,16 @@ function Products() {
               )}
             </ul>
             <div className="form-grid">
-              <select
+              <SearchSelect
                 className="form-select-sm"
                 value={barcodeAliasDraft.variantId}
-                onChange={(e) => setBarcodeAliasDraft((p) => ({ ...p, variantId: e.target.value }))}
-              >
-                <option value="">Base product</option>
-                {(selected.variants || []).map((v) => (
-                  <option key={`barcode-variant-${v.id}`} value={v.id}>
-                    {v.sku || v.label || `Variant #${v.id}`}
-                  </option>
-                ))}
-              </select>
+                onChange={(val) => setBarcodeAliasDraft((p) => ({ ...p, variantId: val }))}
+                placeholder="Base product"
+                options={(selected.variants || []).map((v) => ({
+                  value: String(v.id),
+                  label: v.sku || v.label || `Variant #${v.id}`,
+                }))}
+              />
               <input
                 placeholder={tt("prodPhBarcodeAlias")}
                 value={barcodeAliasDraft.barcode}
@@ -1293,15 +1391,17 @@ function Products() {
               )}
             </ul>
             <div className="form-grid">
-              <select
+              <SearchSelect
                 className="form-select-sm"
                 value={priceListDraft.priceType}
-                onChange={(e) => setPriceListDraft((p) => ({ ...p, priceType: e.target.value }))}
-              >
-                <option value="RETAIL">{tt("prodPriceTypeRetail")}</option>
-                <option value="WHOLESALE">{tt("prodPriceTypeWholesale")}</option>
-                <option value="DEALER">{tt("prodPriceTypeDealer")}</option>
-              </select>
+                onChange={(val) => setPriceListDraft((p) => ({ ...p, priceType: val || "RETAIL" }))}
+                options={[
+                  { value: "RETAIL", label: tt("prodPriceTypeRetail") },
+                  { value: "WHOLESALE", label: tt("prodPriceTypeWholesale") },
+                  { value: "DEALER", label: tt("prodPriceTypeDealer") },
+                ]}
+                isClearable={false}
+              />
               <input
                 placeholder={tt("prodPhPriceListAmount")}
                 type="number"

@@ -1,6 +1,7 @@
 const prisma = require("../../utils/prisma");
 const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
 
 const VALID_DIRECTIONS = ["ISSUED", "RECEIVED"];
 const VALID_STATUSES = ["PENDING", "DEPOSITED", "CLEARED", "BOUNCED", "CANCELLED"];
@@ -188,7 +189,12 @@ exports.listCheques = async (req, res) => {
     const status = req.query.status ? String(req.query.status).toUpperCase() : null;
     const from = parseDate(req.query.from);
     const to = parseDate(req.query.to);
-    const q = String(req.query.q || "").trim();
+    const lq = parseListQuery(req, {
+      searchableFields: ["chequeNo", "bankName", "drawerName", "payeeName", "accountName", "accountNo", "notes"],
+      sortableFields: ["chequeNo", "amount", "chequeDate", "status", "createdAt"],
+      defaultSort: "chequeDate",
+      defaultSortDir: "desc",
+    });
 
     const where = { branchId };
     if (direction && VALID_DIRECTIONS.includes(direction)) where.direction = direction;
@@ -202,23 +208,25 @@ exports.listCheques = async (req, res) => {
         where.chequeDate.lte = end;
       }
     }
-    if (q) {
-      where.OR = [
-        { chequeNo: { contains: q } },
-        { bankName: { contains: q } },
-        { drawerName: { contains: q } },
-        { payeeName: { contains: q } },
-        { notes: { contains: q } },
-      ];
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    const include = {
+      customer: { select: { id: true, name: true, phone: true } },
+      supplier: { select: { id: true, name: true, phone: true } },
+      creator: { select: { id: true, name: true } },
+    };
+
+    if (lq.paged) {
+      const [rows, total] = await prisma.$transaction([
+        prisma.cheque.findMany({ where, include, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.cheque.count({ where }),
+      ]);
+      return res.json(pagedResult({ data: rows, total, page: lq.page, pageSize: lq.pageSize }));
     }
 
     const rows = await prisma.cheque.findMany({
       where,
-      include: {
-        customer: { select: { id: true, name: true, phone: true } },
-        supplier: { select: { id: true, name: true, phone: true } },
-        creator: { select: { id: true, name: true } },
-      },
+      include,
       orderBy: [{ chequeDate: "desc" }, { id: "desc" }],
       take: 500,
     });

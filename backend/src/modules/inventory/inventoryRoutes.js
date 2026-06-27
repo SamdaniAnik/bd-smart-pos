@@ -29,7 +29,10 @@ const {
   getInventoryBatches,
   createInventoryBatch,
   updateInventoryBatchQty,
+  writeOffExpiredBatch,
   getInventoryBatchAlerts,
+  getPosExpiryWarnings,
+  getBatchTraceability,
   getTransferSuggestions,
   getReorderSuggestions,
   createExpiryMarkdownCampaign,
@@ -77,7 +80,10 @@ router.get("/intelligence", requireAuth, requirePermission("inventory.view"), ge
 router.get("/batches", requireAuth, requirePermission("inventory.view"), getInventoryBatches);
 router.post("/batches", requireAuth, requirePermission("inventory.adjust"), createInventoryBatch);
 router.post("/batches/:id/qty", requireAuth, requirePermission("inventory.adjust"), updateInventoryBatchQty);
+router.post("/batches/:id/spoilage", requireAuth, requirePermission("inventory.adjust"), writeOffExpiredBatch);
 router.get("/batches/alerts", requireAuth, requirePermission("inventory.view"), getInventoryBatchAlerts);
+router.get("/batches/pos-warnings", requireAuth, requirePermission("sale.create"), getPosExpiryWarnings);
+router.get("/batches/traceability", requireAuth, requirePermission("inventory.view"), getBatchTraceability);
 router.post("/batches/markdown-campaign", requireAuth, requirePermission("product.create"), createExpiryMarkdownCampaign);
 router.get("/transfers/suggestions", requireAuth, requirePermission("inventory.view"), getTransferSuggestions);
 router.get("/reorder-suggestions", requireAuth, requirePermission("inventory.view"), getReorderSuggestions);

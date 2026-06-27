@@ -1,7 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "../services/api";
-import { notifyActionRequired, notifySuccess } from "../utils/notify";
+import DataTable from "../components/DataTable";
+import useServerTable from "../hooks/useServerTable";
+import { notifyActionRequired, notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 const STATUS_OPTIONS = ["", "PENDING", "DEPOSITED", "CLEARED", "BOUNCED", "CANCELLED"];
 const DIRECTION_OPTIONS = ["", "ISSUED", "RECEIVED"];
@@ -65,9 +70,22 @@ export default function Cheques() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canManageCheques = hasPermission("cheque.manage");
+  const canClearCheques = hasPermission("cheque.clear");
+
+  const requireChequeManage = () => {
+    if (canManageCheques) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "cheque.manage" }));
+    return false;
+  };
+  const requireChequeClear = () => {
+    if (canClearCheques) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "cheque.clear" }));
+    return false;
+  };
 
   const [tab, setTab] = useState("RECEIVED");
-  const [rows, setRows] = useState([]);
   const [summary, setSummary] = useState({ grouped: [], upcoming: [], overdueDeposit: [] });
   const [filters, setFilters] = useState({ status: "", from: "", to: "", q: "" });
   const [showCreate, setShowCreate] = useState(false);
@@ -75,7 +93,6 @@ export default function Cheques() {
   const [actionFor, setActionFor] = useState(null); // { row, action }
   const [actionData, setActionData] = useState({});
   const [details, setDetails] = useState(null);
-  const [loading, setLoading] = useState(false);
   const statusLabels = useMemo(
     () => ({
       PENDING: tt("chPending"),
@@ -105,30 +122,63 @@ export default function Cheques() {
     [tt]
   );
 
-  const load = async () => {
-    setLoading(true);
-    try {
-      const [list, sum] = await Promise.all([
-        api.get("/cheques", {
-          params: {
-            direction: tab,
-            ...(filters.status ? { status: filters.status } : {}),
-            ...(filters.from ? { from: filters.from } : {}),
-            ...(filters.to ? { to: filters.to } : {}),
-            ...(filters.q ? { q: filters.q } : {}),
-          },
-        }),
-        api.get("/cheques/summary"),
-      ]);
-      setRows(list.data);
-      setSummary(sum.data);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+
+  const fetchChequesPage = useCallback(async (q) => {
+    const f = filtersRef.current || {};
+    const res = await api.get("/cheques", {
+      params: {
+        paged: true,
+        direction: tabRef.current,
+        ...(f.status ? { status: f.status } : {}),
+        ...(f.from ? { from: f.from } : {}),
+        ...(f.to ? { to: f.to } : {}),
+        ...(f.q ? { q: f.q } : {}),
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const chequesTable = useServerTable(fetchChequesPage, {
+    pageSize: 10,
+    sortKey: "chequeDate",
+    sortDir: "desc",
+  });
+  const rows = chequesTable.rows;
+
+  const fetchSummary = useCallback(async () => {
+    const sum = await api.get("/cheques/summary");
+    setSummary(sum.data);
+  }, []);
+
+  const load = useCallback(async () => {
+    await Promise.all([chequesTable.refresh(), fetchSummary()]);
+  }, [chequesTable, fetchSummary]);
+
+  // Re-query the table (reset to page 1); used by the filter bar and tab switch.
+  const applyFilters = useCallback(() => {
+    chequesTable.setQuery((prev) => ({ ...prev, page: 1 }));
+  }, [chequesTable]);
 
   useEffect(() => {
-    load();
+    fetchSummary();
+  }, [fetchSummary]);
+
+  const firstTab = useRef(true);
+  useEffect(() => {
+    if (firstTab.current) {
+      firstTab.current = false;
+      return;
+    }
+    applyFilters();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
 
@@ -146,6 +196,7 @@ export default function Cheques() {
 
   const submitCreate = async (e) => {
     e.preventDefault();
+    if (!requireChequeManage()) return;
     if (!form.chequeNo || !form.bankName || !form.amount || !form.chequeDate) {
       notifyActionRequired(tt("chRequiredFields"));
       return;
@@ -166,6 +217,9 @@ export default function Cheques() {
   };
 
   const performTransition = async (row, action) => {
+    if (action === "CLEAR" || action === "BOUNCE") {
+      if (!requireChequeClear()) return;
+    } else if (!requireChequeManage()) return;
     const map = {
       DEPOSIT: "/deposit",
       CLEAR: "/clear",
@@ -201,11 +255,14 @@ export default function Cheques() {
           <div className="page-subtitle">{tt("chSubtitle")}</div>
         </div>
         <div className="page-actions">
-          <button type="button" onClick={() => { setForm({ ...emptyForm(), direction: tab }); setShowCreate(true); }}>
+          <button type="button" disabled={!canManageCheques} onClick={() => { setForm({ ...emptyForm(), direction: tab }); setShowCreate(true); }}>
             + {tt("chRegisterCheque")}
           </button>
         </div>
       </div>
+
+      {!canManageCheques ? <PermissionBanner show code="cheque.manage" tt={tt} /> : null}
+      {!canClearCheques ? <PermissionBanner show code="cheque.clear" tt={tt} /> : null}
 
       <div className="metrics-grid" style={{ marginTop: 4 }}>
         {["RECEIVED", "ISSUED"].map((dir) => {
@@ -273,13 +330,16 @@ export default function Cheques() {
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12, alignItems: "flex-end" }}>
         <label>
           <div style={{ fontSize: 12, color: "#64748b" }}>{tt("colStatus")}</div>
-          <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters({ ...filters, status: e.target.value })}>
-            {STATUS_OPTIONS.map((s) => (
-              <option key={s} value={s}>
-                {s ? statusLabels[s] || s : tt("chAll")}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={filters.status}
+            onChange={(val) => setFilters({ ...filters, status: val })}
+            placeholder={tt("chAll")}
+            options={STATUS_OPTIONS.filter(Boolean).map((s) => ({
+              value: s,
+              label: statusLabels[s] || s,
+            }))}
+          />
         </label>
         <label>
           <div style={{ fontSize: 12, color: "#64748b" }}>{tt("accFrom")}</div>
@@ -297,74 +357,110 @@ export default function Cheques() {
             onChange={(e) => setFilters({ ...filters, q: e.target.value })}
           />
         </label>
-        <button type="button" onClick={load}>{tt("accApplyRange")}</button>
+        <button type="button" onClick={applyFilters}>{tt("accApplyRange")}</button>
         <button
           type="button"
           className="btn-ghost"
-          onClick={() => { setFilters({ status: "", from: "", to: "", q: "" }); setTimeout(load, 0); }}
+          onClick={() => { setFilters({ status: "", from: "", to: "", q: "" }); setTimeout(applyFilters, 0); }}
         >
           {tt("settingsCancel")}
         </button>
       </div>
 
-      <table className="data-table" style={{ marginTop: 16 }}>
-        <thead>
-          <tr>
-            <th>{tt("chChequeNoCol")}</th>
-            <th>{tt("chBank")}</th>
-            <th>{tab === "RECEIVED" ? tt("chDrawer") : tt("chPayee")}</th>
-            <th>{tt("accStatementAmount")}</th>
-            <th>{tt("chChequeDate")}</th>
-            <th>{tt("colStatus")}</th>
-            <th>{tt("chLinked")}</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {loading ? (
-            <tr><td colSpan={8} style={{ textAlign: "center", color: "#94a3b8" }}>{tt("dashUpdating")}</td></tr>
-          ) : rows.length === 0 ? (
-            <tr><td colSpan={8} style={{ textAlign: "center", color: "#94a3b8" }}>{tt("chNoChequesView")}</td></tr>
-          ) : rows.map((r) => (
-            <tr key={r.id}>
-              <td>
-                <button type="button" className="btn-ghost" style={{ padding: 0 }} onClick={() => openDetails(r.id)}>
-                  {r.chequeNo}
-                </button>
-              </td>
-              <td>{r.bankName}{r.bankBranch ? ` (${r.bankBranch})` : ""}</td>
-              <td>{tab === "RECEIVED" ? (r.drawerName || r.customer?.name || "—") : (r.payeeName || r.supplier?.name || "—")}</td>
-              <td>{Number(r.amount || 0).toFixed(2)}</td>
-              <td>{new Date(r.chequeDate).toLocaleDateString()}</td>
-              <td><StatusBadge status={r.status} label={statusLabels[r.status]} /></td>
-              <td>{r.linkedType ? `${linkedTypeLabels[r.linkedType] || r.linkedType}#${r.linkedId || "?"}` : "—"}</td>
-              <td style={{ whiteSpace: "nowrap" }}>
+      <DataTable
+        title={tt("cheques")}
+        rows={rows}
+        serverMode
+        totalRows={chequesTable.total}
+        loading={chequesTable.loading}
+        onQueryChange={chequesTable.onQueryChange}
+        initialSort="chequeDate"
+        initialSortDir="desc"
+        pageSize={10}
+        columns={[
+          {
+            key: "chequeNo",
+            label: tt("chChequeNoCol"),
+            render: (v, r) => (
+              <button type="button" className="btn-ghost" style={{ padding: 0 }} onClick={() => openDetails(r.id)}>
+                {v}
+              </button>
+            ),
+          },
+          {
+            key: "bankName",
+            label: tt("chBank"),
+            render: (v, r) => `${v}${r.bankBranch ? ` (${r.bankBranch})` : ""}`,
+          },
+          {
+            key: "drawerName",
+            label: tab === "RECEIVED" ? tt("chDrawer") : tt("chPayee"),
+            searchable: false,
+            render: (_, r) => (tab === "RECEIVED" ? (r.drawerName || r.customer?.name || "—") : (r.payeeName || r.supplier?.name || "—")),
+          },
+          {
+            key: "amount",
+            label: tt("accStatementAmount"),
+            searchable: false,
+            render: (v) => Number(v || 0).toFixed(2),
+          },
+          {
+            key: "chequeDate",
+            label: tt("chChequeDate"),
+            searchable: false,
+            render: (v) => new Date(v).toLocaleDateString(),
+          },
+          {
+            key: "status",
+            label: tt("colStatus"),
+            searchable: false,
+            render: (v) => <StatusBadge status={v} label={statusLabels[v]} />,
+          },
+          {
+            key: "linkedType",
+            label: tt("chLinked"),
+            searchable: false,
+            render: (v, r) => (v ? `${linkedTypeLabels[v] || v}#${r.linkedId || "?"}` : "—"),
+          },
+          {
+            key: "actions",
+            label: "",
+            searchable: false,
+            render: (_, r) => (
+              <div style={{ whiteSpace: "nowrap" }}>
                 {r.status === "PENDING" && r.direction === "RECEIVED" && (
-                  <button className="btn-secondary btn-sm" onClick={() => { setActionFor({ row: r, action: "DEPOSIT" }); setActionData({}); }}>{tt("chDeposit")}</button>
+                  <button className="btn-secondary btn-sm" disabled={!canManageCheques} onClick={() => { setActionFor({ row: r, action: "DEPOSIT" }); setActionData({}); }}>{tt("chDeposit")}</button>
                 )}
                 {(r.status === "PENDING" || r.status === "DEPOSITED") && (
                   <>
-                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "CLEAR" }); setActionData({}); }}>{tt("chClear")}</button>
-                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "BOUNCE" }); setActionData({}); }}>{tt("chBounce")}</button>
+                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} disabled={!canClearCheques} onClick={() => { setActionFor({ row: r, action: "CLEAR" }); setActionData({}); }}>{tt("chClear")}</button>
+                    <button className="btn-secondary btn-sm" style={{ marginLeft: 4 }} disabled={!canClearCheques} onClick={() => { setActionFor({ row: r, action: "BOUNCE" }); setActionData({}); }}>{tt("chBounce")}</button>
                   </>
                 )}
                 {r.status === "PENDING" && (
-                  <button className="btn-ghost btn-sm" style={{ marginLeft: 4 }} onClick={() => { setActionFor({ row: r, action: "CANCEL" }); setActionData({}); }}>{tt("settingsCancel")}</button>
+                  <button className="btn-ghost btn-sm" style={{ marginLeft: 4 }} disabled={!canManageCheques} onClick={() => { setActionFor({ row: r, action: "CANCEL" }); setActionData({}); }}>{tt("settingsCancel")}</button>
                 )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              </div>
+            ),
+          },
+        ]}
+      />
 
       {showCreate && (
         <Modal onClose={() => setShowCreate(false)} title={tt("chRegisterNewCheque")}>
           <form onSubmit={submitCreate} className="form-grid" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12 }}>
             <label>
               {tt("chDirection")}
-              <select className="form-select-sm" value={form.direction} onChange={(e) => setForm({ ...form, direction: e.target.value })}>
-                {DIRECTION_OPTIONS.filter(Boolean).map((o) => <option key={o} value={o}>{directionLabels[o] || o}</option>)}
-              </select>
+              <SearchSelect
+                className="form-select-sm"
+                value={form.direction}
+                onChange={(val) => setForm({ ...form, direction: val || "ISSUED" })}
+                options={DIRECTION_OPTIONS.filter(Boolean).map((o) => ({
+                  value: o,
+                  label: directionLabels[o] || o,
+                }))}
+                isClearable={false}
+              />
             </label>
             <label>
               {tt("chChequeNo")}
@@ -419,9 +515,16 @@ export default function Cheques() {
             </label>
             <label>
               {tt("chLinkedDocumentType")}
-              <select className="form-select-sm" value={form.linkedType} onChange={(e) => setForm({ ...form, linkedType: e.target.value })}>
-                {LINKED_TYPES.map((o) => <option key={o} value={o}>{o ? linkedTypeLabels[o] || o : "—"}</option>)}
-              </select>
+              <SearchSelect
+                className="form-select-sm"
+                value={form.linkedType}
+                onChange={(val) => setForm({ ...form, linkedType: val })}
+                placeholder="—"
+                options={LINKED_TYPES.filter(Boolean).map((o) => ({
+                  value: o,
+                  label: linkedTypeLabels[o] || o,
+                }))}
+              />
             </label>
             <label>
               {tt("chLinkedDocumentId")}
@@ -433,7 +536,7 @@ export default function Cheques() {
             </label>
             <div style={{ gridColumn: "1 / -1", display: "flex", justifyContent: "flex-end", gap: 8 }}>
               <button type="button" className="btn-ghost" onClick={() => setShowCreate(false)}>{tt("settingsCancel")}</button>
-              <button type="submit">{tt("chRegisterCheque")}</button>
+              <button type="submit" disabled={!canManageCheques}>{tt("chRegisterCheque")}</button>
             </div>
           </form>
         </Modal>

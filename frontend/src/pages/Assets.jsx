@@ -1,6 +1,12 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "../services/api";
-import { notifySuccess, notifyActionRequired } from "../utils/notify";
+import DataTable from "../components/DataTable";
+import useServerTable from "../hooks/useServerTable";
+import { notifySuccess, notifyActionRequired, notifyPermissionRequired } from "../utils/notify";
+import { getLang, t } from "../i18n";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
+import SearchSelect from "../components/SearchSelect";
 
 const emptyForm = {
   assetCode: "",
@@ -15,29 +21,69 @@ const emptyForm = {
 };
 
 export default function Assets() {
-  const [rows, setRows] = useState([]);
+  const lang = getLang();
+  const tt = useMemo(() => (key, params) => t(lang, key, params), [lang]);
+  const { hasPermission } = usePermissions();
+  const canManageAssets = hasPermission("asset.manage");
+
+  const requireAssetManage = () => {
+    if (canManageAssets) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "asset.manage" }));
+    return false;
+  };
+
   const [entries, setEntries] = useState([]);
   const [status, setStatus] = useState("ACTIVE");
   const [form, setForm] = useState(emptyForm);
   const [asOfDate, setAsOfDate] = useState("");
   const [running, setRunning] = useState(false);
 
-  const load = async () => {
-    const [assetsRes, entriesRes] = await Promise.all([
-      api.get("/assets", { params: { ...(status ? { status } : {}) } }),
-      api.get("/assets/depreciation/entries"),
-    ]);
-    setRows(Array.isArray(assetsRes.data) ? assetsRes.data : []);
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const fetchAssetsPage = useCallback(async (q) => {
+    const res = await api.get("/assets", {
+      params: {
+        paged: true,
+        ...(statusRef.current ? { status: statusRef.current } : {}),
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const assetsTable = useServerTable(fetchAssetsPage, { pageSize: 10, sortKey: "id", sortDir: "desc" });
+  const rows = assetsTable.rows;
+
+  const fetchEntries = useCallback(async () => {
+    const entriesRes = await api.get("/assets/depreciation/entries");
     setEntries(Array.isArray(entriesRes.data) ? entriesRes.data : []);
-  };
+  }, []);
+
+  const load = useCallback(async () => {
+    await Promise.all([assetsTable.refresh(), fetchEntries()]);
+  }, [assetsTable, fetchEntries]);
 
   useEffect(() => {
-    load();
+    fetchEntries();
+  }, [fetchEntries]);
+
+  const firstStatus = useRef(true);
+  useEffect(() => {
+    if (firstStatus.current) {
+      firstStatus.current = false;
+      return;
+    }
+    assetsTable.setQuery((prev) => ({ ...prev, page: 1 }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
   const createAsset = async (e) => {
     e.preventDefault();
+    if (!requireAssetManage()) return;
     if (!form.name.trim() || !form.purchaseDate || !form.inServiceDate) {
       notifyActionRequired("name, purchase date, and in-service date are required.");
       return;
@@ -58,6 +104,7 @@ export default function Assets() {
   };
 
   const runDepreciation = async () => {
+    if (!requireAssetManage()) return;
     setRunning(true);
     try {
       const res = await api.post("/assets/depreciation/run", {
@@ -72,6 +119,7 @@ export default function Assets() {
   };
 
   const disposeAsset = async (id) => {
+    if (!requireAssetManage()) return;
     const raw = window.prompt("Disposal proceeds amount (optional, default 0):", "0");
     if (raw == null) return;
     const disposalValue = Number(raw || 0);
@@ -103,6 +151,8 @@ export default function Assets() {
           <div className="page-subtitle">Fixed assets and monthly straight-line depreciation postings</div>
         </div>
       </div>
+
+      <PermissionBanner show={!canManageAssets} code="asset.manage" tt={tt} />
 
       <form onSubmit={createAsset} className="form-grid" style={{ marginBottom: 16 }}>
         <label>
@@ -142,87 +192,94 @@ export default function Assets() {
           <input value={form.notes} onChange={(e) => setForm((p) => ({ ...p, notes: e.target.value }))} />
         </label>
         <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="submit">Add Asset</button>
+          <button type="submit" disabled={!canManageAssets}>Add Asset</button>
         </div>
       </form>
 
       <div className="form-grid" style={{ marginBottom: 12 }}>
         <label>
           Status
-          <select className="form-select-sm" value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">All</option>
-            <option value="ACTIVE">Active</option>
-            <option value="DISPOSED">Disposed</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={status}
+            onChange={(val) => setStatus(val)}
+            placeholder="All"
+            options={[
+              { value: "ACTIVE", label: "Active" },
+              { value: "DISPOSED", label: "Disposed" },
+            ]}
+          />
         </label>
         <label>
           Depreciation as of
           <input type="date" value={asOfDate} onChange={(e) => setAsOfDate(e.target.value)} />
         </label>
         <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="button" className="btn-secondary" onClick={runDepreciation} disabled={running}>
+          <button type="button" className="btn-secondary" onClick={runDepreciation} disabled={running || !canManageAssets}>
             {running ? "Running..." : "Run Depreciation"}
           </button>
         </div>
       </div>
 
       <h3>Assets</h3>
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>Code</th>
-            <th>Name</th>
-            <th>Status</th>
-            <th>Cost</th>
-            <th>Accum. Dep</th>
-            <th>Book Value</th>
-            <th>Disposal</th>
-            <th>Life (m)</th>
-            <th>Last Dep</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => {
-            const cost = Number(r.cost || 0);
-            const dep = Number(r.accumulatedDepreciation || 0);
-            const book = Math.max(0, cost - dep);
-            return (
-              <tr key={r.id}>
-                <td>{r.assetCode || "-"}</td>
-                <td>{r.name}</td>
-                <td>{r.status}</td>
-                <td>{cost.toFixed(2)}</td>
-                <td>{dep.toFixed(2)}</td>
-                <td>{book.toFixed(2)}</td>
-                <td>
-                  {r.status === "DISPOSED"
-                    ? `${Number(r.disposalValue || 0).toFixed(2)} · ${r.disposedAt ? new Date(r.disposedAt).toLocaleDateString() : "-"}`
-                    : "-"}
-                </td>
-                <td>{r.usefulLifeMonths}</td>
-                <td>{r.lastDepreciationDate ? new Date(r.lastDepreciationDate).toLocaleDateString() : "-"}</td>
-                <td>
-                  {r.status === "ACTIVE" ? (
-                    <button type="button" className="btn-secondary btn-sm" onClick={() => disposeAsset(r.id)}>
-                      Dispose
-                    </button>
-                  ) : (
-                    <span className="text-muted">—</span>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-          {!rows.length ? (
-            <tr>
-              <td colSpan={10} style={{ textAlign: "center", color: "#94a3b8" }}>
-                No assets found.
-              </td>
-            </tr>
-          ) : null}
-        </tbody>
-      </table>
+      <DataTable
+        title="Assets"
+        rows={rows}
+        serverMode
+        totalRows={assetsTable.total}
+        loading={assetsTable.loading}
+        onQueryChange={assetsTable.onQueryChange}
+        initialSort="id"
+        initialSortDir="desc"
+        pageSize={10}
+        columns={[
+          { key: "assetCode", label: "Code", render: (v) => v || "-" },
+          { key: "name", label: "Name" },
+          { key: "status", label: "Status", searchable: false },
+          { key: "cost", label: "Cost", searchable: false, render: (v) => Number(v || 0).toFixed(2) },
+          {
+            key: "accumulatedDepreciation",
+            label: "Accum. Dep",
+            searchable: false,
+            render: (v) => Number(v || 0).toFixed(2),
+          },
+          {
+            key: "bookValue",
+            label: "Book Value",
+            searchable: false,
+            render: (_, r) => Math.max(0, Number(r.cost || 0) - Number(r.accumulatedDepreciation || 0)).toFixed(2),
+          },
+          {
+            key: "disposal",
+            label: "Disposal",
+            searchable: false,
+            render: (_, r) =>
+              r.status === "DISPOSED"
+                ? `${Number(r.disposalValue || 0).toFixed(2)} · ${r.disposedAt ? new Date(r.disposedAt).toLocaleDateString() : "-"}`
+                : "-",
+          },
+          { key: "usefulLifeMonths", label: "Life (m)", searchable: false },
+          {
+            key: "lastDepreciationDate",
+            label: "Last Dep",
+            searchable: false,
+            render: (v) => (v ? new Date(v).toLocaleDateString() : "-"),
+          },
+          {
+            key: "actions",
+            label: "Action",
+            searchable: false,
+            render: (_, r) =>
+              r.status === "ACTIVE" ? (
+                <button type="button" className="btn-secondary btn-sm" disabled={!canManageAssets} onClick={() => disposeAsset(r.id)}>
+                  Dispose
+                </button>
+              ) : (
+                <span className="text-muted">—</span>
+              ),
+          },
+        ]}
+      />
 
       <h3 style={{ marginTop: 18 }}>Recent depreciation entries</h3>
       <table className="data-table">

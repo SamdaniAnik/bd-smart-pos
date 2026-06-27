@@ -1,0 +1,1 @@
+ALTER TABLE `Product` ADD COLUMN `trackExpiry` BOOLEAN NOT NULL DEFAULT false;

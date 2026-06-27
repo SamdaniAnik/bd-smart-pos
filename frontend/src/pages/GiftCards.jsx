@@ -1,10 +1,26 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
+import DataTable from "../components/DataTable";
+import useServerTable from "../hooks/useServerTable";
 import SubmitButton from "../components/SubmitButton";
-import { notifyActionRequired, notifySuccess } from "../utils/notify";
+import { notifyActionRequired, notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import { getLang, t } from "../i18n";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
+import SearchSelect from "../components/SearchSelect";
 
 export default function GiftCards() {
-  const [rows, setRows] = useState([]);
+  const lang = getLang();
+  const tt = useMemo(() => (key, params) => t(lang, key, params), [lang]);
+  const { hasPermission } = usePermissions();
+  const canManageWallets = hasPermission("customer.create");
+
+  const requireCustomerCreate = () => {
+    if (canManageWallets) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "customer.create" }));
+    return false;
+  };
+
   const [walletBalances, setWalletBalances] = useState([]);
   const [walletTxns, setWalletTxns] = useState([]);
   const [issueForm, setIssueForm] = useState({ code: "", initialAmount: "", customerId: "", expiresAt: "" });
@@ -16,29 +32,51 @@ export default function GiftCards() {
   const [submittingCashOut, setSubmittingCashOut] = useState(false);
   const [submittingTxnFilter, setSubmittingTxnFilter] = useState(false);
 
-  const load = async (filter = txnFilter) => {
+  const fetchCardsPage = useCallback(async (q) => {
+    const res = await api.get("/gift-cards", {
+      params: {
+        paged: true,
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const cardsTable = useServerTable(fetchCardsPage, { pageSize: 10, sortKey: "id", sortDir: "desc" });
+
+  const fetchWalletData = useCallback(async (filter) => {
     const q = new URLSearchParams();
     if (filter?.from) q.set("from", filter.from);
     if (filter?.to) q.set("to", filter.to);
     if (filter?.type && filter.type !== "ALL") q.set("type", filter.type);
     const txnUrl = q.toString() ? `/gift-cards/wallet-transactions?${q.toString()}` : "/gift-cards/wallet-transactions";
-    const [cardsRes, walletRes, txnRes] = await Promise.all([
-      api.get("/gift-cards"),
+    const [walletRes, txnRes] = await Promise.all([
       api.get("/gift-cards/wallet-balances"),
       api.get(txnUrl),
     ]);
-    setRows(cardsRes.data || []);
     setWalletBalances(walletRes.data || []);
     setWalletTxns(txnRes.data || []);
-  };
+  }, []);
+
+  const load = useCallback(
+    async (filter = txnFilter) => {
+      await Promise.all([cardsTable.refresh(), fetchWalletData(filter)]);
+    },
+    [cardsTable, fetchWalletData, txnFilter]
+  );
 
   useEffect(() => {
-    load(txnFilter);
+    fetchWalletData(txnFilter);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const issue = async (e) => {
     e.preventDefault();
+    if (!requireCustomerCreate()) return;
     const initialAmount = Number(issueForm.initialAmount);
     if (initialAmount <= 0) {
       notifyActionRequired("enter a positive initial amount.");
@@ -62,6 +100,7 @@ export default function GiftCards() {
 
   const loadWallet = async (e) => {
     e.preventDefault();
+    if (!requireCustomerCreate()) return;
     const customerId = Number(walletForm.customerId);
     const amount = Number(walletForm.amount);
     if (!customerId || amount <= 0) {
@@ -85,6 +124,7 @@ export default function GiftCards() {
 
   const cashOutWallet = async (e) => {
     e.preventDefault();
+    if (!requireCustomerCreate()) return;
     const customerId = Number(cashOutForm.customerId);
     const amount = Number(cashOutForm.amount);
     if (!customerId || amount <= 0) {
@@ -141,6 +181,7 @@ export default function GiftCards() {
           <div className="page-subtitle">Issuance, wallet load, cash-out, and transaction history</div>
         </div>
       </div>
+      <PermissionBanner show={!canManageWallets} code="customer.create" tt={tt} />
       <p className="page-intro">Issue prepaid cards or load stored-value balance for a customer (same branch).</p>
 
       <div className="split-cards-grid">
@@ -167,7 +208,7 @@ export default function GiftCards() {
             Expires (optional, yyyy-mm-dd)
             <input type="date" value={issueForm.expiresAt} onChange={(e) => setIssueForm({ ...issueForm, expiresAt: e.target.value })} />
           </label>
-          <SubmitButton loading={submittingIssue} loadingLabel="Issuing…">
+          <SubmitButton loading={submittingIssue} loadingLabel="Issuing…" disabled={!canManageWallets}>
             Issue card
           </SubmitButton>
         </form>
@@ -195,7 +236,7 @@ export default function GiftCards() {
             Note
             <input value={walletForm.note} onChange={(e) => setWalletForm({ ...walletForm, note: e.target.value })} />
           </label>
-          <SubmitButton loading={submittingWallet} loadingLabel="Crediting…">
+          <SubmitButton loading={submittingWallet} loadingLabel="Crediting…" disabled={!canManageWallets}>
             Credit wallet
           </SubmitButton>
         </form>
@@ -228,7 +269,7 @@ export default function GiftCards() {
           Note
           <input value={cashOutForm.note} onChange={(e) => setCashOutForm({ ...cashOutForm, note: e.target.value })} />
         </label>
-        <SubmitButton loading={submittingCashOut} loadingLabel="Posting…">
+        <SubmitButton loading={submittingCashOut} loadingLabel="Posting…" disabled={!canManageWallets}>
           Cash out wallet
         </SubmitButton>
       </form>
@@ -236,28 +277,28 @@ export default function GiftCards() {
       <div className="transfer-history-head" style={{ marginTop: 24 }}>
         <h3 style={{ margin: 0 }}>Recent cards</h3>
       </div>
-      <div className="data-table-wrap">
-        <table className="data-table">
-        <thead>
-          <tr>
-            <th>Code</th>
-            <th>Balance</th>
-            <th>Status</th>
-            <th>Expires</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.id}>
-              <td>{r.code}</td>
-              <td>{Number(r.balance || 0).toFixed(2)}</td>
-              <td>{r.status}</td>
-              <td>{r.expiresAt ? new Date(r.expiresAt).toLocaleDateString() : "—"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      </div>
+      <DataTable
+        title="Gift cards"
+        rows={cardsTable.rows}
+        serverMode
+        totalRows={cardsTable.total}
+        loading={cardsTable.loading}
+        onQueryChange={cardsTable.onQueryChange}
+        initialSort="id"
+        initialSortDir="desc"
+        pageSize={10}
+        columns={[
+          { key: "code", label: "Code" },
+          { key: "balance", label: "Balance", searchable: false, render: (v) => Number(v || 0).toFixed(2) },
+          { key: "status", label: "Status", searchable: false },
+          {
+            key: "expiresAt",
+            label: "Expires",
+            searchable: false,
+            render: (v) => (v ? new Date(v).toLocaleDateString() : "—"),
+          },
+        ]}
+      />
 
       <div className="transfer-history-head" style={{ marginTop: 24 }}>
         <h3 style={{ margin: 0 }}>Customer wallet balances</h3>
@@ -304,14 +345,20 @@ export default function GiftCards() {
         </label>
         <label>
           Type
-          <select className="form-select-sm" value={txnFilter.type} onChange={(e) => setTxnFilter((p) => ({ ...p, type: e.target.value }))}>
-            <option value="ALL">All</option>
-            <option value="WALLET_LOAD">Wallet Load</option>
-            <option value="WALLET_REDEEM">Wallet Redeem</option>
-            <option value="WALLET_CASH_OUT">Wallet Cash Out</option>
-            <option value="LOAD">Gift Card Load</option>
-            <option value="REDEEM">Gift Card Redeem</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={txnFilter.type}
+            onChange={(val) => setTxnFilter((p) => ({ ...p, type: val || "ALL" }))}
+            options={[
+              { value: "ALL", label: "All" },
+              { value: "WALLET_LOAD", label: "Wallet Load" },
+              { value: "WALLET_REDEEM", label: "Wallet Redeem" },
+              { value: "WALLET_CASH_OUT", label: "Wallet Cash Out" },
+              { value: "LOAD", label: "Gift Card Load" },
+              { value: "REDEEM", label: "Gift Card Redeem" },
+            ]}
+            isClearable={false}
+          />
         </label>
         <div style={{ display: "flex", gap: 8, alignItems: "end", flexWrap: "wrap" }}>
           <SubmitButton loading={submittingTxnFilter} loadingLabel="Applying…">

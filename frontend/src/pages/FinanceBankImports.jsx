@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
 import { consumeGlobalSubmitError, notifySuccess } from "../utils/notify";
+import SearchSelect from "../components/SearchSelect";
 
 export default function FinanceBankImports() {
   const [imports, setImports] = useState([]);
@@ -327,22 +328,16 @@ export default function FinanceBankImports() {
       <div style={{ marginTop: 24 }}>
         <label>
           Selected batch:&nbsp;
-          <select
+          <SearchSelect
             className="form-select-sm"
             value={selectedImportId != null ? String(selectedImportId) : ""}
-            onChange={(e) => {
-              const v = e.target.value;
-              setSelectedImportId(v ? Number(v) : null);
-            }}
-          >
-            <option value="">— Choose —</option>
-            {(imports || []).map((row) => (
-              <option key={row.id} value={row.id}>
-                #{row.id} · {row.label || "Untitled"} · {row.importedAt ? new Date(row.importedAt).toLocaleString() : ""} (
-                {(row._count && row._count.lines) ?? row.rowCount ?? 0} rows)
-              </option>
-            ))}
-          </select>
+            onChange={(val) => setSelectedImportId(val ? Number(val) : null)}
+            placeholder="— Choose —"
+            options={(imports || []).map((row) => ({
+              value: String(row.id),
+              label: `#${row.id} · ${row.label || "Untitled"} · ${row.importedAt ? new Date(row.importedAt).toLocaleString() : ""} (${(row._count && row._count.lines) ?? row.rowCount ?? 0} rows)`,
+            }))}
+          />
         </label>
       </div>
       {selectedImportId ? (
@@ -668,11 +663,17 @@ export default function FinanceBankImports() {
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "end" }}>
           <label>
             Status
-            <select className="form-select-sm" value={snapshotFilter.status} onChange={(e) => setSnapshotFilter((s) => ({ ...s, status: e.target.value }))}>
-              <option value="ALL">All</option>
-              <option value="OPEN">Open</option>
-              <option value="CLOSED">Closed</option>
-            </select>
+            <SearchSelect
+              className="form-select-sm"
+              value={snapshotFilter.status}
+              onChange={(val) => setSnapshotFilter((s) => ({ ...s, status: val || "ALL" }))}
+              options={[
+                { value: "ALL", label: "All" },
+                { value: "OPEN", label: "Open" },
+                { value: "CLOSED", label: "Closed" },
+              ]}
+              isClearable={false}
+            />
           </label>
           <label>
             From

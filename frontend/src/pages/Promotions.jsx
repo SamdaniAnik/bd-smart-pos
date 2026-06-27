@@ -1,8 +1,198 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import { getLang, t } from "../i18n";
+import { notifyActionRequired, notifyPermissionRequired, notifySuccess } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
+import SearchSelect from "../components/SearchSelect";
+
+const EMPTY_PROMO_FORM = {
+  name: "",
+  type: "CART_PERCENT",
+  productId: "",
+  category: "",
+  buyQty: 1,
+  getQty: 1,
+  discountValue: 0,
+  minBasketAmount: 0,
+  bundleProductIds: [],
+  startsAt: "",
+  endsAt: "",
+};
+
+const GROCERY_PROMO_CATEGORIES = ["DAIRY", "BEVERAGES", "SNACKS", "FROZEN", "HOUSEHOLD", "PERSONAL_CARE", "GROCERY"];
+
+function formatPromoScheduleLabel(row, tt) {
+  const now = Date.now();
+  const start = row.startsAt ? new Date(row.startsAt).getTime() : null;
+  const end = row.endsAt ? new Date(row.endsAt).getTime() : null;
+  if (!row.isActive) return tt("promoStatusInactive");
+  if (start && start > now) return tt("promoStatusScheduled");
+  if (end && end < now) return tt("promoStatusExpired");
+  return tt("promoStatusActive");
+}
+
+function toDatetimeLocalValue(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function buildPromoTemplates(tt) {
+  return [
+    {
+      id: "two_for_99_snacks",
+      label: tt("promoTemplate2for99"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "2 for ৳99 — SNACKS",
+        type: "CATEGORY_BUNDLE_FIXED",
+        category: "SNACKS",
+        buyQty: 2,
+        getQty: 1,
+        discountValue: 99,
+      },
+    },
+    {
+      id: "three_for_150_snacks",
+      label: tt("promoTemplate3for150"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "3 for ৳150 — SNACKS",
+        type: "CATEGORY_BUNDLE_FIXED",
+        category: "SNACKS",
+        buyQty: 3,
+        getQty: 1,
+        discountValue: 150,
+      },
+    },
+    {
+      id: "dairy_10pct",
+      label: tt("promoTemplateDairy10"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "10% off — DAIRY",
+        type: "CATEGORY_PERCENT",
+        category: "DAIRY",
+        discountValue: 10,
+      },
+    },
+    {
+      id: "spend_500_5pct",
+      label: tt("promoTemplateSpend500"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "5% off when spend ৳500+",
+        type: "CART_PERCENT",
+        discountValue: 5,
+        minBasketAmount: 500,
+      },
+    },
+    {
+      id: "bogo_buy2get1",
+      label: "Buy 2 Get 1 (product)",
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "Buy 2 Get 1",
+        type: "BOGO_PRODUCT",
+        buyQty: 2,
+        getQty: 1,
+      },
+    },
+    {
+      id: "mix_match_snacks",
+      label: tt("promoTemplateMixMatch"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "Mix & match — SNACKS",
+        type: "MIX_MATCH_FIXED",
+        buyQty: 3,
+        discountValue: 120,
+        bundleProductIds: [],
+      },
+    },
+  ];
+}
+
+function buildFestivalTemplates(tt) {
+  return [
+    {
+      id: "festival_eid",
+      label: tt("promoTemplateEid"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "ঈদ অফার — Eid Offer",
+        type: "CART_PERCENT",
+        discountValue: 10,
+        minBasketAmount: 1000,
+      },
+    },
+    {
+      id: "festival_ramadan",
+      label: tt("promoTemplateRamadan"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "রমজান অফার — Ramadan Grocery",
+        type: "CATEGORY_PERCENT",
+        category: "GROCERY",
+        discountValue: 5,
+      },
+    },
+    {
+      id: "festival_boishakh",
+      label: tt("promoTemplateBoishakh"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "পহেলা বৈশাখ অফার — Boishakh Offer",
+        type: "CART_PERCENT",
+        discountValue: 5,
+        minBasketAmount: 500,
+      },
+    },
+    {
+      id: "festival_puja",
+      label: tt("promoTemplatePuja"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "পূজা অফার — Puja Offer",
+        type: "CART_PERCENT",
+        discountValue: 8,
+      },
+    },
+    {
+      id: "salary_week",
+      label: tt("promoTemplateSalaryWeek"),
+      form: {
+        ...EMPTY_PROMO_FORM,
+        name: "বেতন সপ্তাহ — Salary Week",
+        type: "CART_PERCENT",
+        discountValue: 5,
+        minBasketAmount: 2000,
+      },
+    },
+  ];
+}
 
 function Promotions() {
+  const lang = getLang();
+  const tt = (key, params) => t(lang, key, params);
+  const { hasPermission } = usePermissions();
+  const canManagePromos = hasPermission("product.create");
+
+  const requirePromoCreate = () => {
+    if (canManagePromos) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "product.create" }));
+    return false;
+  };
+
+  const promoTemplates = buildPromoTemplates(tt);
+  const festivalTemplates = buildFestivalTemplates(tt);
+  const [festivalHint, setFestivalHint] = useState(false);
+  const [festivalApiTemplates, setFestivalApiTemplates] = useState([]);
+  const [deployingKit, setDeployingKit] = useState("");
   const [tab, setTab] = useState("rules"); // rules | coupons
   const [rows, setRows] = useState([]);
   const [couponRows, setCouponRows] = useState([]);
@@ -16,32 +206,86 @@ function Promotions() {
     endsAt: "",
   });
   const [products, setProducts] = useState([]);
-  const [form, setForm] = useState({
-    name: "",
-    type: "CART_PERCENT",
-    productId: "",
-    category: "",
-    buyQty: 1,
-    getQty: 1,
-    discountValue: 0,
-    minBasketAmount: 0,
-    bundleProductIds: [],
+  const [form, setForm] = useState({ ...EMPTY_PROMO_FORM });
+  const [productCategories, setProductCategories] = useState([]);
+  const [showExpiryAutoOnly, setShowExpiryAutoOnly] = useState(() => {
+    try {
+      return sessionStorage.getItem("bd_pos_promotions_filter") === "expiry_auto";
+    } catch {
+      return false;
+    }
   });
 
   const load = async () => {
-    const [promoRes, productRes] = await Promise.all([api.get("/promotions"), api.get("/products")]);
+    const [promoRes, productRes, catRes] = await Promise.all([
+      api.get("/promotions"),
+      api.get("/products"),
+      api.get("/master/product-categories").catch(() => ({ data: [] })),
+    ]);
     setRows(promoRes.data || []);
     setProducts(productRes.data || []);
+    setProductCategories(Array.isArray(catRes.data) ? catRes.data : []);
   };
+
+  const categoryOptions = useMemo(() => {
+    const fromMaster = productCategories
+      .map((c) => String(c.name || "").trim().toUpperCase())
+      .filter(Boolean);
+    const merged = [...new Set([...GROCERY_PROMO_CATEGORIES, ...fromMaster])].sort();
+    return merged;
+  }, [productCategories]);
 
   const loadCoupons = async () => {
     const res = await api.get("/promotions/coupons");
     setCouponRows(res.data || []);
   };
 
+  const deployFestivalKit = async (templateId) => {
+    if (!requirePromoCreate()) return;
+    const tpl = festivalApiTemplates.find((t) => t.id === templateId) || {};
+    setDeployingKit(templateId);
+    try {
+      await api.post(`/promotions/festival-kits/${templateId}/deploy`, {
+        startsAt: tpl.suggestedStartsAt || null,
+        endsAt: tpl.suggestedEndsAt || null,
+      });
+      await load();
+      notifySuccess(tt("promoFestivalDeployed"));
+    } catch (err) {
+      notifyActionRequired(err?.response?.data?.error || tt("promoFestivalDeployFailed"));
+    } finally {
+      setDeployingKit("");
+    }
+  };
+
   useEffect(() => {
     load();
+    api.get("/promotions/festival-templates").then((res) => {
+      setFestivalApiTemplates(Array.isArray(res.data) ? res.data : []);
+    }).catch(() => setFestivalApiTemplates([]));
   }, []);
+
+  useEffect(() => {
+    const onNav = (event) => {
+      if (event?.detail?.view !== "promotions") return;
+      try {
+        if (sessionStorage.getItem("bd_pos_promotions_filter") === "expiry_auto") {
+          setShowExpiryAutoOnly(true);
+          sessionStorage.removeItem("bd_pos_promotions_filter");
+          void load();
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener("bd_pos_navigate", onNav);
+    return () => window.removeEventListener("bd_pos_navigate", onNav);
+  }, []);
+
+  const displayRows = useMemo(() => {
+    if (!showExpiryAutoOnly) return rows;
+    return rows.filter((r) => String(r.name || "").includes("[AUTO] Expiry"));
+  }, [rows, showExpiryAutoOnly]);
 
   useEffect(() => {
     loadCoupons();
@@ -49,6 +293,7 @@ function Promotions() {
 
   const createRule = async (e) => {
     e.preventDefault();
+    if (!requirePromoCreate()) return;
     await api.post("/promotions", {
       ...form,
       productId: form.productId ? Number(form.productId) : null,
@@ -57,18 +302,10 @@ function Promotions() {
       discountValue: Number(form.discountValue || 0),
       minBasketAmount: Number(form.minBasketAmount || 0),
       bundleProductIds: Array.isArray(form.bundleProductIds) ? form.bundleProductIds.map((x) => Number(x)) : [],
+      startsAt: form.startsAt ? new Date(form.startsAt).toISOString() : null,
+      endsAt: form.endsAt ? new Date(form.endsAt).toISOString() : null,
     });
-    setForm({
-      name: "",
-      type: "CART_PERCENT",
-      productId: "",
-      category: "",
-      buyQty: 1,
-      getQty: 1,
-      discountValue: 0,
-      minBasketAmount: 0,
-      bundleProductIds: [],
-    });
+    setForm({ ...EMPTY_PROMO_FORM });
     load();
   };
 
@@ -84,11 +321,13 @@ function Promotions() {
   };
 
   const toggle = async (row) => {
+    if (!requirePromoCreate()) return;
     await api.put(`/promotions/${row.id}`, { isActive: !row.isActive });
     load();
   };
 
   const removeRule = async (row) => {
+    if (!requirePromoCreate()) return;
     if (!window.confirm("Delete this promotion?")) return;
     await api.delete(`/promotions/${row.id}`);
     load();
@@ -96,6 +335,7 @@ function Promotions() {
 
   const createCoupon = async (e) => {
     e.preventDefault();
+    if (!requirePromoCreate()) return;
     await api.post("/promotions/coupons", {
       code: couponForm.code,
       discountType: couponForm.discountType,
@@ -118,11 +358,13 @@ function Promotions() {
   };
 
   const toggleCoupon = async (row) => {
+    if (!requirePromoCreate()) return;
     await api.put(`/promotions/coupons/${row.id}`, { isActive: !row.isActive });
     loadCoupons();
   };
 
   const removeCoupon = async (row) => {
+    if (!requirePromoCreate()) return;
     if (!window.confirm(`Delete coupon ${row.code}?`)) return;
     await api.delete(`/promotions/coupons/${row.id}`);
     loadCoupons();
@@ -136,6 +378,7 @@ function Promotions() {
           <div className="page-subtitle">Automatic cart rules and checkout coupon codes</div>
         </div>
       </div>
+      <PermissionBanner show={!canManagePromos} code="product.create" tt={tt} />
       <div className="pos-tabs">
         <div className="pos-tablist" role="tablist" aria-label="Promotion views">
           <button
@@ -172,14 +415,16 @@ function Promotions() {
               onChange={(e) => setCouponForm((f) => ({ ...f, code: e.target.value }))}
               required
             />
-            <select
+            <SearchSelect
               className="form-select-sm"
               value={couponForm.discountType}
-              onChange={(e) => setCouponForm((f) => ({ ...f, discountType: e.target.value }))}
-            >
-              <option value="PERCENT">Percent off basket (before VAT)</option>
-              <option value="AMOUNT">Fixed BDT off</option>
-            </select>
+              onChange={(val) => setCouponForm((f) => ({ ...f, discountType: val || "PERCENT" }))}
+              options={[
+                { value: "PERCENT", label: "Percent off basket (before VAT)" },
+                { value: "AMOUNT", label: "Fixed BDT off" },
+              ]}
+              isClearable={false}
+            />
             <input
               type="number"
               placeholder="Value (% or BDT)"
@@ -208,7 +453,7 @@ function Promotions() {
               value={couponForm.endsAt}
               onChange={(e) => setCouponForm((f) => ({ ...f, endsAt: e.target.value }))}
             />
-            <button type="submit">Create coupon</button>
+            <button type="submit" disabled={!canManagePromos}>Create coupon</button>
           </form>
           <DataTable
             title="Coupon codes"
@@ -246,6 +491,65 @@ function Promotions() {
 
       {tab === "rules" ? (
       <>
+      <div className="pos-department-chips" style={{ marginBottom: 12 }} role="group" aria-label={tt("promoTemplatesLabel")}>
+        <span className="pos-quick-add-label" style={{ alignSelf: "center" }}>
+          {tt("promoTemplatesLabel")}:
+        </span>
+        {promoTemplates.map((tpl) => (
+          <button
+            key={tpl.id}
+            type="button"
+            className="pos-dept-chip"
+            onClick={() => {
+              setForm({ ...tpl.form });
+              setFestivalHint(false);
+            }}
+            title={tpl.form.type === "BOGO_PRODUCT" ? tt("promoTemplateBogoHint") : undefined}
+          >
+            {tpl.label}
+          </button>
+        ))}
+      </div>
+      <div
+        className="pos-department-chips"
+        style={{ marginBottom: 12 }}
+        role="group"
+        aria-label={tt("promoFestivalTemplatesLabel")}
+      >
+        <span className="pos-quick-add-label" style={{ alignSelf: "center" }}>
+          {tt("promoFestivalTemplatesLabel")}:
+        </span>
+        {festivalTemplates.map((tpl) => (
+          <span key={tpl.id} style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+            <button
+              type="button"
+              className="pos-dept-chip"
+              onClick={() => {
+                setForm({ ...tpl.form });
+                setFestivalHint(true);
+              }}
+            >
+              {tpl.label}
+            </button>
+            {canManagePromos ? (
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                disabled={deployingKit === tpl.id}
+                onClick={() => deployFestivalKit(tpl.id)}
+                title={tt("promoFestivalDeployHint")}
+              >
+                {deployingKit === tpl.id ? "…" : tt("promoFestivalDeploy")}
+              </button>
+            ) : null}
+          </span>
+        ))}
+      </div>
+      {festivalHint ? (
+        <p className="text-muted" style={{ marginTop: -6, marginBottom: 10, fontSize: 13 }}>
+          {tt("promoFestivalDateHint")}
+        </p>
+      ) : null}
       <form onSubmit={createRule} className="form-grid" style={{ marginBottom: 12 }}>
         <input
           placeholder="Promotion name"
@@ -253,42 +557,50 @@ function Promotions() {
           onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
           required
         />
-        <select className="form-select-sm" value={form.type} onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}>
-          <option value="CART_PERCENT">Cart % Off</option>
-          <option value="CATEGORY_PERCENT">Category % Off</option>
-          <option value="BOGO_PRODUCT">BOGO Product</option>
-          <option value="BUNDLE_FIXED">Bundle Fixed Price</option>
-          <option value="CATEGORY_BUNDLE_FIXED">Category Bundle Fixed Price</option>
-        </select>
+        <SearchSelect
+          className="form-select-sm"
+          value={form.type}
+          onChange={(val) => setForm((f) => ({ ...f, type: val || "CART_PERCENT" }))}
+          options={[
+            { value: "CART_PERCENT", label: "Cart % Off" },
+            { value: "CATEGORY_PERCENT", label: "Category % Off" },
+            { value: "BOGO_PRODUCT", label: "BOGO Product" },
+            { value: "BUNDLE_FIXED", label: "Bundle Fixed Price" },
+            { value: "CATEGORY_BUNDLE_FIXED", label: "Category Bundle Fixed Price" },
+            { value: "MIX_MATCH_FIXED", label: tt("promoTypeMixMatch") },
+          ]}
+          isClearable={false}
+        />
         {form.type === "BOGO_PRODUCT" ? (
           <>
-            <select className="form-select-sm" value={form.productId} onChange={(e) => setForm((f) => ({ ...f, productId: e.target.value }))} required>
-              <option value="">Select product</option>
-              {products.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
+            <SearchSelect
+              className="form-select-sm"
+              value={form.productId}
+              onChange={(val) => setForm((f) => ({ ...f, productId: val }))}
+              placeholder="Select product"
+              options={products.map((p) => ({ value: String(p.id), label: p.name }))}
+            />
             <input type="number" placeholder="Buy Qty" value={form.buyQty} onChange={(e) => setForm((f) => ({ ...f, buyQty: e.target.value }))} />
             <input type="number" placeholder="Get Qty" value={form.getQty} onChange={(e) => setForm((f) => ({ ...f, getQty: e.target.value }))} />
           </>
         ) : null}
         {form.type === "CATEGORY_PERCENT" ? (
-          <input
-            placeholder="Category text (exact match)"
+          <SearchSelect
+            className="form-select-sm"
             value={form.category}
-            onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}
-            required
+            onChange={(val) => setForm((f) => ({ ...f, category: val }))}
+            placeholder={tt("promoPickCategory")}
+            options={categoryOptions.map((cat) => ({ value: cat, label: cat }))}
           />
         ) : null}
         {form.type === "CATEGORY_BUNDLE_FIXED" ? (
           <>
-            <input
-              placeholder="Category text (exact match)"
+            <SearchSelect
+              className="form-select-sm"
               value={form.category}
-              onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}
-              required
+              onChange={(val) => setForm((f) => ({ ...f, category: val }))}
+              placeholder={tt("promoPickCategory")}
+              options={categoryOptions.map((cat) => ({ value: cat, label: cat }))}
             />
             <input
               type="number"
@@ -307,7 +619,42 @@ function Promotions() {
             />
           </>
         ) : null}
-        {form.type !== "BOGO_PRODUCT" && form.type !== "BUNDLE_FIXED" && form.type !== "CATEGORY_BUNDLE_FIXED" ? (
+        {form.type === "MIX_MATCH_FIXED" ? (
+          <>
+            <input
+              type="number"
+              placeholder={tt("promoMixPickCount")}
+              value={form.buyQty}
+              onChange={(e) => setForm((f) => ({ ...f, buyQty: e.target.value }))}
+              min={2}
+              required
+            />
+            <input
+              type="number"
+              placeholder={tt("promoMixBundlePrice")}
+              value={form.discountValue}
+              onChange={(e) => setForm((f) => ({ ...f, discountValue: e.target.value }))}
+              required
+            />
+            <div className="page-card" style={{ maxHeight: 180, overflow: "auto" }}>
+              <strong>{tt("promoMixPickProducts")}</strong>
+              {products.map((p) => (
+                <label key={p.id} style={{ display: "block", marginTop: 6 }}>
+                  <input
+                    type="checkbox"
+                    checked={form.bundleProductIds.includes(Number(p.id))}
+                    onChange={() => toggleBundleProduct(p.id)}
+                  />{" "}
+                  {p.name}
+                </label>
+              ))}
+            </div>
+          </>
+        ) : null}
+        {form.type !== "BOGO_PRODUCT" &&
+        form.type !== "BUNDLE_FIXED" &&
+        form.type !== "CATEGORY_BUNDLE_FIXED" &&
+        form.type !== "MIX_MATCH_FIXED" ? (
           <input
             type="number"
             placeholder="Discount %"
@@ -347,12 +694,38 @@ function Promotions() {
             onChange={(e) => setForm((f) => ({ ...f, minBasketAmount: e.target.value }))}
           />
         ) : null}
-        <button type="submit">Create Promotion</button>
+        <input
+          type="datetime-local"
+          value={form.startsAt}
+          onChange={(e) => setForm((f) => ({ ...f, startsAt: e.target.value }))}
+          title={tt("promoStartsAt")}
+        />
+        <input
+          type="datetime-local"
+          value={form.endsAt}
+          onChange={(e) => setForm((f) => ({ ...f, endsAt: e.target.value }))}
+          title={tt("promoEndsAt")}
+        />
+        <button type="submit" disabled={!canManagePromos}>Create Promotion</button>
       </form>
 
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12, alignItems: "center" }}>
+        <button
+          type="button"
+          className={`pos-dept-chip${showExpiryAutoOnly ? " active" : ""}`}
+          onClick={() => setShowExpiryAutoOnly((v) => !v)}
+        >
+          {tt("promoFilterExpiryAuto")}
+        </button>
+        {showExpiryAutoOnly ? (
+          <span className="text-muted" style={{ fontSize: 13 }}>
+            {tt("promoFilterExpiryAutoCount", { n: displayRows.length })}
+          </span>
+        ) : null}
+      </div>
       <DataTable
         title="Promotion Rules"
-        rows={rows}
+        rows={displayRows}
         columns={[
           { key: "id", label: "ID" },
           { key: "name", label: "Name" },
@@ -360,16 +733,36 @@ function Promotions() {
           { key: "product", label: "Product", render: (_, r) => r.product?.name || "-" },
           { key: "category", label: "Category", render: (v) => v || "-" },
           {
+            key: "schedule",
+            label: tt("promoColSchedule"),
+            render: (_, r) => formatPromoScheduleLabel(r, tt),
+          },
+          {
+            key: "startsAt",
+            label: tt("promoStartsAt"),
+            render: (v) => (v ? new Date(v).toLocaleString() : "—"),
+          },
+          {
+            key: "endsAt",
+            label: tt("promoEndsAt"),
+            render: (v) => (v ? new Date(v).toLocaleString() : "—"),
+          },
+          {
             key: "discountValue",
             label: "Discount",
             render: (v, r) =>
-              r.type === "BOGO_PRODUCT" || r.type === "BUNDLE_FIXED" ? "-" : `${Number(v || 0)}%`,
+              r.type === "BOGO_PRODUCT" ||
+              r.type === "BUNDLE_FIXED" ||
+              r.type === "CATEGORY_BUNDLE_FIXED" ||
+              r.type === "MIX_MATCH_FIXED"
+                ? "-"
+                : `${Number(v || 0)}%`,
           },
           {
             key: "bundlePrice",
             label: "Bundle Price",
             render: (v, r) =>
-              r.type === "BUNDLE_FIXED" || r.type === "CATEGORY_BUNDLE_FIXED"
+              r.type === "BUNDLE_FIXED" || r.type === "CATEGORY_BUNDLE_FIXED" || r.type === "MIX_MATCH_FIXED"
                 ? `৳${Number(v || r.discountValue || 0).toFixed(2)}`
                 : "-",
           },
@@ -381,7 +774,19 @@ function Promotions() {
                 ? `${r.category || "-"} | ${Number(r.buyQty || 0)} for ৳${Number(r.bundlePrice || r.discountValue || 0).toFixed(2)}`
                 : "-",
           },
-          { key: "bundleProductIds", label: "Bundle Products", render: (v, r) => (r.type === "BUNDLE_FIXED" ? String(v || "-") : "-") },
+          {
+            key: "mixMatch",
+            label: tt("promoTypeMixMatch"),
+            render: (_, r) =>
+              r.type === "MIX_MATCH_FIXED"
+                ? `${Number(r.buyQty || 0)} for ৳${Number(r.bundlePrice || r.discountValue || 0).toFixed(2)} | ${String(r.bundleProductIds || "-")}`
+                : "-",
+          },
+          {
+            key: "bundleProductIds",
+            label: "Bundle Products",
+            render: (v, r) => (r.type === "BUNDLE_FIXED" || r.type === "MIX_MATCH_FIXED" ? String(v || "-") : "-"),
+          },
           { key: "buyQty", label: "Buy Qty" },
           { key: "getQty", label: "Get Qty" },
           { key: "minBasketAmount", label: "Min Basket", render: (v) => `৳${Number(v || 0).toFixed(2)}` },

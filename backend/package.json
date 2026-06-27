@@ -6,7 +6,9 @@
     "postinstall": "prisma generate",
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "smoke": "node scripts/smoke-test.js",
+    "seed:demo": "node scripts/seed-demo-data.js",
+    "seed:demo:reset": "node scripts/seed-demo-data.js --reset",
+    "print-bridge": "node scripts/print-bridge-server.js",
     "migrate:inventory-batches": "node scripts/migrate-legacy-inventory-batches.js"
   },
   "keywords": [],

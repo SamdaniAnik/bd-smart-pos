@@ -4,7 +4,9 @@ const { generateMushak63, checkCompleteness } = require("./mushak63");
 const { generateMushak91 } = require("./mushak91");
 
 function getBranchId(req) {
-  return Number(req.headers["x-branch-id"] || req.user?.branchId || 0);
+  // req.branchId is resolved by requireAuth with cross-branch authorization,
+  // so trust it rather than re-reading the client-controlled header.
+  return Number(req.branchId || req.user?.branchId || 0);
 }
 
 exports.getSaleMushak63Xml = async (req, res) => {

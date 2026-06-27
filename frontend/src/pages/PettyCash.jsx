@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
-import { notifyActionRequired, notifySuccess } from "../utils/notify";
+import { notifyActionRequired, notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import { getLang, t } from "../i18n";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
+import SearchSelect from "../components/SearchSelect";
 
 const emptyFundForm = {
   name: "",
@@ -29,6 +33,17 @@ const emptyClaimForm = {
 };
 
 export default function PettyCash() {
+  const lang = getLang();
+  const tt = useMemo(() => (key, params) => t(lang, key, params), [lang]);
+  const { hasPermission } = usePermissions();
+  const canManagePettyCash = hasPermission("pettycash.manage");
+
+  const requirePettyCashManage = () => {
+    if (canManagePettyCash) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "pettycash.manage" }));
+    return false;
+  };
+
   const [funds, setFunds] = useState([]);
   const [txns, setTxns] = useState([]);
   const [claims, setClaims] = useState([]);
@@ -78,6 +93,7 @@ export default function PettyCash() {
 
   const createFund = async (e) => {
     e.preventDefault();
+    if (!requirePettyCashManage()) return;
     if (!fundForm.name.trim()) {
       notifyActionRequired("fund name is required.");
       return;
@@ -97,6 +113,7 @@ export default function PettyCash() {
   };
 
   const toggleFund = async (fund) => {
+    if (!requirePettyCashManage()) return;
     await api.patch(`/petty-cash/funds/${fund.id}`, { isActive: !fund.isActive });
     notifySuccess("fund status updated.");
     load();
@@ -104,6 +121,7 @@ export default function PettyCash() {
 
   const postTxn = async (e) => {
     e.preventDefault();
+    if (!requirePettyCashManage()) return;
     if (!txnForm.fundId) {
       notifyActionRequired("select a fund.");
       return;
@@ -126,6 +144,7 @@ export default function PettyCash() {
 
   const submitClaim = async (e) => {
     e.preventDefault();
+    if (!requirePettyCashManage()) return;
     if (!claimForm.fundId) {
       notifyActionRequired("select a fund for claim.");
       return;
@@ -148,6 +167,7 @@ export default function PettyCash() {
   };
 
   const approveClaim = async (row) => {
+    if (!requirePettyCashManage()) return;
     const remark = (window.prompt("Approval remark (optional):") || "").trim();
     await api.post(`/petty-cash/claims/${row.id}/approve`, { remark });
     notifySuccess("claim approved and reimbursement journal posted.");
@@ -155,6 +175,7 @@ export default function PettyCash() {
   };
 
   const rejectClaim = async (row) => {
+    if (!requirePettyCashManage()) return;
     const remark = (window.prompt("Rejection reason:") || "").trim();
     if (!remark) {
       notifyActionRequired("rejection reason is required.");
@@ -173,6 +194,8 @@ export default function PettyCash() {
           <div className="page-subtitle">Funds, spends, claims, and replenishment with automatic journals</div>
         </div>
       </div>
+
+      <PermissionBanner show={!canManagePettyCash} code="pettycash.manage" tt={tt} />
 
       <div className="summary-cards" style={{ marginBottom: 12 }}>
         <div className="summary-card">
@@ -215,7 +238,7 @@ export default function PettyCash() {
           Active
         </label>
         <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="submit">Create Fund</button>
+          <button type="submit" disabled={!canManagePettyCash}>Create Fund</button>
         </div>
       </form>
 
@@ -240,7 +263,7 @@ export default function PettyCash() {
               <td>{Number(f.currentBalance || 0).toFixed(2)}</td>
               <td>{f.isActive ? "Active" : "Inactive"}</td>
               <td>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => toggleFund(f)}>
+                <button type="button" className="btn-secondary btn-sm" disabled={!canManagePettyCash} onClick={() => toggleFund(f)}>
                   {f.isActive ? "Deactivate" : "Activate"}
                 </button>
               </td>
@@ -260,22 +283,27 @@ export default function PettyCash() {
       <form onSubmit={postTxn} className="form-grid" style={{ marginBottom: 12 }}>
         <label>
           Fund
-          <select required className="form-select-sm" value={txnForm.fundId} onChange={(e) => setTxnForm((p) => ({ ...p, fundId: e.target.value }))}>
-            <option value="">Select</option>
-            {funds.filter((x) => x.isActive).map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.name}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={txnForm.fundId}
+            onChange={(val) => setTxnForm((p) => ({ ...p, fundId: val }))}
+            placeholder="Select"
+            options={funds.filter((x) => x.isActive).map((f) => ({ value: String(f.id), label: f.name }))}
+          />
         </label>
         <label>
           Type
-          <select className="form-select-sm" value={txnForm.type} onChange={(e) => setTxnForm((p) => ({ ...p, type: e.target.value }))}>
-            <option value="SPEND">Spend</option>
-            <option value="TOPUP">Top-up</option>
-            <option value="REPLENISH">Replenish</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={txnForm.type}
+            onChange={(val) => setTxnForm((p) => ({ ...p, type: val || "SPEND" }))}
+            options={[
+              { value: "SPEND", label: "Spend" },
+              { value: "TOPUP", label: "Top-up" },
+              { value: "REPLENISH", label: "Replenish" },
+            ]}
+            isClearable={false}
+          />
         </label>
         <label>
           Amount
@@ -290,21 +318,20 @@ export default function PettyCash() {
           <input value={txnForm.description} onChange={(e) => setTxnForm((p) => ({ ...p, description: e.target.value }))} />
         </label>
         <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="submit">Post</button>
+          <button type="submit" disabled={!canManagePettyCash}>Post</button>
         </div>
       </form>
 
       <div className="form-grid" style={{ marginBottom: 10 }}>
         <label>
           Filter by fund
-          <select className="form-select-sm" value={fundFilter} onChange={(e) => setFundFilter(e.target.value)}>
-            <option value="">All Funds</option>
-            {funds.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.name}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={fundFilter}
+            onChange={(val) => setFundFilter(val)}
+            placeholder="All Funds"
+            options={funds.map((f) => ({ value: String(f.id), label: f.name }))}
+          />
         </label>
       </div>
 
@@ -346,27 +373,28 @@ export default function PettyCash() {
       <form onSubmit={submitClaim} className="form-grid" style={{ marginBottom: 12 }}>
         <label>
           Fund
-          <select required className="form-select-sm" value={claimForm.fundId} onChange={(e) => setClaimForm((p) => ({ ...p, fundId: e.target.value }))}>
-            <option value="">Select</option>
-            {funds.filter((x) => x.isActive).map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.name}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={claimForm.fundId}
+            onChange={(val) => setClaimForm((p) => ({ ...p, fundId: val }))}
+            placeholder="Select"
+            options={funds.filter((x) => x.isActive).map((f) => ({ value: String(f.id), label: f.name }))}
+          />
         </label>
         <label>
           Linked Spend (optional)
-          <select className="form-select-sm" value={claimForm.txnId} onChange={(e) => setClaimForm((p) => ({ ...p, txnId: e.target.value }))}>
-            <option value="">None</option>
-            {txns
+          <SearchSelect
+            className="form-select-sm"
+            value={claimForm.txnId}
+            onChange={(val) => setClaimForm((p) => ({ ...p, txnId: val }))}
+            placeholder="None"
+            options={txns
               .filter((x) => x.type === "SPEND" && Number(x.fundId) === Number(claimForm.fundId || 0))
-              .map((t) => (
-                <option key={t.id} value={t.id}>
-                  #{t.id} - {Number(t.amount || 0).toFixed(2)} on {new Date(t.txnDate).toLocaleDateString()}
-                </option>
-              ))}
-          </select>
+              .map((t) => ({
+                value: String(t.id),
+                label: `#${t.id} - ${Number(t.amount || 0).toFixed(2)} on ${new Date(t.txnDate).toLocaleDateString()}`,
+              }))}
+          />
         </label>
         <label>
           Claim Amount
@@ -385,18 +413,23 @@ export default function PettyCash() {
           <input value={claimForm.attachmentNote} onChange={(e) => setClaimForm((p) => ({ ...p, attachmentNote: e.target.value }))} />
         </label>
         <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="submit">Submit Claim</button>
+          <button type="submit" disabled={!canManagePettyCash}>Submit Claim</button>
         </div>
       </form>
       <div className="form-grid" style={{ marginBottom: 10 }}>
         <label>
           Claim Status
-          <select className="form-select-sm" value={claimStatusFilter} onChange={(e) => setClaimStatusFilter(e.target.value)}>
-            <option value="">All</option>
-            <option value="PENDING">Pending</option>
-            <option value="APPROVED">Approved</option>
-            <option value="REJECTED">Rejected</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={claimStatusFilter}
+            onChange={(val) => setClaimStatusFilter(val)}
+            placeholder="All"
+            options={[
+              { value: "PENDING", label: "Pending" },
+              { value: "APPROVED", label: "Approved" },
+              { value: "REJECTED", label: "Rejected" },
+            ]}
+          />
         </label>
       </div>
       <table className="data-table">
@@ -425,10 +458,10 @@ export default function PettyCash() {
               <td>
                 {c.status === "PENDING" ? (
                   <div style={{ display: "flex", gap: 6 }}>
-                    <button type="button" className="btn-secondary btn-sm" onClick={() => approveClaim(c)}>
+                    <button type="button" className="btn-secondary btn-sm" disabled={!canManagePettyCash} onClick={() => approveClaim(c)}>
                       Approve
                     </button>
-                    <button type="button" className="btn-danger btn-sm" onClick={() => rejectClaim(c)}>
+                    <button type="button" className="btn-danger btn-sm" disabled={!canManagePettyCash} onClick={() => rejectClaim(c)}>
                       Reject
                     </button>
                   </div>

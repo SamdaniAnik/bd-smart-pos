@@ -1,4 +1,5 @@
 const prisma = require("../../utils/prisma");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
 
 exports.createWarehouse = async (req, res) => {
   try {
@@ -22,9 +23,26 @@ exports.createWarehouse = async (req, res) => {
 
 exports.getWarehouses = async (req, res) => {
   try {
+    const lq = parseListQuery(req, {
+      searchableFields: ["name"],
+      sortableFields: ["id", "name"],
+      defaultSort: "id",
+      defaultSortDir: "desc",
+    });
+    const where = { branchId: req.branchId };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    if (lq.paged) {
+      const [warehouses, total] = await prisma.$transaction([
+        prisma.warehouse.findMany({ where, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.warehouse.count({ where }),
+      ]);
+      return res.json(pagedResult({ data: warehouses, total, page: lq.page, pageSize: lq.pageSize }));
+    }
+
     const warehouses = await prisma.warehouse.findMany({
-      where: { branchId: req.branchId },
-      orderBy: { id: "desc" },
+      where,
+      orderBy: lq.orderBy || { id: "desc" },
     });
     res.json(warehouses);
   } catch (error) {

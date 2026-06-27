@@ -1,9 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import useServerTable from "../hooks/useServerTable";
 import SubmitButton from "../components/SubmitButton";
+import { notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { formatBDT } from "../utils/currency";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 const EMPTY_FORM = {
   name: "",
@@ -28,30 +33,62 @@ function Suppliers() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canManageSuppliers = hasPermission("supplier.create");
+
+  const requireSupplierCreate = () => {
+    if (canManageSuppliers) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "supplier.create" }));
+    return false;
+  };
+
   const bdt = (v) => formatBDT(v, { lang: uiLang, decimals: 2 });
 
-  const [suppliers, setSuppliers] = useState([]);
   const [taxCategories, setTaxCategories] = useState([]);
   const [form, setForm] = useState({ ...EMPTY_FORM });
   const [editingId, setEditingId] = useState(null);
   const [selected, setSelected] = useState(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const load = async () => {
-    const [supRes, taxRes] = await Promise.all([
-      api.get("/master/suppliers"),
+  const fetchSupplierPage = useCallback(async (q) => {
+    const res = await api.get("/master/suppliers", {
+      params: {
+        paged: true,
+        page: q.page,
+        pageSize: q.pageSize,
+        sortKey: q.sortKey,
+        sortDir: q.sortDir,
+        search: JSON.stringify(q.search || {}),
+        filters: JSON.stringify(q.filters || {}),
+      },
+    });
+    return { data: res.data?.data || [], total: res.data?.total || 0 };
+  }, []);
+  const suppliersTable = useServerTable(fetchSupplierPage, {
+    pageSize: 10,
+    sortKey: "createdAt",
+    sortDir: "desc",
+  });
+  const suppliers = suppliersTable.rows;
+
+  const load = useCallback(async () => {
+    const [, taxRes] = await Promise.all([
+      suppliersTable.refresh(),
       api.get("/withholding/tax-categories"),
     ]);
-    setSuppliers(supRes.data);
     setTaxCategories(taxRes.data?.categories || []);
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
-    load();
+    api.get("/withholding/tax-categories").then((taxRes) => {
+      setTaxCategories(taxRes.data?.categories || []);
+    });
   }, []);
 
   const submit = async (e) => {
     e.preventDefault();
+    if (!requireSupplierCreate()) return;
     const payload = { ...form };
     // Send empty strings as nulls to clear fields cleanly server-side.
     for (const k of Object.keys(payload)) {
@@ -99,6 +136,7 @@ function Suppliers() {
   };
 
   const handleDelete = async (row) => {
+    if (!requireSupplierCreate()) return;
     if (!window.confirm(tt("supConfirmDelete", { name: row.name }))) return;
     await api.delete(`/master/suppliers/${row.id}`);
     if (selected?.id === row.id) setSelected(null);
@@ -118,6 +156,7 @@ function Suppliers() {
           <div className="page-subtitle">{tt("supSubtitle")}</div>
         </div>
       </div>
+      <PermissionBanner show={!canManageSuppliers} code="supplier.create" tt={tt} />
       <form onSubmit={submit} className="form-grid">
         <input placeholder={tt("colName")} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required />
         <input placeholder={tt("colPhone")} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
@@ -134,19 +173,14 @@ function Suppliers() {
           maxLength={32}
           onChange={(e) => setForm({ ...form, binNumber: e.target.value })}
         />
-        <select
+        <SearchSelect
           className="form-select-sm"
           value={form.taxCategory}
-          onChange={(e) => setForm({ ...form, taxCategory: e.target.value })}
-          title={tt("supTaxCategoryTitle")}
-        >
-          <option value="">{tt("supNoDefaultTaxCat")}</option>
-          {taxCategories.map((c) => (
-            <option key={c.code} value={c.code}>
-              {c.label}
-            </option>
-          ))}
-        </select>
+          onChange={(val) => setForm({ ...form, taxCategory: val })}
+          placeholder={tt("supNoDefaultTaxCat")}
+          options={taxCategories.map((c) => ({ value: c.code, label: c.label }))}
+          aria-label={tt("supTaxCategoryTitle")}
+        />
         <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
           <input
             type="checkbox"
@@ -160,7 +194,7 @@ function Suppliers() {
           value={form.withholdingNote}
           onChange={(e) => setForm({ ...form, withholdingNote: e.target.value })}
         />
-        <SubmitButton loading={submitting} loadingLabel={editingId ? tt("settingsUpdating") : tt("settingsSaving")}>
+        <SubmitButton loading={submitting} loadingLabel={editingId ? tt("settingsUpdating") : tt("settingsSaving")} disabled={!canManageSuppliers}>
           {editingId ? tt("supBtnUpdate") : tt("supBtnAdd")}
         </SubmitButton>
         {editingId ? (
@@ -183,22 +217,28 @@ function Suppliers() {
       ) : null}
       <DataTable
         rows={suppliers}
-        searchableKeys={["name", "phone", "address", "tinNumber", "binNumber", "taxCategory"]}
+        serverMode
+        totalRows={suppliersTable.total}
+        loading={suppliersTable.loading}
+        onQueryChange={suppliersTable.onQueryChange}
+        initialSort="createdAt"
+        initialSortDir="desc"
+        pageSize={10}
         columns={[
-          { key: "id", label: tt("colId") },
+          { key: "id", label: tt("colId"), searchable: false },
           { key: "name", label: tt("colName") },
           { key: "phone", label: tt("colPhone"), render: (v) => v || "-" },
           { key: "tinNumber", label: tt("supTin"), render: (v) => v || "-" },
           { key: "taxCategory", label: tt("supTaxCatShort"), render: (v, row) => (row.withholdingExempt ? tt("supExempt") : v || "-") },
-          { key: "payableBalance", label: tt("supPayable"), render: (v) => bdt(v) },
+          { key: "payableBalance", label: tt("supPayable"), searchable: false, render: (v) => bdt(v) },
           {
             key: "actions",
             label: tt("colActions"),
             render: (_, row) => (
               <div style={{ display: "flex", gap: 6 }}>
                 <button type="button" className="btn-secondary btn-sm" onClick={() => handleDetails(row)}>{tt("supBtnDetails")}</button>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => handleEdit(row)}>{tt("actionEdit")}</button>
-                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)}>{tt("actionDelete")}</button>
+                <button type="button" className="btn-secondary btn-sm" onClick={() => handleEdit(row)} disabled={!canManageSuppliers}>{tt("actionEdit")}</button>
+                <button type="button" className="btn-danger btn-sm" onClick={() => handleDelete(row)} disabled={!canManageSuppliers}>{tt("actionDelete")}</button>
               </div>
             ),
           },

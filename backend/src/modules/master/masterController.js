@@ -1,6 +1,26 @@
 const prisma = require("../../utils/prisma");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
 const PDFDocument = require("pdfkit");
 const XLSX = require("xlsx");
+const { RETAIL_CATEGORY_SEEDS } = require("../../constants/retailDepartments");
+const { sendBulkSms, renderSmsTemplate, isSmsConfigured, getProviderName } = require("../../utils/smsGateway");
+const { isEfdConfigured, getEfdProvider } = require("../efd/efdService");
+const { isTopupConfigured, getProviderName: getTopupProvider } = require("../../utils/topupGateway");
+const { isFcommerceLive, getProviderMode: getFcommerceProvider } = require("../../utils/fcommerceService");
+const {
+  buildCustomerLoyaltyBalance,
+  buildBranchCustomerLoyaltyMap,
+  loadBranchPointsExpiryDays,
+} = require("../../utils/loyaltyPointsExpiry");
+
+const ALLOWED_DEPARTMENTS = new Set(["GROCERY", "PHARMACY", "APPAREL", "GENERAL"]);
+
+function normalizeDepartment(value) {
+  const key = String(value || "")
+    .trim()
+    .toUpperCase();
+  return ALLOWED_DEPARTMENTS.has(key) ? key : null;
+}
 
 function pointsFromAmount(amount) {
   const pointsPer100 = Number(process.env.LOYALTY_POINTS_PER_100 || 1);
@@ -13,16 +33,6 @@ function tierFromPoints(points) {
   if (points >= goldAt) return "GOLD";
   if (points >= silverAt) return "SILVER";
   return "REGULAR";
-}
-
-function parseRedeemedPoints(notes) {
-  if (!notes) return 0;
-  try {
-    const payload = JSON.parse(notes);
-    return Number(payload?.loyalty?.redeemedPoints || 0);
-  } catch {
-    return 0;
-  }
 }
 
 function startOfDay(date = new Date()) {
@@ -62,21 +72,18 @@ function calcDaysUntilBirthday(birthDate) {
 }
 
 async function buildCustomerLoyaltySnapshot(branchId, customerId) {
-  const sales = await prisma.sale.findMany({
-    where: { branchId, customerId },
-    select: { total: true, notes: true },
-  });
-  const totalSpent = sales.reduce((sum, row) => sum + Number(row.total || 0), 0);
-  const earnedPoints = pointsFromAmount(totalSpent);
-  const redeemedPoints = sales.reduce((sum, row) => sum + parseRedeemedPoints(row.notes), 0);
-  const availablePoints = Math.max(0, earnedPoints - redeemedPoints);
+  const balance = await buildCustomerLoyaltyBalance(prisma, branchId, customerId);
   return {
-    loyaltyPoints: availablePoints,
-    loyaltyEarnedPoints: earnedPoints,
-    loyaltyRedeemedPoints: redeemedPoints,
-    loyaltyTier: tierFromPoints(earnedPoints),
-    loyaltyTotalSpent: totalSpent,
-    loyaltyOrders: sales.length,
+    loyaltyPoints: balance.availablePoints,
+    loyaltyEarnedPoints: balance.earnedPoints,
+    loyaltyRedeemedPoints: balance.redeemedPoints,
+    loyaltyExpiredPoints: balance.expiredPoints,
+    loyaltyExpiringSoonPoints: balance.expiringSoonPoints,
+    loyaltyPointsExpiryDays: balance.pointsExpiryDays,
+    loyaltyTier: tierFromPoints(balance.earnedPoints),
+    loyaltyTotalSpent: balance.totalSpent,
+    loyaltyOrders: balance.orders,
+    loyaltyExpiryEnabled: balance.expiryEnabled,
   };
 }
 
@@ -141,9 +148,27 @@ exports.createSupplier = async (req, res) => {
 
 exports.getSuppliers = async (req, res) => {
   try {
+    const lq = parseListQuery(req, {
+      searchableFields: ["name", "phone", "address", "tinNumber", "binNumber", "taxCategory", "withholdingNote"],
+      filterableFields: ["taxCategory", "withholdingExempt"],
+      sortableFields: ["id", "name", "payableBalance", "createdAt"],
+      defaultSort: "createdAt",
+      defaultSortDir: "desc",
+    });
+    const where = { branchId: req.branchId };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    if (lq.paged) {
+      const [suppliers, total] = await prisma.$transaction([
+        prisma.supplier.findMany({ where, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.supplier.count({ where }),
+      ]);
+      return res.json(pagedResult({ data: suppliers, total, page: lq.page, pageSize: lq.pageSize }));
+    }
+
     const suppliers = await prisma.supplier.findMany({
-      where: { branchId: req.branchId },
-      orderBy: { createdAt: "desc" },
+      where,
+      orderBy: lq.orderBy || { createdAt: "desc" },
     });
     res.json(suppliers);
   } catch (error) {
@@ -241,38 +266,104 @@ exports.deleteSupplier = async (req, res) => {
   }
 };
 
+const CUSTOMER_TYPES = new Set(["RETAIL", "WHOLESALE", "INSTITUTION"]);
+
+function buildCustomerPayload(body, branchId) {
+  const {
+    name,
+    phone,
+    address,
+    district,
+    area,
+    landmark,
+    customerType,
+    buyerBin,
+    companyName,
+    whatsappOptIn,
+    creditLimit,
+    birthDate,
+    marketingOptIn,
+    priceTier,
+    nidNumber,
+    birthCertificateNo,
+    kycDocumentType,
+  } = body;
+  const normalizedPriceTier = ["RETAIL", "WHOLESALE", "DEALER"].includes(String(priceTier || "").toUpperCase())
+    ? String(priceTier).toUpperCase()
+    : "RETAIL";
+  const normalizedCustomerType = CUSTOMER_TYPES.has(String(customerType || "").toUpperCase())
+    ? String(customerType).toUpperCase()
+    : "RETAIL";
+  return {
+    branchId,
+    name: String(name).trim(),
+    phone: phone ? String(phone).trim() : null,
+    address: address ? String(address).trim() : null,
+    district: district ? String(district).trim() : null,
+    area: area ? String(area).trim() : null,
+    landmark: landmark ? String(landmark).trim() : null,
+    customerType: normalizedCustomerType,
+    buyerBin: buyerBin ? String(buyerBin).trim().slice(0, 64) : null,
+    companyName: companyName ? String(companyName).trim() : null,
+    whatsappOptIn: whatsappOptIn == null ? false : Boolean(whatsappOptIn),
+    creditLimit:
+      creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
+        ? Number(creditLimit)
+        : 0,
+    birthDate: birthDate ? new Date(birthDate) : null,
+    marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
+    priceTier: normalizedPriceTier,
+    nidNumber: nidNumber ? String(nidNumber).trim().slice(0, 20) : null,
+    birthCertificateNo: birthCertificateNo ? String(birthCertificateNo).trim().slice(0, 40) : null,
+    kycDocumentType: ["NID", "BIRTH_CERT"].includes(String(kycDocumentType || "").toUpperCase())
+      ? String(kycDocumentType).toUpperCase()
+      : nidNumber
+        ? "NID"
+        : birthCertificateNo
+          ? "BIRTH_CERT"
+          : null,
+    kycCapturedAt:
+      nidNumber || birthCertificateNo ? new Date() : undefined,
+  };
+}
+
+async function saveCustomerRecord(prismaClient, { isCreate, id, data }) {
+  try {
+    if (isCreate) {
+      return await prismaClient.customer.create({ data });
+    }
+    return await prismaClient.customer.update({ where: { id }, data });
+  } catch (e) {
+    if (e.code !== "P2022") throw e;
+    const fallback = { ...data };
+    [
+      "district",
+      "area",
+      "landmark",
+      "customerType",
+      "buyerBin",
+      "companyName",
+      "whatsappOptIn",
+      "priceTier",
+    ].forEach((key) => delete fallback[key]);
+    if (isCreate) {
+      return await prismaClient.customer.create({ data: fallback });
+    }
+    return await prismaClient.customer.update({ where: { id }, data: fallback });
+  }
+}
+
 exports.createCustomer = async (req, res) => {
   try {
     const branchId = req.branchId;
-    const { name, phone, address, creditLimit, birthDate, marketingOptIn, priceTier } = req.body;
+    const { name } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Customer name must be at least 2 characters" });
     }
-    const normalizedPriceTier = ["RETAIL", "WHOLESALE", "DEALER"].includes(String(priceTier || "").toUpperCase())
-      ? String(priceTier).toUpperCase()
-      : "RETAIL";
-    const baseData = {
-      branchId,
-      name: String(name).trim(),
-      phone: phone || null,
-      address: address || null,
-      creditLimit:
-        creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
-          ? Number(creditLimit)
-          : 0,
-      birthDate: birthDate ? new Date(birthDate) : null,
-      marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
-      priceTier: normalizedPriceTier,
-    };
-    let customer;
-    try {
-      customer = await prisma.customer.create({ data: baseData });
-    } catch (e) {
-      if (e.code !== "P2022") throw e;
-      const fallback = { ...baseData };
-      delete fallback.priceTier;
-      customer = await prisma.customer.create({ data: fallback });
-    }
+    const customer = await saveCustomerRecord(prisma, {
+      isCreate: true,
+      data: buildCustomerPayload(req.body, branchId),
+    });
     res.status(201).json(customer);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -281,19 +372,47 @@ exports.createCustomer = async (req, res) => {
 
 exports.getCustomers = async (req, res) => {
   try {
-    const customers = await prisma.customer.findMany({
-      where: { branchId: req.branchId },
-      orderBy: { createdAt: "desc" },
+    const lq = parseListQuery(req, {
+      searchableFields: [
+        "name", "phone", "address", "companyName", "buyerBin",
+        "nidNumber", "district", "area", "priceTier",
+      ],
+      filterableFields: ["customerType", "priceTier"],
+      sortableFields: ["id", "name", "balance", "creditLimit", "createdAt"],
+      defaultSort: "createdAt",
+      defaultSortDir: "desc",
     });
+    const where = { branchId: req.branchId };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    let total = null;
+    let customers;
+    if (lq.paged) {
+      [customers, total] = await prisma.$transaction([
+        prisma.customer.findMany({ where, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.customer.count({ where }),
+      ]);
+    } else {
+      customers = await prisma.customer.findMany({ where, orderBy: lq.orderBy || { createdAt: "desc" } });
+    }
+
+    const sendRows = (rows) =>
+      lq.paged
+        ? res.json(pagedResult({ data: rows, total: total || 0, page: lq.page, pageSize: lq.pageSize }))
+        : res.json(rows);
+
     const customerIds = customers.map((c) => c.id);
-    if (!customerIds.length) return res.json(customers);
-    const salesAgg = await prisma.sale.groupBy({
-      by: ["customerId"],
-      where: { branchId: req.branchId, customerId: { in: customerIds } },
-      _sum: { total: true },
-      _count: { _all: true },
-      _max: { createdAt: true },
-    });
+    if (!customerIds.length) return sendRows(customers);
+    const [loyaltyMap, salesAgg] = await Promise.all([
+      buildBranchCustomerLoyaltyMap(prisma, req.branchId),
+      prisma.sale.groupBy({
+        by: ["customerId"],
+        where: { branchId: req.branchId, customerId: { in: customerIds } },
+        _sum: { total: true },
+        _count: { _all: true },
+        _max: { createdAt: true },
+      }),
+    ]);
     const byCustomer = new Map(
       salesAgg
         .filter((x) => x.customerId != null)
@@ -306,20 +425,27 @@ exports.getCustomers = async (req, res) => {
           },
         ])
     );
-    res.json(
+    sendRows(
       customers.map((c) => {
         const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0, lastPurchaseAt: null };
-        const earnedPoints = pointsFromAmount(stats.totalSpent);
-        const loyaltyPoints = Math.max(0, earnedPoints);
+        const bal = loyaltyMap.get(c.id) || {
+          earnedPoints: 0,
+          availablePoints: 0,
+          redeemedPoints: 0,
+          expiredPoints: 0,
+          expiringSoonPoints: 0,
+        };
         const daysSinceLastPurchase = calcDaysDiffFromToday(stats.lastPurchaseAt);
         const atRiskDays = getRetentionThresholdDays();
         const daysUntilBirthday = calcDaysUntilBirthday(c.birthDate);
         return {
           ...c,
-          loyaltyPoints,
-          loyaltyEarnedPoints: earnedPoints,
-          loyaltyRedeemedPoints: 0,
-          loyaltyTier: tierFromPoints(earnedPoints),
+          loyaltyPoints: bal.availablePoints,
+          loyaltyEarnedPoints: bal.earnedPoints,
+          loyaltyRedeemedPoints: bal.redeemedPoints,
+          loyaltyExpiredPoints: bal.expiredPoints,
+          loyaltyExpiringSoonPoints: bal.expiringSoonPoints,
+          loyaltyTier: tierFromPoints(bal.earnedPoints),
           loyaltyTotalSpent: stats.totalSpent,
           loyaltyOrders: stats.orders,
           lastPurchaseAt: stats.lastPurchaseAt,
@@ -407,13 +533,16 @@ exports.getCustomerLoyaltyRanking = async (req, res) => {
     });
     const customerIds = customers.map((c) => c.id);
     if (!customerIds.length) return res.json([]);
-    const salesAgg = await prisma.sale.groupBy({
-      by: ["customerId"],
-      where: { branchId: req.branchId, customerId: { in: customerIds } },
-      _sum: { total: true },
-      _count: { _all: true },
-      _max: { createdAt: true },
-    });
+    const [loyaltyMap, salesAgg] = await Promise.all([
+      buildBranchCustomerLoyaltyMap(prisma, req.branchId),
+      prisma.sale.groupBy({
+        by: ["customerId"],
+        where: { branchId: req.branchId, customerId: { in: customerIds } },
+        _sum: { total: true },
+        _count: { _all: true },
+        _max: { createdAt: true },
+      }),
+    ]);
     const byCustomer = new Map(
       salesAgg
         .filter((x) => x.customerId != null)
@@ -429,14 +558,22 @@ exports.getCustomerLoyaltyRanking = async (req, res) => {
     const rows = customers
       .map((c) => {
         const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0, lastPurchaseAt: null };
-        const loyaltyPoints = pointsFromAmount(stats.totalSpent);
+        const bal = loyaltyMap.get(c.id) || {
+          earnedPoints: 0,
+          availablePoints: 0,
+          expiredPoints: 0,
+          expiringSoonPoints: 0,
+        };
         const daysSinceLastPurchase = calcDaysDiffFromToday(stats.lastPurchaseAt);
         return {
           id: c.id,
           name: c.name,
           phone: c.phone,
-          loyaltyPoints,
-          loyaltyTier: tierFromPoints(loyaltyPoints),
+          loyaltyPoints: bal.availablePoints,
+          loyaltyEarnedPoints: bal.earnedPoints,
+          loyaltyExpiredPoints: bal.expiredPoints,
+          loyaltyExpiringSoonPoints: bal.expiringSoonPoints,
+          loyaltyTier: tierFromPoints(bal.earnedPoints),
           loyaltyTotalSpent: stats.totalSpent,
           loyaltyOrders: stats.orders,
           lastPurchaseAt: stats.lastPurchaseAt,
@@ -464,12 +601,15 @@ exports.exportCustomerLoyaltyRankingCSV = async (req, res) => {
       res.setHeader("Content-Disposition", 'attachment; filename="loyalty-ranking.csv"');
       return res.send("");
     }
-    const salesAgg = await prisma.sale.groupBy({
-      by: ["customerId"],
-      where: { branchId: req.branchId, customerId: { in: customerIds } },
-      _sum: { total: true },
-      _count: { _all: true },
-    });
+    const [loyaltyMap, salesAgg] = await Promise.all([
+      buildBranchCustomerLoyaltyMap(prisma, req.branchId),
+      prisma.sale.groupBy({
+        by: ["customerId"],
+        where: { branchId: req.branchId, customerId: { in: customerIds } },
+        _sum: { total: true },
+        _count: { _all: true },
+      }),
+    ]);
     const byCustomer = new Map(
       salesAgg
         .filter((x) => x.customerId != null)
@@ -478,18 +618,20 @@ exports.exportCustomerLoyaltyRankingCSV = async (req, res) => {
     const rows = customers
       .map((c) => {
         const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0 };
-        const loyaltyPoints = pointsFromAmount(stats.totalSpent);
+        const bal = loyaltyMap.get(c.id) || { earnedPoints: 0, availablePoints: 0, expiredPoints: 0, expiringSoonPoints: 0 };
         return {
           customer_id: c.id,
           customer_name: c.name,
           phone: c.phone || "",
-          tier: tierFromPoints(loyaltyPoints),
-          points: loyaltyPoints,
+          tier: tierFromPoints(bal.earnedPoints),
+          available_points: bal.availablePoints,
+          expiring_soon_points: bal.expiringSoonPoints,
+          expired_points: bal.expiredPoints,
           total_spent: stats.totalSpent.toFixed(2),
           orders: stats.orders,
         };
       })
-      .sort((a, b) => b.points - a.points);
+      .sort((a, b) => b.available_points - a.available_points);
     res.setHeader("Content-Type", "text/csv");
     res.setHeader("Content-Disposition", 'attachment; filename="loyalty-ranking.csv"');
     res.send(toCSV(rows));
@@ -505,14 +647,17 @@ exports.exportCustomerLoyaltyRankingPDF = async (req, res) => {
       orderBy: { createdAt: "desc" },
     });
     const customerIds = customers.map((c) => c.id);
-    const salesAgg = customerIds.length
-      ? await prisma.sale.groupBy({
-          by: ["customerId"],
-          where: { branchId: req.branchId, customerId: { in: customerIds } },
-          _sum: { total: true },
-          _count: { _all: true },
-        })
-      : [];
+    const [loyaltyMap, salesAgg] = await Promise.all([
+      buildBranchCustomerLoyaltyMap(prisma, req.branchId),
+      customerIds.length
+        ? prisma.sale.groupBy({
+            by: ["customerId"],
+            where: { branchId: req.branchId, customerId: { in: customerIds } },
+            _sum: { total: true },
+            _count: { _all: true },
+          })
+        : Promise.resolve([]),
+    ]);
     const byCustomer = new Map(
       salesAgg
         .filter((x) => x.customerId != null)
@@ -521,12 +666,12 @@ exports.exportCustomerLoyaltyRankingPDF = async (req, res) => {
     const rows = customers
       .map((c) => {
         const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0 };
-        const loyaltyPoints = pointsFromAmount(stats.totalSpent);
+        const bal = loyaltyMap.get(c.id) || { earnedPoints: 0, availablePoints: 0 };
         return {
           name: c.name,
           phone: c.phone || "-",
-          tier: tierFromPoints(loyaltyPoints),
-          points: loyaltyPoints,
+          tier: tierFromPoints(bal.earnedPoints),
+          points: bal.availablePoints,
           spent: stats.totalSpent.toFixed(2),
         };
       })
@@ -556,14 +701,17 @@ exports.exportCustomerLoyaltyRankingXLSX = async (req, res) => {
       orderBy: { createdAt: "desc" },
     });
     const customerIds = customers.map((c) => c.id);
-    const salesAgg = customerIds.length
-      ? await prisma.sale.groupBy({
-          by: ["customerId"],
-          where: { branchId: req.branchId, customerId: { in: customerIds } },
-          _sum: { total: true },
-          _count: { _all: true },
-        })
-      : [];
+    const [loyaltyMap, salesAgg] = await Promise.all([
+      buildBranchCustomerLoyaltyMap(prisma, req.branchId),
+      customerIds.length
+        ? prisma.sale.groupBy({
+            by: ["customerId"],
+            where: { branchId: req.branchId, customerId: { in: customerIds } },
+            _sum: { total: true },
+            _count: { _all: true },
+          })
+        : Promise.resolve([]),
+    ]);
     const byCustomer = new Map(
       salesAgg
         .filter((x) => x.customerId != null)
@@ -572,19 +720,112 @@ exports.exportCustomerLoyaltyRankingXLSX = async (req, res) => {
     const rows = customers
       .map((c) => {
         const stats = byCustomer.get(c.id) || { totalSpent: 0, orders: 0 };
-        const loyaltyPoints = pointsFromAmount(stats.totalSpent);
+        const bal = loyaltyMap.get(c.id) || {
+          earnedPoints: 0,
+          availablePoints: 0,
+          expiredPoints: 0,
+          expiringSoonPoints: 0,
+        };
         return {
           CustomerID: c.id,
           Customer: c.name,
           Phone: c.phone || "",
-          Tier: tierFromPoints(loyaltyPoints),
-          AvailablePoints: loyaltyPoints,
+          Tier: tierFromPoints(bal.earnedPoints),
+          AvailablePoints: bal.availablePoints,
+          ExpiringSoonPoints: bal.expiringSoonPoints,
+          ExpiredPoints: bal.expiredPoints,
           TotalSpent: Number(stats.totalSpent || 0).toFixed(2),
           Orders: stats.orders,
         };
       })
       .sort((a, b) => b.AvailablePoints - a.AvailablePoints);
     sendXlsx(res, rows, "loyalty-ranking.xlsx", "LoyaltyRanking");
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getLoyaltyPointsExpiry = async (req, res) => {
+  try {
+    const onlyExpiring = String(req.query.filter || "expiring") !== "all";
+    const [customers, loyaltyMap, pointsExpiryDays] = await Promise.all([
+      prisma.customer.findMany({
+        where: { branchId: req.branchId },
+        select: { id: true, name: true, phone: true },
+        orderBy: { name: "asc" },
+      }),
+      buildBranchCustomerLoyaltyMap(prisma, req.branchId),
+      loadBranchPointsExpiryDays(prisma, req.branchId),
+    ]);
+    const rows = customers
+      .map((c) => {
+        const bal = loyaltyMap.get(c.id) || {
+          earnedPoints: 0,
+          availablePoints: 0,
+          redeemedPoints: 0,
+          expiredPoints: 0,
+          expiringSoonPoints: 0,
+        };
+        if (onlyExpiring && bal.expiringSoonPoints <= 0 && bal.expiredPoints <= 0) return null;
+        return {
+          customerId: c.id,
+          name: c.name,
+          phone: c.phone || "",
+          availablePoints: bal.availablePoints,
+          earnedPoints: bal.earnedPoints,
+          redeemedPoints: bal.redeemedPoints,
+          expiredPoints: bal.expiredPoints,
+          expiringSoonPoints: bal.expiringSoonPoints,
+          loyaltyTier: tierFromPoints(bal.earnedPoints),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.expiringSoonPoints - a.expiringSoonPoints || b.expiredPoints - a.expiredPoints);
+    const summary = {
+      pointsExpiryDays,
+      expiryEnabled: pointsExpiryDays > 0,
+      customersWithExpiringSoon: rows.filter((r) => r.expiringSoonPoints > 0).length,
+      totalExpiringSoonPoints: rows.reduce((s, r) => s + Number(r.expiringSoonPoints || 0), 0),
+      totalExpiredPoints: [...loyaltyMap.values()].reduce((s, r) => s + Number(r.expiredPoints || 0), 0),
+    };
+    res.json({ summary, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportLoyaltyPointsExpiryCSV = async (req, res) => {
+  try {
+    req.query = { ...(req.query || {}), filter: req.query.filter || "expiring" };
+    const customers = await prisma.customer.findMany({
+      where: { branchId: req.branchId },
+      select: { id: true, name: true, phone: true },
+    });
+    const loyaltyMap = await buildBranchCustomerLoyaltyMap(prisma, req.branchId);
+    const onlyExpiring = String(req.query.filter || "expiring") !== "all";
+    const rows = customers
+      .map((c) => {
+        const bal = loyaltyMap.get(c.id) || {
+          availablePoints: 0,
+          expiredPoints: 0,
+          expiringSoonPoints: 0,
+          earnedPoints: 0,
+        };
+        if (onlyExpiring && bal.expiringSoonPoints <= 0 && bal.expiredPoints <= 0) return null;
+        return {
+          customer_id: c.id,
+          customer_name: c.name,
+          phone: c.phone || "",
+          available_points: bal.availablePoints,
+          expiring_soon_points: bal.expiringSoonPoints,
+          expired_points: bal.expiredPoints,
+          earned_points: bal.earnedPoints,
+        };
+      })
+      .filter(Boolean);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="loyalty-points-expiry.csv"');
+    res.send(toCSV(rows));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -604,41 +845,18 @@ exports.updateCustomer = async (req, res) => {
       return res.status(404).json({ error: "Customer not found" });
     }
 
-    const { name, phone, address, creditLimit, birthDate, marketingOptIn, priceTier } = req.body;
+    const { name } = req.body;
     if (!name || String(name).trim().length < 2) {
       return res.status(400).json({ error: "Customer name must be at least 2 characters" });
     }
 
-    const normalizedPriceTier = ["RETAIL", "WHOLESALE", "DEALER"].includes(String(priceTier || "").toUpperCase())
-      ? String(priceTier).toUpperCase()
-      : "RETAIL";
-    const baseData = {
-      name: String(name).trim(),
-      phone: phone || null,
-      address: address || null,
-      creditLimit:
-        creditLimit != null && creditLimit !== "" && !Number.isNaN(Number(creditLimit))
-          ? Number(creditLimit)
-          : 0,
-      birthDate: birthDate ? new Date(birthDate) : null,
-      marketingOptIn: marketingOptIn == null ? true : Boolean(marketingOptIn),
-      priceTier: normalizedPriceTier,
-    };
-    let customer;
-    try {
-      customer = await prisma.customer.update({
-        where: { id },
-        data: baseData,
-      });
-    } catch (e) {
-      if (e.code !== "P2022") throw e;
-      const fallback = { ...baseData };
-      delete fallback.priceTier;
-      customer = await prisma.customer.update({
-        where: { id },
-        data: fallback,
-      });
-    }
+    const payload = buildCustomerPayload(req.body, req.branchId);
+    delete payload.branchId;
+    const customer = await saveCustomerRecord(prisma, {
+      isCreate: false,
+      id,
+      data: payload,
+    });
     res.json(customer);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -665,6 +883,11 @@ exports.getFeatureReadiness = async (_req, res) => {
     const missing = required.filter((c) => !colSet.has(c));
     const customerRequired = ["priceTier"];
     const missingCustomer = customerRequired.filter((c) => !customerColSet.has(c));
+    const mfsDefaultProvider = String(process.env.MFS_PROVIDER || "log").trim().toLowerCase();
+    const bkashProvider = String(process.env.MFS_BKASH_PROVIDER || mfsDefaultProvider).trim().toLowerCase();
+    const smsProvider = getProviderName();
+    const efdProvider = getEfdProvider();
+
     res.json({
       ok:
         missing.length === 0 &&
@@ -680,6 +903,50 @@ exports.getFeatureReadiness = async (_req, res) => {
         productPriceListTableReady: Array.isArray(priceListTableRows) && priceListTableRows.length > 0,
         customerColumnsReady: missingCustomer.length === 0,
         missingCustomerColumns: missingCustomer,
+      },
+      integrations: {
+        sms: {
+          provider: smsProvider,
+          mode: isSmsConfigured() ? "live" : "simulated",
+          senderId: process.env.SMS_SENDER_ID || null,
+        },
+        mfs: {
+          defaultProvider: mfsDefaultProvider,
+          bkashProvider,
+          bkashLive: bkashProvider === "bkash" && Boolean(process.env.BKASH_APP_KEY && process.env.BKASH_APP_SECRET),
+          nagadLive: Boolean(process.env.NAGAD_MERCHANT_ID || process.env.NAGAD_MERCHANT_NUMBER),
+          bkashMerchantNumber: process.env.BKASH_MERCHANT_NUMBER || process.env.BKASH_CHECKOUT_NUMBER || null,
+          nagadMerchantNumber: process.env.NAGAD_MERCHANT_NUMBER || null,
+          rocketMerchantNumber: process.env.ROCKET_MERCHANT_NUMBER || null,
+          upayMerchantNumber: process.env.UPAY_MERCHANT_NUMBER || null,
+        },
+        efd: {
+          provider: efdProvider,
+          mode: isEfdConfigured() ? "live" : "simulated",
+          deviceId: process.env.EFD_DEVICE_ID || null,
+          genexUrlConfigured: Boolean(process.env.EFD_GENEX_URL),
+        },
+        topup: {
+          provider: getTopupProvider(),
+          mode: isTopupConfigured() ? "live" : "simulated",
+          aggregatorUrlConfigured: Boolean(process.env.TOPUP_API_URL),
+        },
+        fcommerce: {
+          provider: getFcommerceProvider(),
+          mode: isFcommerceLive() ? "live" : "simulated",
+          metaAccessTokenConfigured: Boolean(process.env.META_ACCESS_TOKEN),
+          webhookPath: "/api/fcommerce/meta/webhook",
+        },
+        storefront: {
+          publicCatalog: true,
+          publicOrderPath: "/api/storefront/order",
+          hashRoute: "#/storefront?token=…",
+        },
+        pwa: {
+          serviceWorker: true,
+          indexedDbCatalog: true,
+          offlineSaleQueue: true,
+        },
       },
     });
   } catch (error) {
@@ -697,6 +964,7 @@ exports.listProductCategories = async (req, res) => {
     res.json(
       rows.map((row) => ({
         ...row,
+        department: row.department ? String(row.department).toUpperCase() : null,
         attributeSet: Array.isArray(row.attributeSet) ? row.attributeSet : [],
         minMarginPct:
           row.minMarginPct != null && Number.isFinite(Number(row.minMarginPct))
@@ -728,6 +996,7 @@ exports.createProductCategory = async (req, res) => {
           .filter(Boolean)
           .slice(0, 30)
       : [];
+    const department = normalizeDepartment(req.body?.department);
     const existing = await prisma.productCategory.findFirst({
       where: { branchId, name: { equals: name } },
       select: { id: true },
@@ -737,6 +1006,7 @@ exports.createProductCategory = async (req, res) => {
       data: {
         branchId,
         name,
+        department,
         attributeSet,
         minMarginPct: minMarginPct != null ? Number(minMarginPct) : null,
       },
@@ -772,6 +1042,8 @@ exports.updateProductCategory = async (req, res) => {
       : Array.isArray(existing.attributeSet)
         ? existing.attributeSet
         : [];
+    const department =
+      req.body?.department != null ? normalizeDepartment(req.body.department) : existing.department;
     const dup = await prisma.productCategory.findFirst({
       where: {
         branchId,
@@ -785,6 +1057,7 @@ exports.updateProductCategory = async (req, res) => {
       where: { id },
       data: {
         name,
+        department,
         attributeSet,
         minMarginPct: minMarginPct != null ? Number(minMarginPct) : null,
       },
@@ -813,6 +1086,60 @@ exports.deleteProductCategory = async (req, res) => {
     }
     await prisma.productCategory.delete({ where: { id } });
     res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function upsertRetailCategoriesForBranch(branchId) {
+  let created = 0;
+  let updated = 0;
+  for (const seed of RETAIL_CATEGORY_SEEDS) {
+    const name = String(seed.name || "").trim();
+    if (!name) continue;
+    const attributeSet = Array.isArray(seed.attributeSet) ? seed.attributeSet : [];
+    const department = normalizeDepartment(seed.department);
+    const minMarginPct =
+      seed.minMarginPct != null && Number.isFinite(Number(seed.minMarginPct))
+        ? Number(seed.minMarginPct)
+        : null;
+    const existing = await prisma.productCategory.findFirst({
+      where: { branchId, name: { equals: name } },
+    });
+    if (existing) {
+      await prisma.productCategory.update({
+        where: { id: existing.id },
+        data: {
+          department: department || existing.department,
+          attributeSet: attributeSet.length ? attributeSet : existing.attributeSet,
+          minMarginPct: minMarginPct != null ? minMarginPct : existing.minMarginPct,
+        },
+      });
+      updated += 1;
+    } else {
+      await prisma.productCategory.create({
+        data: {
+          branchId,
+          name,
+          department,
+          attributeSet,
+          minMarginPct,
+        },
+      });
+      created += 1;
+    }
+  }
+  return { created, updated, total: RETAIL_CATEGORY_SEEDS.length };
+}
+
+exports.seedRetailCategories = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const result = await upsertRetailCategoriesForBranch(branchId);
+    res.json({
+      message: "Retail categories seeded for super shop, pharmacy, and apparel",
+      ...result,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1159,6 +1486,11 @@ exports.getCustomerRetentionAutomationHistory = async (req, res) => {
         birthdayCount: Number(x.payload?.summary?.birthdayCount || 0),
         generatedAt: x.payload?.generatedAt || x.createdAt,
         generatedBy: x.user?.name || x.user?.email || "",
+        dispatchedAt: x.payload?.dispatch?.dispatchedAt || null,
+        dispatchProvider: x.payload?.dispatch?.provider || null,
+        smsSent: Number(x.payload?.dispatch?.summary?.sent || 0),
+        smsSimulated: Number(x.payload?.dispatch?.summary?.simulated || 0),
+        smsFailed: Number(x.payload?.dispatch?.summary?.failed || 0),
       }));
     const latestQueue =
       logs
@@ -1172,6 +1504,99 @@ exports.getCustomerRetentionAutomationHistory = async (req, res) => {
       },
       campaigns: rows,
       latestQueue,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+const RETENTION_SMS_TEMPLATES = {
+  BIRTHDAY_OFFER:
+    "প্রিয় {name}, শুভ জন্মদিন! {store} এ আপনার জন্য জন্মদিনের বিশেষ অফার ও বোনাস পয়েন্ট অপেক্ষা করছে। আজই ঘুরে যান!",
+  AT_RISK_WINBACK:
+    "প্রিয় {name}, অনেকদিন আপনাকে দেখি না! {store} এ ফিরে আসুন — আপনার জন্য বিশেষ ছাড় ও বোনাস পয়েন্ট রয়েছে।",
+  GENERIC_RETENTION:
+    "প্রিয় {name}, {store} এ আপনার জন্য বিশেষ অফার চলছে। আজই ভিজিট করুন!",
+};
+
+exports.dispatchCustomerRetentionAutomation = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const automationId = Number(req.params.id);
+    if (Number.isNaN(automationId)) return res.status(400).json({ error: "Invalid automation id" });
+
+    const log = await prisma.auditLog.findFirst({
+      where: { id: automationId, action: "CUSTOMER_RETENTION_AUTOMATION", entity: "RetentionCampaign" },
+    });
+    if (!log || Number(log.payload?.branchId || 0) !== Number(branchId)) {
+      return res.status(404).json({ error: "Retention automation run not found" });
+    }
+    if (log.payload?.dispatch?.dispatchedAt) {
+      return res.status(409).json({ error: "This automation queue has already been dispatched" });
+    }
+    const queue = Array.isArray(log.payload?.queue) ? log.payload.queue : [];
+    const pending = queue.filter((x) => String(x.status || "PENDING") === "PENDING" && String(x.phone || "").trim());
+    if (!pending.length) return res.status(400).json({ error: "No pending contacts with phone numbers in this queue" });
+
+    const branch = await prisma.branch.findUnique({ where: { id: branchId }, select: { name: true } });
+    const storeName = branch?.name || "আমাদের দোকান";
+    const customTemplate = String(req.body?.messageTemplate || "").trim();
+
+    const recipients = pending.map((row) => {
+      const template = customTemplate || RETENTION_SMS_TEMPLATES[row.campaignType] || RETENTION_SMS_TEMPLATES.GENERIC_RETENTION;
+      return {
+        customerId: row.customerId,
+        to: row.phone,
+        message: renderSmsTemplate(template, {
+          name: row.customerName || "গ্রাহক",
+          store: storeName,
+          offer: row.suggestedOffer || "",
+        }),
+      };
+    });
+
+    const { results, summary } = await sendBulkSms(recipients);
+    const resultByCustomer = new Map(results.map((x) => [x.customerId, x]));
+    const updatedQueue = queue.map((row) => {
+      const result = resultByCustomer.get(row.customerId);
+      return result ? { ...row, status: result.status, smsError: result.error || null } : row;
+    });
+    const dispatch = {
+      dispatchedAt: new Date().toISOString(),
+      dispatchedByUserId: req.user?.id || null,
+      provider: getProviderName(),
+      simulated: !isSmsConfigured(),
+      summary,
+    };
+
+    await prisma.auditLog.update({
+      where: { id: log.id },
+      data: { payload: { ...log.payload, queue: updatedQueue, dispatch } },
+    });
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user?.id || null,
+        action: "CUSTOMER_RETENTION_SMS_DISPATCH",
+        entity: "RetentionCampaign",
+        entityId: String(log.id),
+        payload: { branchId, automationId: log.id, ...dispatch },
+      },
+    });
+
+    res.json({
+      message: dispatch.simulated
+        ? "SMS dispatch simulated (configure SMS_PROVIDER to send for real)"
+        : "SMS dispatch completed",
+      automationId: log.id,
+      ...dispatch,
+      results: results.map((x) => ({
+        customerId: x.customerId,
+        msisdn: x.msisdn,
+        status: x.status,
+        segments: x.segments,
+        encoding: x.encoding,
+        error: x.error || null,
+      })),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1254,5 +1679,27 @@ exports.getCustomerAccountStatementPdf = async (req, res) => {
     doc.end();
   } catch (err) {
     if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+};
+
+exports.issueLoyaltyCard = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    const customer = await prisma.customer.findFirst({ where: { id, branchId } });
+    if (!customer) return res.status(404).json({ error: "Customer not found" });
+    if (!String(customer.phone || "").trim()) {
+      return res.status(400).json({ error: "Customer phone is required for loyalty SMS OTP" });
+    }
+    const { issueLoyaltyCardToken } = require("../loyalty/loyaltyPublicController");
+    const loyaltyCardToken = issueLoyaltyCardToken();
+    await prisma.customer.update({ where: { id }, data: { loyaltyCardToken } });
+    const cardUrl =
+      typeof process.env.PUBLIC_APP_URL === "string" && process.env.PUBLIC_APP_URL
+        ? `${process.env.PUBLIC_APP_URL.replace(/\/$/, "")}/#/loyalty?card=${encodeURIComponent(loyaltyCardToken)}`
+        : null;
+    res.json({ loyaltyCardToken, cardUrl });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 };

@@ -6,10 +6,14 @@ import {
   runMushak63CompletenessCheck,
 } from "../services/nbrMushak63";
 import DataTable from "../components/DataTable";
-import { notifyError } from "../utils/notify";
+import { notifyError, notifySuccess } from "../utils/notify";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
 import { formatBDT, formatBdNumber, toBanglaDigits } from "../utils/currency";
 import { getLang, t } from "../i18n";
+import { SALE_UNIT_LABEL_KEYS } from "../constants/saleUnits";
+import { GROCERY_CATEGORY_CHIPS, RETAIL_DEPARTMENTS } from "../constants/retailDepartments";
+import { mergeIntoLabelQueue, navigateToLabelQueue } from "../utils/labelPrintQueue";
+import SearchSelect from "../components/SearchSelect";
 
 function mapWithholdingVoucherRow(r, bdtFn) {
   const net =
@@ -62,12 +66,27 @@ function Reports() {
       window.removeEventListener("storage", sync);
     };
   }, []);
+  useEffect(() => {
+    try {
+      const tab = sessionStorage.getItem("bd_pos_reports_tab");
+      if (tab) setReportsTab(tab);
+      if (sessionStorage.getItem("bd_pos_margin_erosion_only") === "1") {
+        setMarginErosionFilterOnly(true);
+      }
+      sessionStorage.removeItem("bd_pos_reports_tab");
+      sessionStorage.removeItem("bd_pos_margin_erosion_only");
+    } catch {
+      /* ignore */
+    }
+  }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
   const bdt = (v) => formatBDT(v, { lang: uiLang, decimals: 2 });
   const bdt0 = (v) => formatBDT(v, { lang: uiLang, decimals: 0 });
 
   const permissions = getStoredPermissions();
   const canExportAdvanced = hasPermission("accounting.report", permissions);
+  const canHqBranchCompare =
+    hasPermission("branch.manage", permissions) || hasPermission("rbac.manage", permissions);
   const [aging, setAging] = useState({ customers: [], suppliers: [] });
   const [stockValuation, setStockValuation] = useState({ totalValue: 0, rows: [] });
   const [stockValuationFilter, setStockValuationFilter] = useState({
@@ -77,6 +96,13 @@ function Reports() {
   });
   const [warehouses, setWarehouses] = useState([]);
   const [settlementRange, setSettlementRange] = useState({ from: "", to: "" });
+  const marginReportQuerySuffix = useMemo(() => {
+    const q = new URLSearchParams();
+    if (settlementRange.from) q.set("from", settlementRange.from);
+    if (settlementRange.to) q.set("to", settlementRange.to);
+    const s = q.toString();
+    return s ? `?${s}` : "";
+  }, [settlementRange.from, settlementRange.to]);
   const [settlement, setSettlement] = useState({
     from: null,
     to: null,
@@ -136,13 +162,67 @@ function Reports() {
     onlyMismatched: false,
   });
   const [reportsTab, setReportsTab] = useState("overview");
+  const [marginErosionFilterOnly, setMarginErosionFilterOnly] = useState(false);
   const [marginThresholdPct, setMarginThresholdPct] = useState(5);
+  const [categoryMarginErosion, setCategoryMarginErosion] = useState({
+    summary: {
+      categoryCount: 0,
+      soldCategoryCount: 0,
+      belowTargetCount: 0,
+      costErosionCount: 0,
+      alertCount: 0,
+      worstGapPct: 0,
+    },
+    rows: [],
+  });
   const [advancedMargin, setAdvancedMargin] = useState({
     summary: { skuCount: 0, soldSkuCount: 0, erosionAlertCount: 0, totalRevenue: 0, totalLandedCogs: 0, totalGrossProfit: 0 },
     categoryRows: [],
     rows: [],
   });
   const [advancedMarginTrend, setAdvancedMarginTrend] = useState({ months: 12, rows: [] });
+  const [categorySales, setCategorySales] = useState({
+    rows: [],
+    summary: { categoryCount: 0, totalRevenue: 0, totalCogs: 0, totalGrossProfit: 0 },
+  });
+  const [departmentSales, setDepartmentSales] = useState({
+    rows: [],
+    summary: { departmentCount: 0, totalRevenue: 0, totalCogs: 0, totalGrossProfit: 0 },
+  });
+  const [promotionRoi, setPromotionRoi] = useState({
+    rows: [],
+    summary: { saleCount: 0, salesWithPromo: 0, ruleCount: 0, totalDiscount: 0, unattributedPromoTotal: 0 },
+  });
+  const [hourlyCategoryFilter, setHourlyCategoryFilter] = useState("ALL");
+  const [slowMoverDays, setSlowMoverDays] = useState(60);
+  const [slowMoverCategory, setSlowMoverCategory] = useState("ALL");
+  const [shrinkageByCategory, setShrinkageByCategory] = useState({
+    rows: [],
+    summary: { categoryCount: 0, adjustmentCount: 0, unitsWrittenOff: 0, estimatedCost: 0 },
+  });
+  const [hqBranchCompare, setHqBranchCompare] = useState({ from: "", to: "", branches: [] });
+  const [loyaltyByCategory, setLoyaltyByCategory] = useState({
+    rows: [],
+    summary: { categoryCount: 0, totalRevenue: 0, totalPoints: 0, bonusPoints: 0 },
+    aisleBonusActive: false,
+  });
+  const [slowMovers, setSlowMovers] = useState({
+    rows: [],
+    summary: { slowMoverCount: 0, stockValueAtRisk: 0 },
+  });
+  const [basketAnalysis, setBasketAnalysis] = useState({
+    mode: "product",
+    rows: [],
+    summary: { saleCount: 0, multiItemSaleCount: 0, pairCount: 0 },
+  });
+  const [basketMode, setBasketMode] = useState("product");
+  const [basketMinCount, setBasketMinCount] = useState(3);
+  const [hourlyCategorySales, setHourlyCategorySales] = useState({
+    rows: [],
+    hourTotals: [],
+    categories: [],
+    summary: { peakHour: 0, peakHourLabel: "00:00", peakHourRevenue: 0, totalRevenue: 0 },
+  });
   const [taxRisk, setTaxRisk] = useState({
     summary: {
       vatSalesCount: 0,
@@ -162,6 +242,8 @@ function Reports() {
     warnings: [],
     readyForExport: false,
   });
+  const [efdPending, setEfdPending] = useState([]);
+  const [efdPendingLoading, setEfdPendingLoading] = useState(false);
   const [focusWorstMarginImpact, setFocusWorstMarginImpact] = useState(false);
   const [selectedImpactProductId, setSelectedImpactProductId] = useState(null);
   const todayPeriodKey = (() => {
@@ -340,6 +422,37 @@ function Reports() {
     setWithholdingRegistersPreviewError("");
   }, [mushak91Period]);
 
+  const loadEfdPending = async () => {
+    setEfdPendingLoading(true);
+    try {
+      const q = new URLSearchParams();
+      if (settlementRange.from) q.set("from", settlementRange.from);
+      if (settlementRange.to) q.set("to", settlementRange.to);
+      q.set("limit", "50");
+      const res = await api.get(`/efd/pending-sales?${q.toString()}`);
+      setEfdPending(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      notifyError(err?.response?.data?.error || tt("repEfdRetryFailed"));
+      setEfdPending([]);
+    } finally {
+      setEfdPendingLoading(false);
+    }
+  };
+
+  const retryEfdSale = async (saleId) => {
+    try {
+      await api.post(`/efd/sales/${saleId}/submit`);
+      notifySuccess(tt("repEfdRetryOk"));
+      await loadEfdPending();
+    } catch (err) {
+      notifyError(err?.response?.data?.error || tt("repEfdRetryFailed"));
+    }
+  };
+
+  useEffect(() => {
+    if (reportsTab === "tax") void loadEfdPending();
+  }, [reportsTab, settlementRange.from, settlementRange.to]);
+
   useEffect(() => {
     const load = async () => {
       const settlementQuery = new URLSearchParams();
@@ -361,7 +474,35 @@ function Reports() {
       const stockSuffix = stockQuery.toString() ? `?${stockQuery.toString()}` : "";
       const taxRiskQuery = new URLSearchParams(settlementQuery.toString());
       if (Number(taxRiskMinScore || 0) > 0) taxRiskQuery.set("minRiskScore", String(taxRiskMinScore));
-      const [agingRes, stockRes, settlementRes, loyaltyRes, vatSummaryRes, vatRegisterRes, shrinkageRes, staffKpiRes, auditTrailRes, chequeLedgerRes, warehouseRes, marginRes, marginTrendRes, taxRiskRes, taxPrecheckRes] =
+      const categorySalesQuery = new URLSearchParams();
+      if (settlementRange.from) categorySalesQuery.set("from", settlementRange.from);
+      if (settlementRange.to) categorySalesQuery.set("to", settlementRange.to);
+      const categorySalesSuffix = categorySalesQuery.toString() ? `?${categorySalesQuery.toString()}` : "";
+      const hourlyCategoryQuery = new URLSearchParams(categorySalesQuery.toString());
+      if (hourlyCategoryFilter && hourlyCategoryFilter !== "ALL") {
+        hourlyCategoryQuery.set("category", hourlyCategoryFilter);
+      }
+      const hourlyCategorySuffix = hourlyCategoryQuery.toString() ? `?${hourlyCategoryQuery.toString()}` : "";
+      const slowMoverQuery = new URLSearchParams(categorySalesQuery.toString());
+      slowMoverQuery.set("days", String(slowMoverDays || 60));
+      if (slowMoverCategory && slowMoverCategory !== "ALL") {
+        slowMoverQuery.set("category", slowMoverCategory);
+      }
+      const slowMoverSuffix = slowMoverQuery.toString() ? `?${slowMoverQuery.toString()}` : "";
+      const basketQuery = new URLSearchParams(categorySalesQuery.toString());
+      basketQuery.set("mode", basketMode === "category" ? "category" : "product");
+      basketQuery.set("minCount", String(basketMinCount || 3));
+      const basketSuffix = basketQuery.toString() ? `?${basketQuery.toString()}` : "";
+
+      const marginQuery = (() => {
+        const q = new URLSearchParams();
+        if (settlementRange.from) q.set("from", settlementRange.from);
+        if (settlementRange.to) q.set("to", settlementRange.to);
+        q.set("erosionThresholdPct", String(marginThresholdPct || 5));
+        const s = q.toString();
+        return s ? `?${s}` : "";
+      })();
+      const [agingRes, stockRes, settlementRes, loyaltyRes, vatSummaryRes, vatRegisterRes, shrinkageRes, staffKpiRes, auditTrailRes, chequeLedgerRes, warehouseRes, marginRes, marginTrendRes, marginErosionRes, taxRiskRes, taxPrecheckRes, categorySalesRes, departmentSalesRes, promotionRoiRes, hourlyCategorySalesRes, shrinkageByCategoryRes, slowMoversRes, hqBranchCompareRes, loyaltyByCategoryRes, basketAnalysisRes] =
         await Promise.all([
         api.get("/reports/aging"),
         api.get(`/reports/stock-valuation${stockSuffix}`),
@@ -385,17 +526,22 @@ function Reports() {
           }`
         ),
         api.get("/warehouses"),
-        api.get(`/reports/advanced-margin${(() => {
-          const q = new URLSearchParams();
-          if (settlementRange.from) q.set("from", settlementRange.from);
-          if (settlementRange.to) q.set("to", settlementRange.to);
-          q.set("erosionThresholdPct", String(marginThresholdPct || 5));
-          const s = q.toString();
-          return s ? `?${s}` : "";
-        })()}`),
+        api.get(`/reports/advanced-margin${marginQuery}`),
         api.get("/reports/advanced-margin/trend?months=12"),
+        api.get(`/reports/category-margin-erosion${marginQuery}`),
         api.get(`/reports/tax-risk${taxRiskQuery.toString() ? `?${taxRiskQuery.toString()}` : ""}`),
         api.get(`/reports/tax-filing/prevalidate${taxRiskQuery.toString() ? `?${taxRiskQuery.toString()}` : ""}`),
+        api.get(`/reports/category-sales${categorySalesSuffix}`),
+        api.get(`/reports/department-sales${categorySalesSuffix}`),
+        api.get(`/reports/promotion-roi${categorySalesSuffix}`),
+        api.get(`/reports/hourly-category-sales${hourlyCategorySuffix}`),
+        api.get(`/reports/shrinkage-by-category${categorySalesSuffix}`),
+        api.get(`/reports/slow-movers${slowMoverSuffix}`),
+        canHqBranchCompare
+          ? api.get(`/reports/hq-branch-compare${categorySalesSuffix}`).catch(() => ({ data: null }))
+          : Promise.resolve({ data: null }),
+        api.get(`/reports/loyalty-by-category${categorySalesSuffix}`),
+        api.get(`/reports/basket-analysis${basketSuffix}`),
       ]);
       setAging(agingRes.data);
       setStockValuation(stockRes.data);
@@ -427,6 +573,76 @@ function Reports() {
         }
       );
       setAdvancedMarginTrend(marginTrendRes.data || { months: 12, rows: [] });
+      setCategoryMarginErosion(
+        marginErosionRes.data || {
+          summary: {
+            categoryCount: 0,
+            soldCategoryCount: 0,
+            belowTargetCount: 0,
+            costErosionCount: 0,
+            alertCount: 0,
+            worstGapPct: 0,
+          },
+          rows: [],
+        }
+      );
+      setCategorySales(
+        categorySalesRes.data || {
+          rows: [],
+          summary: { categoryCount: 0, totalRevenue: 0, totalCogs: 0, totalGrossProfit: 0 },
+        }
+      );
+      setDepartmentSales(
+        departmentSalesRes.data || {
+          rows: [],
+          summary: { departmentCount: 0, totalRevenue: 0, totalCogs: 0, totalGrossProfit: 0 },
+        }
+      );
+      setPromotionRoi(
+        promotionRoiRes.data || {
+          rows: [],
+          summary: { saleCount: 0, salesWithPromo: 0, ruleCount: 0, totalDiscount: 0, unattributedPromoTotal: 0 },
+        }
+      );
+      setHourlyCategorySales(
+        hourlyCategorySalesRes.data || {
+          rows: [],
+          hourTotals: [],
+          categories: [],
+          summary: { peakHour: 0, peakHourLabel: "00:00", peakHourRevenue: 0, totalRevenue: 0 },
+        }
+      );
+      setShrinkageByCategory(
+        shrinkageByCategoryRes.data || {
+          rows: [],
+          summary: { categoryCount: 0, adjustmentCount: 0, unitsWrittenOff: 0, estimatedCost: 0 },
+        }
+      );
+      setSlowMovers(
+        slowMoversRes.data || {
+          rows: [],
+          summary: { slowMoverCount: 0, stockValueAtRisk: 0 },
+        }
+      );
+      setHqBranchCompare(
+        hqBranchCompareRes?.data && Array.isArray(hqBranchCompareRes.data.branches)
+          ? hqBranchCompareRes.data
+          : { from: "", to: "", branches: [] }
+      );
+      setLoyaltyByCategory(
+        loyaltyByCategoryRes.data || {
+          rows: [],
+          summary: { categoryCount: 0, totalRevenue: 0, totalPoints: 0, bonusPoints: 0 },
+          aisleBonusActive: false,
+        }
+      );
+      setBasketAnalysis(
+        basketAnalysisRes.data || {
+          mode: basketMode,
+          rows: [],
+          summary: { saleCount: 0, multiItemSaleCount: 0, pairCount: 0 },
+        }
+      );
       setTaxRisk(
         taxRiskRes.data || {
           summary: {
@@ -465,6 +681,12 @@ function Reports() {
     stockValuationFilter.warehouseId,
     marginThresholdPct,
     taxRiskMinScore,
+    hourlyCategoryFilter,
+    slowMoverDays,
+    slowMoverCategory,
+    basketMode,
+    basketMinCount,
+    canHqBranchCompare,
   ]);
 
   const exportCSV = async (url, filename) => {
@@ -593,6 +815,20 @@ function Reports() {
     await exportCSV(`${url}${suffix}`, filename);
   };
 
+  const exportCategoryMarginErosion = async (type) => {
+    const query = new URLSearchParams();
+    if (settlementRange.from) query.set("from", settlementRange.from);
+    if (settlementRange.to) query.set("to", settlementRange.to);
+    query.set("erosionThresholdPct", String(marginThresholdPct || 5));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const endpoints = {
+      csv: ["/reports/category-margin-erosion/export.csv", "category-margin-erosion.csv"],
+      pdf: ["/reports/category-margin-erosion/export.pdf", "category-margin-erosion.pdf"],
+    };
+    const [url, filename] = endpoints[type];
+    await exportCSV(`${url}${suffix}`, filename);
+  };
+
   const exportTaxRisk = async (type) => {
     const query = new URLSearchParams();
     if (settlementRange.from) query.set("from", settlementRange.from);
@@ -615,6 +851,12 @@ function Reports() {
       ),
     [advancedMarginTrend.rows]
   );
+
+  const categoryMarginErosionRows = useMemo(() => {
+    const rows = categoryMarginErosion.rows || [];
+    if (marginErosionFilterOnly) return rows.filter((row) => row.alert);
+    return rows;
+  }, [categoryMarginErosion.rows, marginErosionFilterOnly]);
 
   const setSettlementPresetRange = (preset) => {
     const now = new Date();
@@ -808,6 +1050,86 @@ function Reports() {
       </div>
       {reportsTab === "overview" ? (
         <div className="pos-tab-panel">
+      {canHqBranchCompare && hqBranchCompare.branches?.length ? (
+        <div className="page-card" style={{ marginBottom: 12 }}>
+          <h4 style={{ marginTop: 0 }}>{tt("repHqBranchCompareTitle")}</h4>
+          <p className="text-muted" style={{ fontSize: 13, marginTop: 0 }}>
+            {tt("repHqBranchCompareSub", {
+              from: hqBranchCompare.from || "—",
+              to: hqBranchCompare.to || "—",
+            })}
+          </p>
+          <div style={{ marginBottom: 10 }}>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() =>
+                exportCSV(
+                  `/reports/hq-branch-compare/export.csv${marginReportQuerySuffix}`,
+                  "hq-branch-compare.csv"
+                )
+              }
+            >
+              {tt("repExportHqBranchCompareCsv")}
+            </button>
+          </div>
+          {[
+            { key: "salesToday", labelKey: "repHqMetricSales" },
+            { key: "groceryRevenueToday", labelKey: "repHqMetricGrocery" },
+            { key: "groceryMarginPctToday", labelKey: "dashGroceryMarginShort", isPct: true },
+          ].map((metric) => {
+            const maxVal = Math.max(
+              ...hqBranchCompare.branches.map((b) => Number(b[metric.key] || 0)),
+              1
+            );
+            return (
+              <div key={metric.key} style={{ marginBottom: 14 }}>
+                <strong style={{ fontSize: 13 }}>{tt(metric.labelKey)}</strong>
+                <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+                  {hqBranchCompare.branches.map((b) => {
+                    const val = Number(b[metric.key] || 0);
+                    const pct = Math.min(100, (val / maxVal) * 100);
+                    return (
+                      <div key={`${metric.key}-${b.branchId}`}>
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            fontSize: 12,
+                            marginBottom: 4,
+                          }}
+                        >
+                          <span>
+                            {b.name} <span style={{ opacity: 0.65 }}>({b.code})</span>
+                          </span>
+                          <span>{metric.isPct ? `${val.toFixed(1)}%` : bdt(val)}</span>
+                        </div>
+                        <div
+                          style={{
+                            height: 8,
+                            borderRadius: 4,
+                            background: "#e5e7eb",
+                            overflow: "hidden",
+                          }}
+                        >
+                          <div
+                            style={{
+                              width: `${pct}%`,
+                              height: "100%",
+                              background: "#1d4ed8",
+                              borderRadius: 4,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
       <DataTable
         title={tt("repSettleByMethodTitle")}
         rows={settlement.methods.map((row, idx) => ({ rowNo: idx + 1, ...row }))}
@@ -981,6 +1303,44 @@ function Reports() {
       />
 
       <div className="page-card" style={{ marginBottom: "12px" }}>
+        <h4 style={{ marginTop: 0 }}>{tt("repEfdQueueTitle")}</h4>
+        <p className="text-muted" style={{ marginTop: 0, fontSize: 12 }}>
+          {tt("repEfdQueueHelp")}
+        </p>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <button type="button" className="btn-secondary btn-sm" onClick={loadEfdPending} disabled={efdPendingLoading}>
+            {efdPendingLoading ? tt("settingsLoading") : tt("settingsRefreshReadiness")}
+          </button>
+        </div>
+        {efdPending.length === 0 && !efdPendingLoading ? (
+          <p className="text-muted" style={{ margin: 0, fontSize: 13 }}>{tt("repEfdNoPending")}</p>
+        ) : (
+          <DataTable
+            rows={efdPending}
+            columns={[
+              { key: "invoiceNo", label: tt("repInvoiceNumber"), render: (v, row) => v || `#${row.id}` },
+              {
+                key: "createdAt",
+                label: tt("colDate"),
+                render: (v) => (v ? new Date(v).toLocaleString() : "—"),
+              },
+              { key: "total", label: tt("receiptTotal"), render: (v) => formatBDT(v || 0) },
+              { key: "paymentMethod", label: tt("receiptPayment") },
+              {
+                key: "id",
+                label: tt("colActions"),
+                render: (_, row) => (
+                  <button type="button" className="btn-secondary btn-sm" onClick={() => retryEfdSale(row.id)}>
+                    {tt("repEfdRetry")}
+                  </button>
+                ),
+              },
+            ]}
+          />
+        )}
+      </div>
+
+      <div className="page-card" style={{ marginBottom: "12px" }}>
         <h4 style={{ marginTop: 0 }}>{tt("repMushak63Title")}</h4>
         <p className="text-muted" style={{ marginTop: 0, fontSize: 12 }}>
           {tt("repMushak63HelpA")} <strong>{tt("repInvoiceNumber")}</strong> {tt("repMushak63HelpB")}
@@ -988,16 +1348,17 @@ function Reports() {
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <label style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
             {tt("repMatchBy")}
-            <select
+            <SearchSelect
               className="form-select-sm"
               value={mushak63LookupMode}
-              onChange={(e) => setMushak63LookupMode(e.target.value)}
-              style={{ minWidth: 140 }}
-            >
-              <option value="auto">{tt("repAuto")}</option>
-              <option value="saleId">{tt("repSaleId")}</option>
-              <option value="invoice">{tt("repInvoiceNumber")}</option>
-            </select>
+              onChange={(val) => setMushak63LookupMode(val || "auto")}
+              options={[
+                { value: "auto", label: tt("repAuto") },
+                { value: "saleId", label: tt("repSaleId") },
+                { value: "invoice", label: tt("repInvoiceNumber") },
+              ]}
+              isClearable={false}
+            />
           </label>
           <input
             type="text"
@@ -1303,7 +1664,61 @@ function Reports() {
         <div className="stat">Staff Sales: {bdt(staffKpi.summary?.totalSales)}</div>
         <div className="stat">Invoices: {Number(staffKpi.summary?.totalInvoices || 0)}</div>
       </div>
-      <div className="page-card" style={{ marginBottom: "12px" }}>
+      <p className="text-muted" style={{ margin: "0 0 8px", fontSize: 13 }}>
+        {tt("repShrinkageByCategoryHelp")}
+      </p>
+      <div className="quick-stats" style={{ marginBottom: "12px" }}>
+        <div className="stat">{tt("repShrinkageCategories")}: {Number(shrinkageByCategory.summary?.categoryCount || 0)}</div>
+        <div className="stat">{tt("repShrinkageUnits")}: {Number(shrinkageByCategory.summary?.unitsWrittenOff || 0).toFixed(2)}</div>
+        <div className="stat">{tt("repShrinkageEstCost")}: {bdt(shrinkageByCategory.summary?.estimatedCost || 0)}</div>
+      </div>
+      <div style={{ marginBottom: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button
+          type="button"
+          className="btn-secondary btn-sm"
+          onClick={() =>
+            exportCSV(
+              `/reports/shrinkage-by-category/export.csv${marginReportQuerySuffix}`,
+              "shrinkage-by-category.csv"
+            )
+          }
+        >
+          {tt("repExportShrinkageCategoryCsv")}
+        </button>
+        <button
+          type="button"
+          className="btn-secondary btn-sm"
+          onClick={() =>
+            exportCSV(
+              `/reports/shrinkage-by-category/export.pdf${marginReportQuerySuffix}`,
+              "shrinkage-by-category.pdf"
+            )
+          }
+        >
+          {tt("repExportShrinkageCategoryPdf")}
+        </button>
+      </div>
+      <DataTable
+        title={tt("repShrinkageByCategoryTitle")}
+        rows={(shrinkageByCategory.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+        searchableKeys={["category", "department"]}
+        columns={[
+          { key: "rowNo", label: tt("colId") },
+          { key: "category", label: tt("repColCategory") },
+          {
+            key: "department",
+            label: tt("repColDepartment"),
+            render: (v) => {
+              const dept = RETAIL_DEPARTMENTS.find((d) => d.id === String(v || "").toUpperCase());
+              return dept ? tt(dept.labelKey) : v || "—";
+            },
+          },
+          { key: "adjustmentCount", label: tt("repShrinkageAdjCount") },
+          { key: "unitsWrittenOff", label: tt("repColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+          { key: "estimatedCost", label: tt("repShrinkageEstCost"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+        ]}
+      />
+            <div className="page-card" style={{ marginBottom: "12px" }}>
         <strong>Shrinkage Risk Guide:</strong>{" "}
         High discount events are flagged at {bdt0(shrinkageThresholds.discountAlertMin)}+, high
         return events at {bdt0(shrinkageThresholds.returnAlertMin)}+, and timeline risk becomes
@@ -1618,27 +2033,29 @@ function Reports() {
         <div className="stat">Total Credit: {bdt(chequeLedger.summary?.totalCredit)}</div>
       </div>
       <div className="form-grid" style={{ marginBottom: "12px" }}>
-        <select
+        <SearchSelect
           className="form-select-sm"
           value={chequeLedgerFilter.direction}
-          onChange={(e) => setChequeLedgerFilter((prev) => ({ ...prev, direction: e.target.value }))}
-        >
-          <option value="">All Directions</option>
-          <option value="RECEIVED">RECEIVED</option>
-          <option value="ISSUED">ISSUED</option>
-        </select>
-        <select
+          onChange={(val) => setChequeLedgerFilter((prev) => ({ ...prev, direction: val }))}
+          placeholder="All Directions"
+          options={[
+            { value: "RECEIVED", label: "RECEIVED" },
+            { value: "ISSUED", label: "ISSUED" },
+          ]}
+        />
+        <SearchSelect
           className="form-select-sm"
           value={chequeLedgerFilter.status}
-          onChange={(e) => setChequeLedgerFilter((prev) => ({ ...prev, status: e.target.value }))}
-        >
-          <option value="">All Status</option>
-          <option value="CLEARED">CLEARED</option>
-          <option value="BOUNCED">BOUNCED</option>
-          <option value="DEPOSITED">DEPOSITED</option>
-          <option value="PENDING">PENDING</option>
-          <option value="CANCELLED">CANCELLED</option>
-        </select>
+          onChange={(val) => setChequeLedgerFilter((prev) => ({ ...prev, status: val }))}
+          placeholder="All Status"
+          options={[
+            { value: "CLEARED", label: "CLEARED" },
+            { value: "BOUNCED", label: "BOUNCED" },
+            { value: "DEPOSITED", label: "DEPOSITED" },
+            { value: "PENDING", label: "PENDING" },
+            { value: "CANCELLED", label: "CANCELLED" },
+          ]}
+        />
         <button
           type="button"
           className="btn-secondary"
@@ -1716,18 +2133,13 @@ function Reports() {
           value={stockValuationFilter.category}
           onChange={(e) => setStockValuationFilter((prev) => ({ ...prev, category: e.target.value }))}
         />
-        <select
+        <SearchSelect
           className="form-select-sm"
+          kind="warehouses"
           value={stockValuationFilter.warehouseId}
-          onChange={(e) => setStockValuationFilter((prev) => ({ ...prev, warehouseId: e.target.value }))}
-        >
-          <option value="">All Warehouses</option>
-          {(warehouses || []).map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.name}
-            </option>
-          ))}
-        </select>
+          onChange={(val) => setStockValuationFilter((prev) => ({ ...prev, warehouseId: val }))}
+          placeholder="All Warehouses"
+        />
         <button
           type="button"
           className="btn-secondary"
@@ -1778,7 +2190,12 @@ function Reports() {
         columns={[
           { key: "rowNo", label: "ID" },
           { key: "name", label: "Product" },
-          { key: "stock", label: "Stock" },
+          { key: "saleUnit", label: tt("prodLblUom"), render: (v) => (v ? tt(SALE_UNIT_LABEL_KEYS[v] || v) : "—") },
+          {
+            key: "stockDisplay",
+            label: tt("prodLblStock"),
+            render: (v, row) => v || row.stock,
+          },
           { key: "unitCost", label: "Unit Cost", render: (v) => `৳${Number(v).toFixed(2)}` },
           { key: "sellingPrice", label: tt("prodLblSellingPrice"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
           { key: "profitMargin", label: tt("prodLblProfitMargin"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
@@ -1848,6 +2265,498 @@ function Reports() {
                 );
               })}
             </div>
+          </div>
+          <p className="text-muted" style={{ margin: "0 0 8px", fontSize: 13 }}>
+            {tt("repCategorySalesHelp")}
+          </p>
+          <div style={{ marginBottom: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() =>
+                exportCSV(
+                  `/reports/category-sales/export.csv${marginReportQuerySuffix}`,
+                  "category-sales.csv"
+                )
+              }
+            >
+              {tt("repExportCategoryCsv")}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() =>
+                exportCSV(
+                  `/reports/department-sales/export.csv${marginReportQuerySuffix}`,
+                  "department-sales.csv"
+                )
+              }
+            >
+              {tt("repExportDepartmentCsv")}
+            </button>
+          </div>
+          <DataTable
+            title={tt("repCategorySalesTitle")}
+            rows={(categorySales.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["category"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "category", label: tt("repColCategory") },
+              { key: "soldQty", label: tt("repColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+              { key: "revenue", label: tt("repMarginRevenue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "cogs", label: tt("repColCogs"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "grossProfit", label: tt("repColGrossProfit"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "marginPct", label: tt("repColMarginPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+            ]}
+          />
+          <p className="text-muted" style={{ margin: "16px 0 8px", fontSize: 13 }}>
+            {tt("repDepartmentSalesHelp")}
+          </p>
+          <div className="quick-stats" style={{ marginBottom: "12px" }}>
+            <div className="stat">{tt("repDeptCount")}: {Number(departmentSales.summary?.departmentCount || 0)}</div>
+            <div className="stat">{tt("repMarginRevenue")}: {bdt(departmentSales.summary?.totalRevenue || 0)}</div>
+            <div className="stat">{tt("repColCogs")}: {bdt(departmentSales.summary?.totalCogs || 0)}</div>
+            <div className="stat">{tt("repColGrossProfit")}: {bdt(departmentSales.summary?.totalGrossProfit || 0)}</div>
+          </div>
+          <DataTable
+            title={tt("repDepartmentSalesTitle")}
+            rows={(departmentSales.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["department"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              {
+                key: "department",
+                label: tt("repColDepartment"),
+                render: (v) => {
+                  const dept = RETAIL_DEPARTMENTS.find((d) => d.id === String(v || "").toUpperCase());
+                  return dept ? tt(dept.labelKey) : v || "—";
+                },
+              },
+              { key: "soldQty", label: tt("repColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+              { key: "revenue", label: tt("repMarginRevenue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "cogs", label: tt("repColCogs"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "grossProfit", label: tt("repColGrossProfit"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "marginPct", label: tt("repColMarginPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+            ]}
+          />
+          <p className="text-muted" style={{ margin: "16px 0 8px", fontSize: 13 }}>
+            {tt("repHourlyCategoryHelp")}
+          </p>
+          <div style={{ marginBottom: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                const q = new URLSearchParams(marginReportQuerySuffix.replace(/^\?/, ""));
+                if (hourlyCategoryFilter && hourlyCategoryFilter !== "ALL") {
+                  q.set("category", hourlyCategoryFilter);
+                }
+                const suffix = q.toString() ? `?${q.toString()}` : "";
+                exportCSV(`/reports/hourly-category-sales/export.csv${suffix}`, "hourly-category-sales.csv");
+              }}
+            >
+              {tt("repExportHourlyCsv")}
+            </button>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            <button
+              type="button"
+              className={`pos-dept-chip${hourlyCategoryFilter === "ALL" ? " active" : ""}`}
+              onClick={() => setHourlyCategoryFilter("ALL")}
+            >
+              {tt("repHourlyAllAisles")}
+            </button>
+            {GROCERY_CATEGORY_CHIPS.map((cat) => (
+              <button
+                key={cat.id}
+                type="button"
+                className={`pos-dept-chip${hourlyCategoryFilter === cat.id ? " active" : ""}`}
+                onClick={() => setHourlyCategoryFilter(cat.id)}
+              >
+                {tt(cat.labelKey)}
+              </button>
+            ))}
+          </div>
+          <div className="quick-stats" style={{ marginBottom: "12px" }}>
+            <div className="stat">{tt("repHourlyPeakHour")}: {hourlyCategorySales.summary?.peakHourLabel || "—"}</div>
+            <div className="stat">{tt("repMarginRevenue")}: {bdt(hourlyCategorySales.summary?.totalRevenue || 0)}</div>
+          </div>
+          <div className="page-card" style={{ marginBottom: 16 }}>
+            <h4 style={{ marginTop: 0 }}>{tt("repHourlyCategoryTitle")}</h4>
+            <div style={{ display: "grid", gap: 6 }}>
+              {(hourlyCategorySales.hourTotals || []).map((row) => {
+                const maxRev = Math.max(
+                  1,
+                  ...(hourlyCategorySales.hourTotals || []).map((h) => Number(h.revenue || 0))
+                );
+                const widthPct = Math.max(2, (Number(row.revenue || 0) / maxRev) * 100);
+                return (
+                  <div
+                    key={row.hour}
+                    style={{ display: "grid", gridTemplateColumns: "52px 1fr 88px", gap: 8, alignItems: "center" }}
+                  >
+                    <div style={{ fontSize: 12 }}>{row.hourLabel}</div>
+                    <div style={{ height: 10, background: "#e5e7eb", borderRadius: 999 }}>
+                      <div
+                        style={{
+                          height: "100%",
+                          width: `${widthPct}%`,
+                          borderRadius: 999,
+                          background: "var(--primary, #2563eb)",
+                        }}
+                      />
+                    </div>
+                    <div style={{ textAlign: "right", fontSize: 12 }}>{bdt(row.revenue)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <DataTable
+            title={tt("repHourlyCategoryDetailTitle")}
+            rows={(hourlyCategorySales.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["category", "hourLabel"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "hourLabel", label: tt("repHourlyColHour") },
+              { key: "category", label: tt("repColCategory") },
+              { key: "soldQty", label: tt("repColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+              { key: "revenue", label: tt("repMarginRevenue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            ]}
+          />
+          <p className="text-muted" style={{ margin: "16px 0 8px", fontSize: 13 }}>
+            {tt("repBasketAnalysisHelp")}
+          </p>
+          <div className="quick-stats" style={{ marginBottom: 10 }}>
+            <div className="stat">{tt("repBasketSales")}: {Number(basketAnalysis.summary?.saleCount || 0)}</div>
+            <div className="stat">{tt("repBasketMultiItem")}: {Number(basketAnalysis.summary?.multiItemSaleCount || 0)}</div>
+            <div className="stat">{tt("repBasketPairs")}: {Number(basketAnalysis.summary?.pairCount || 0)}</div>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 10 }}>
+            <button
+              type="button"
+              className={`pos-dept-chip${basketMode === "product" ? " active" : ""}`}
+              onClick={() => setBasketMode("product")}
+            >
+              {tt("repBasketModeProduct")}
+            </button>
+            <button
+              type="button"
+              className={`pos-dept-chip${basketMode === "category" ? " active" : ""}`}
+              onClick={() => setBasketMode("category")}
+            >
+              {tt("repBasketModeCategory")}
+            </button>
+            <label style={{ fontSize: 13 }}>
+              {tt("repBasketMinCount")}{" "}
+              <input
+                type="number"
+                min={2}
+                max={100}
+                value={basketMinCount}
+                onChange={(e) => setBasketMinCount(Number(e.target.value) || 3)}
+                style={{ width: 56, marginLeft: 6 }}
+              />
+            </label>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                const q = new URLSearchParams(marginReportQuerySuffix.replace(/^\?/, ""));
+                q.set("mode", basketMode === "category" ? "category" : "product");
+                q.set("minCount", String(basketMinCount || 3));
+                const s = q.toString();
+                exportCSV(`/reports/basket-analysis/export.csv${s ? `?${s}` : ""}`, "basket-analysis.csv");
+              }}
+            >
+              {tt("repExportBasketCsv")}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                const q = new URLSearchParams(marginReportQuerySuffix.replace(/^\?/, ""));
+                q.set("mode", basketMode === "category" ? "category" : "product");
+                q.set("minCount", String(basketMinCount || 3));
+                const s = q.toString();
+                exportCSV(`/reports/basket-analysis/export.pdf${s ? `?${s}` : ""}`, "basket-analysis.pdf");
+              }}
+            >
+              {tt("repExportBasketPdf")}
+            </button>
+          </div>
+          <DataTable
+            title={tt("repBasketAnalysisTitle")}
+            rows={(basketAnalysis.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["itemA", "itemB", "skuA", "skuB", "categoryA", "categoryB"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "itemA", label: tt("repBasketItemA") },
+              ...(basketMode === "product"
+                ? [
+                    { key: "skuA", label: tt("prodLblSku"), render: (v) => v || "—" },
+                    { key: "categoryA", label: tt("repColCategory"), render: (v) => v || "—" },
+                  ]
+                : []),
+              { key: "itemB", label: tt("repBasketItemB") },
+              ...(basketMode === "product"
+                ? [
+                    { key: "skuB", label: tt("repBasketSkuB"), render: (v) => v || "—" },
+                    { key: "categoryB", label: tt("repBasketCatB"), render: (v) => v || "—" },
+                  ]
+                : []),
+              { key: "pairCount", label: tt("repBasketTogether") },
+              {
+                key: "supportPct",
+                label: tt("repBasketSupport"),
+                render: (v) => `${Number(v || 0).toFixed(1)}%`,
+              },
+              {
+                key: "confidenceAPct",
+                label: tt("repBasketConfA"),
+                render: (v) => `${Number(v || 0).toFixed(1)}%`,
+              },
+              {
+                key: "confidenceBPct",
+                label: tt("repBasketConfB"),
+                render: (v) => `${Number(v || 0).toFixed(1)}%`,
+              },
+            ]}
+          />
+          <p className="text-muted" style={{ margin: "16px 0 8px", fontSize: 13 }}>
+            {tt("repSlowMoversHelp")}
+          </p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 10 }}>
+            <label style={{ fontSize: 13 }}>
+              {tt("repSlowMoversDays")}{" "}
+              <input
+                type="number"
+                min={7}
+                max={365}
+                value={slowMoverDays}
+                onChange={(e) => setSlowMoverDays(Number(e.target.value) || 60)}
+                style={{ width: 72, marginLeft: 6 }}
+              />
+            </label>
+            <button type="button" className="btn-secondary btn-sm" onClick={() => setSlowMoverCategory("ALL")}>
+              {tt("repHourlyAllAisles")}
+            </button>
+            {GROCERY_CATEGORY_CHIPS.map((cat) => (
+              <button
+                key={`slow-${cat.id}`}
+                type="button"
+                className={`pos-dept-chip${slowMoverCategory === cat.id ? " active" : ""}`}
+                onClick={() => setSlowMoverCategory(cat.id)}
+              >
+                {tt(cat.labelKey)}
+              </button>
+            ))}
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                const q = new URLSearchParams(marginReportQuerySuffix.replace(/^\?/, ""));
+                q.set("days", String(slowMoverDays || 60));
+                if (slowMoverCategory && slowMoverCategory !== "ALL") q.set("category", slowMoverCategory);
+                const suffix = q.toString() ? `?${q.toString()}` : "";
+                exportCSV(`/reports/slow-movers/export.csv${suffix}`, "slow-movers.csv");
+              }}
+            >
+              {tt("repExportSlowMoversCsv")}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                const q = new URLSearchParams(marginReportQuerySuffix.replace(/^\?/, ""));
+                q.set("days", String(slowMoverDays || 60));
+                if (slowMoverCategory && slowMoverCategory !== "ALL") q.set("category", slowMoverCategory);
+                const suffix = q.toString() ? `?${q.toString()}` : "";
+                exportCSV(`/reports/slow-movers/export.pdf${suffix}`, "slow-movers.pdf");
+              }}
+            >
+              {tt("repExportSlowMoversPdf")}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                const entries = (slowMovers.rows || []).map((row) => ({
+                  productId: row.productId,
+                  qty: 1,
+                }));
+                if (!entries.length) {
+                  notifyError(tt("repSlowMoversQueueEmpty"));
+                  return;
+                }
+                mergeIntoLabelQueue(entries);
+                navigateToLabelQueue({
+                  aisle: slowMoverCategory !== "ALL" ? slowMoverCategory : "",
+                });
+              }}
+            >
+              {tt("repQueueSlowMoversLabels")}
+            </button>
+          </div>
+          <div className="quick-stats" style={{ marginBottom: "12px" }}>
+            <div className="stat">{tt("repSlowMoverCount")}: {Number(slowMovers.summary?.slowMoverCount || 0)}</div>
+            <div className="stat">{tt("repSlowMoverStockValue")}: {bdt(slowMovers.summary?.stockValueAtRisk || 0)}</div>
+          </div>
+          <DataTable
+            title={tt("repSlowMoversTitle")}
+            rows={(slowMovers.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["name", "sku", "category"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "name", label: tt("colName") },
+              { key: "sku", label: "SKU" },
+              { key: "category", label: tt("repColCategory") },
+              { key: "stockUnits", label: tt("repColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+              { key: "stockValue", label: tt("repSlowMoverStockValue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            ]}
+          />
+          <p className="text-muted" style={{ margin: "16px 0 8px", fontSize: 13 }}>
+            {tt("repLoyaltyByCategoryHelp")}
+          </p>
+          <div className="quick-stats" style={{ marginBottom: "12px" }}>
+            <div className="stat">{tt("repLoyaltyCategories")}: {Number(loyaltyByCategory.summary?.categoryCount || 0)}</div>
+            <div className="stat">{tt("repLoyaltyTotalPoints")}: {Number(loyaltyByCategory.summary?.totalPoints || 0)}</div>
+            <div className="stat">{tt("repLoyaltyBonusPoints")}: {Number(loyaltyByCategory.summary?.bonusPoints || 0)}</div>
+          </div>
+          <div style={{ marginBottom: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() =>
+                exportCSV(
+                  `/reports/loyalty-by-category/export.csv${marginReportQuerySuffix}`,
+                  "loyalty-by-category.csv"
+                )
+              }
+            >
+              {tt("repExportLoyaltyCategoryCsv")}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() =>
+                exportCSV(
+                  `/reports/loyalty-by-category/export.pdf${marginReportQuerySuffix}`,
+                  "loyalty-by-category.pdf"
+                )
+              }
+            >
+              {tt("repExportLoyaltyCategoryPdf")}
+            </button>
+          </div>
+          <DataTable
+            title={tt("repLoyaltyByCategoryTitle")}
+            rows={(loyaltyByCategory.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["category"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "category", label: tt("repColCategory") },
+              { key: "revenue", label: tt("repMarginRevenue"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+              { key: "multiplier", label: tt("repLoyaltyMultiplier"), render: (v) => `${Number(v || 1).toFixed(1)}×` },
+              { key: "totalPoints", label: tt("repLoyaltyTotalPoints") },
+              { key: "bonusPoints", label: tt("repLoyaltyBonusPoints") },
+            ]}
+          />
+          <p className="text-muted" style={{ margin: "16px 0 8px", fontSize: 13 }}>
+            {tt("repPromotionRoiHelp")}
+          </p>
+          <div className="quick-stats" style={{ marginBottom: "12px" }}>
+            <div className="stat">{tt("repPromoSalesWithOffer")}: {Number(promotionRoi.summary?.salesWithPromo || 0)}</div>
+            <div className="stat">{tt("repPromoTotalDiscount")}: {bdt(promotionRoi.summary?.totalDiscount || 0)}</div>
+          </div>
+          <DataTable
+            title={tt("repPromotionRoiTitle")}
+            rows={(promotionRoi.rows || []).map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+            searchableKeys={["name", "type", "category"]}
+            columns={[
+              { key: "rowNo", label: tt("colId") },
+              { key: "name", label: tt("promoColName") },
+              { key: "type", label: tt("promoColType") },
+              { key: "category", label: tt("repColCategory"), render: (v) => v || "—" },
+              { key: "redemptionCount", label: tt("repPromoRedemptions") },
+              { key: "discountTotal", label: tt("repPromoDiscountTotal"), render: (v) => `৳${Number(v || 0).toFixed(2)}` },
+            ]}
+          />
+          <div className="page-card" style={{ marginBottom: "12px" }}>
+            <h4 style={{ marginTop: 0 }}>{tt("repMarginErosionTitle")}</h4>
+            <p className="text-muted" style={{ marginTop: 0, fontSize: 13 }}>
+              {tt("repMarginErosionHelp")}
+            </p>
+            <div className="quick-stats" style={{ marginBottom: 10 }}>
+              <div className="stat">{tt("repMarginErosionBelowTarget")}: {Number(categoryMarginErosion.summary?.belowTargetCount || 0)}</div>
+              <div className="stat">{tt("repMarginErosionAlerts")}: {Number(categoryMarginErosion.summary?.alertCount || 0)}</div>
+              <div className="stat">{tt("repMarginErosionWorstGap")}: {Number(categoryMarginErosion.summary?.worstGapPct || 0).toFixed(1)}%</div>
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10, alignItems: "center" }}>
+              <button
+                type="button"
+                className={`btn-secondary btn-sm ${marginErosionFilterOnly ? "pos-tab-active" : ""}`}
+                onClick={() => setMarginErosionFilterOnly((v) => !v)}
+              >
+                {marginErosionFilterOnly ? tt("repMarginErosionShowAll") : tt("repMarginErosionFilterOnly")}
+              </button>
+              <button type="button" className="btn-secondary btn-sm" onClick={() => exportCategoryMarginErosion("csv")}>
+                {tt("repBtnMarginErosionCsv")}
+              </button>
+              <button type="button" className="btn-secondary btn-sm" onClick={() => exportCategoryMarginErosion("pdf")}>
+                {tt("repBtnMarginErosionPdf")}
+              </button>
+            </div>
+            <DataTable
+              title=""
+              rows={categoryMarginErosionRows.map((row, idx) => ({ rowNo: idx + 1, ...row }))}
+              searchableKeys={["category", "department"]}
+              allowExport={false}
+              columns={[
+                { key: "rowNo", label: tt("colId") },
+                { key: "category", label: tt("prodLblCategory") },
+                {
+                  key: "department",
+                  label: tt("repColDepartment"),
+                  render: (v) => {
+                    const dept = RETAIL_DEPARTMENTS.find((d) => d.id === v);
+                    return dept ? tt(dept.labelKey) : v || "—";
+                  },
+                },
+                { key: "soldQty", label: tt("invColSoldQty"), render: (v) => Number(v || 0).toFixed(2) },
+                { key: "realizedMarginPct", label: tt("repMarginRealizedPct"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+                { key: "minMarginPct", label: tt("repMarginMinTarget"), render: (v) => `${Number(v || 0).toFixed(2)}%` },
+                {
+                  key: "gapPct",
+                  label: tt("repMarginGapPct"),
+                  render: (v) => (
+                    <span style={{ color: Number(v || 0) < 0 ? "#b91c1c" : "#166534", fontWeight: 600 }}>
+                      {Number(v || 0).toFixed(2)}%
+                    </span>
+                  ),
+                },
+                {
+                  key: "belowTarget",
+                  label: tt("repMarginBelowTarget"),
+                  render: (v) =>
+                    v ? (
+                      <span className="badge badge-danger">{tt("repMarginAlertYes")}</span>
+                    ) : (
+                      <span className="badge badge-success">{tt("repMarginAlertNo")}</span>
+                    ),
+                },
+                {
+                  key: "costErosion",
+                  label: tt("repMarginCostErosion"),
+                  render: (v) =>
+                    v ? (
+                      <span className="badge badge-danger">{tt("repMarginAlertYes")}</span>
+                    ) : (
+                      <span className="badge badge-success">{tt("repMarginAlertNo")}</span>
+                    ),
+                },
+              ]}
+            />
           </div>
           <DataTable
             title={tt("repMarginCategoryTitle")}

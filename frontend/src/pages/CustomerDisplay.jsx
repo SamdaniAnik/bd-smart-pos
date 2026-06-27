@@ -5,6 +5,9 @@ import {
   readCustomerDisplayState,
   subscribeCustomerDisplay,
 } from "../services/customerDisplay";
+import { formatSaleLineQtyDisplay } from "../utils/formatSaleLineQty";
+import { t as i18nT } from "../i18n";
+import QrCodeImage from "../components/QrCodeImage";
 
 const DEFAULT_STORE = {
   name: "BD Smart POS",
@@ -17,6 +20,7 @@ const EMPTY_TOTALS = {
   subTotal: 0,
   vatAmount: 0,
   totalDiscount: 0,
+  promoSavings: 0,
   total: 0,
   paid: 0,
   due: 0,
@@ -309,6 +313,7 @@ function CustomerDisplay() {
   const store = { ...DEFAULT_STORE, ...(state?.store || {}) };
   const customer = state?.customer || null;
   const paymentMethod = state?.paymentMethod || "Cash";
+  const mfsQr = state?.mfsQr || null;
   const completedAt = state?.completedAt || null;
 
   const isLive = lastSeenAt && now.getTime() - lastSeenAt < 30_000;
@@ -328,6 +333,7 @@ function CustomerDisplay() {
         subTotal: "সাবটোটাল",
         vat: "ভ্যাট",
         discount: "ডিসকাউন্ট",
+        promoSavings: "আপনি সাশ্রয়",
         total: "সর্বমোট",
         paid: "পরিশোধিত",
         due: "বাকি",
@@ -337,6 +343,8 @@ function CustomerDisplay() {
         customer: "কাস্টমার",
         live: "লাইভ",
         offline: "সংযোগ বিচ্ছিন্ন",
+        scanQr: "স্ক্যান করে পেমেন্ট করুন",
+        scanQrHint: "bKash / Nagad / Rocket / Upay খুলে QR স্ক্যান করুন",
       }
     : {
         welcome: "Welcome",
@@ -347,6 +355,7 @@ function CustomerDisplay() {
         subTotal: "Sub Total",
         vat: "VAT",
         discount: "Discount",
+        promoSavings: "You save",
         total: "Total",
         paid: "Paid",
         due: "Due",
@@ -356,6 +365,8 @@ function CustomerDisplay() {
         customer: "Customer",
         live: "Live",
         offline: "Disconnected",
+        scanQr: "Scan to pay",
+        scanQrHint: "Open bKash / Nagad / Rocket / Upay and scan",
       };
 
   const showThankYou =
@@ -429,9 +440,15 @@ function CustomerDisplay() {
                   ...(idx % 2 === 1 ? STYLES.itemRowAlt : {}),
                   ...(isNewest ? STYLES.itemRowFresh : {}),
                 };
-                const qtyText = line.sellByWeight
-                  ? `${Number(line.weightKg || 0).toFixed(3)} kg`
-                  : `× ${Number(line.qty || 0)}`;
+                const qtyText = formatSaleLineQtyDisplay(
+                  {
+                    qty: line.qty,
+                    weightKg: line.weightKg,
+                    saleUnit: line.saleUnit,
+                    sellByWeight: line.sellByWeight,
+                  },
+                  (key, params) => i18nT(lang, key, params)
+                );
                 return (
                   <div
                     key={line.lineId || `${line.id}-${idx}`}
@@ -473,7 +490,22 @@ function CustomerDisplay() {
               {formatCurrency(totals.vatAmount, lang)}
             </span>
           </div>
-          {totals.totalDiscount > 0 ? (
+          {Number(totals.promoSavings || 0) > 0 ? (
+            <div style={STYLES.totalsRow}>
+              <span style={STYLES.totalsLabel}>{text.promoSavings}</span>
+              <span style={{ ...STYLES.totalsValue, color: "#86efac" }}>
+                − {formatCurrency(totals.promoSavings, lang)}
+              </span>
+            </div>
+          ) : null}
+          {totals.totalDiscount > Number(totals.promoSavings || 0) ? (
+            <div style={STYLES.totalsRow}>
+              <span style={STYLES.totalsLabel}>{text.discount}</span>
+              <span style={{ ...STYLES.totalsValue, color: "#fca5a5" }}>
+                − {formatCurrency(Math.max(0, totals.totalDiscount - Number(totals.promoSavings || 0)), lang)}
+              </span>
+            </div>
+          ) : totals.totalDiscount > 0 && Number(totals.promoSavings || 0) <= 0 ? (
             <div style={STYLES.totalsRow}>
               <span style={STYLES.totalsLabel}>{text.discount}</span>
               <span style={{ ...STYLES.totalsValue, color: "#fca5a5" }}>
@@ -505,6 +537,36 @@ function CustomerDisplay() {
               <div style={STYLES.totalsLabel}>{text.customer}</div>
               <div style={{ ...STYLES.totalsValue, marginTop: 4 }}>
                 {[customer.name, customer.phone].filter(Boolean).join(" · ")}
+              </div>
+            </div>
+          ) : null}
+          {Array.isArray(state?.appliedPromos) && state.appliedPromos.length > 0 ? (
+            <div style={{ fontSize: 12, color: "rgba(255,255,255,0.72)", lineHeight: 1.5 }}>
+              {state.appliedPromos.map((p) => (
+                <div key={p.name}>
+                  {p.name}: −{formatCurrency(p.amount, lang)}
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {mfsQr?.qrPayload ? (
+            <div
+              style={{
+                ...STYLES.customerCard,
+                textAlign: "center",
+                padding: 18,
+              }}
+            >
+              <div style={{ ...STYLES.totalsLabel, marginBottom: 8 }}>{text.scanQr}</div>
+              <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}>
+                <QrCodeImage value={mfsQr.qrPayload} size={220} alt={text.scanQr} />
+              </div>
+              <div style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 600 }}>
+                {mfsQr.method || paymentMethod} · {formatCurrency(mfsQr.amount ?? totals.total, lang)}
+              </div>
+              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.55)", marginTop: 6 }}>
+                {text.scanQrHint}
               </div>
             </div>
           ) : null}

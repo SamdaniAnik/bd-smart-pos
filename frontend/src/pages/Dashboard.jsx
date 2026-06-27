@@ -1,8 +1,40 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import { getLang, t } from "../i18n";
+import { getBillingUnitsForSaleLine, formatSaleLineQtyDisplay } from "../utils/formatSaleLineQty";
 import { formatBDT, formatBdNumber, toBanglaDigits } from "../utils/currency";
 import { getStoredPermissions, hasAnyPermission, hasPermission } from "../utils/permissions";
+
+const toInputDate = (date) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+};
+
+const EMPTY_INSIGHTS = {
+  bakirKhata: {
+    customersWithDue: 0,
+    totalReceivable: 0,
+    creditSalesToday: { count: 0, amount: 0 },
+    ledgerCreditToday: { count: 0, amount: 0 },
+    collectionsToday: { count: 0, amount: 0 },
+    topDebtors: [],
+  },
+  warranty: { open: 0, approved: 0, todayNew: 0 },
+  orders: { pending: 0, pendingValue: 0, webStorefrontPending: 0, todayCount: 0 },
+  loyalty: { activeCards: 0, customersWithPoints: 0, totalPoints: 0 },
+  compliance: {
+    kycProducts: 0,
+    customersWithoutKyc: 0,
+    kycCreditSalesToday: 0,
+    efdSubmittedToday: 0,
+    efdPendingToday: 0,
+  },
+  courier: { activeShipments: 0 },
+  restaurant: { openKitchenTickets: 0 },
+  manufacturing: { productionOrdersToday: 0 },
+};
 
 function Dashboard() {
   const [data, setData] = useState({ sales: 0, collections: 0, purchase: 0, stockAlerts: 0 });
@@ -23,17 +55,59 @@ function Dashboard() {
   const [aging, setAging] = useState({ customers: [], suppliers: [] });
   const [stockValuation, setStockValuation] = useState({ totalValue: 0, rows: [] });
   const [lowStock, setLowStock] = useState({ rows: [], summary: { totalTracked: 0, outOfStock: 0, lowStock: 0 } });
+  const [expiryAlerts, setExpiryAlerts] = useState({
+    summary: { nearExpiryCount: 0, expiredCount: 0 },
+    rows: [],
+  });
   const [recentSales, setRecentSales] = useState([]);
   const [hqBranchSummary, setHqBranchSummary] = useState(null);
+  const [marginErosionAlerts, setMarginErosionAlerts] = useState({
+    summary: { belowTargetCount: 0, alertCount: 0, worstGapPct: 0 },
+  });
+  const [topupToday, setTopupToday] = useState({ commissionTotal: 0, count: 0 });
+  const [insights, setInsights] = useState(EMPTY_INSIGHTS);
   const [loading, setLoading] = useState(true);
   const [uiLang, setUiLang] = useState(() => getLang());
+
+  useEffect(() => {
+    if (!hasAnyPermission(["topup.view", "topup.create"], getStoredPermissions())) return;
+    let cancelled = false;
+    api
+      .get("/topup/summary")
+      .then((r) => {
+        if (!cancelled) setTopupToday(r.data?.today || { commissionTotal: 0, count: 0 });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const canMultiBranch = hasAnyPermission(["rbac.manage", "branch.manage"], getStoredPermissions());
+      const canReports = hasPermission("report.view", getStoredPermissions());
+      const canSaleView = hasPermission("sale.view", getStoredPermissions());
+      const insightsPromise = api
+        .get("/reports/dashboard/insights")
+        .then((r) => r.data)
+        .catch(() => EMPTY_INSIGHTS);
       const hqPromise = canMultiBranch
         ? api.get("/reports/hq-branch-summary").then((r) => r.data).catch(() => null)
+        : Promise.resolve(null);
+      const erosionTo = new Date();
+      const erosionFrom = new Date();
+      erosionFrom.setDate(erosionFrom.getDate() - 29);
+      const erosionQuery = new URLSearchParams({
+        from: toInputDate(erosionFrom),
+        to: toInputDate(erosionTo),
+      });
+      const marginErosionPromise = canReports
+        ? api
+            .get(`/reports/category-margin-erosion?${erosionQuery.toString()}`)
+            .then((r) => r.data)
+            .catch(() => null)
         : Promise.resolve(null);
 
       const [
@@ -44,20 +118,30 @@ function Dashboard() {
         agingRes,
         stockRes,
         lowStockRes,
+        expiryAlertsRes,
         recentSalesRes,
         hqRes,
+        marginErosionRes,
+        insightsRes,
       ] = await Promise.all([
-        api.get("/reports/dashboard"),
-        api.get("/reports/dashboard/trends"),
-        api.get("/sales/quotes/reminders/summary"),
-        api.get("/sales/summary/settlement-today"),
-        api.get("/reports/aging"),
-        api.get("/reports/stock-valuation"),
-        api.get("/inventory/alerts/low-stock?onlyCritical=true"),
-        api.get("/sales/recent"),
+        canReports ? api.get("/reports/dashboard") : Promise.resolve({ data: { sales: 0, collections: 0, purchase: 0, stockAlerts: 0 } }),
+        canReports ? api.get("/reports/dashboard/trends") : Promise.resolve({ data: null }),
+        canSaleView ? api.get("/sales/quotes/reminders/summary") : Promise.resolve({ data: { overdue: 0, today: 0, tomorrow: 0, upcoming: 0 } }),
+        canSaleView ? api.get("/sales/summary/settlement-today") : Promise.resolve({ data: null }),
+        canReports ? api.get("/reports/aging") : Promise.resolve({ data: { customers: [], suppliers: [] } }),
+        canReports ? api.get("/reports/stock-valuation") : Promise.resolve({ data: { totalValue: 0, rows: [] } }),
+        hasPermission("inventory.view", getStoredPermissions())
+          ? api.get("/inventory/alerts/low-stock?onlyCritical=true")
+          : Promise.resolve({ data: { rows: [], summary: { totalTracked: 0, outOfStock: 0, lowStock: 0 } } }),
+        hasPermission("inventory.view", getStoredPermissions())
+          ? api.get("/inventory/batches/alerts?days=14")
+          : Promise.resolve({ data: { summary: { nearExpiryCount: 0, expiredCount: 0 }, rows: [] } }),
+        canSaleView ? api.get("/sales/recent") : Promise.resolve({ data: [] }),
         hqPromise,
+        marginErosionPromise,
+        insightsPromise,
       ]);
-      setData(dashboardRes.data);
+      setData(dashboardRes.data || { sales: 0, collections: 0, purchase: 0, stockAlerts: 0 });
       setTrends(
         trendRes.data || {
           sales: { diff: 0, pct: 0 },
@@ -81,8 +165,20 @@ function Dashboard() {
       setLowStock(
         lowStockRes.data || { rows: [], summary: { totalTracked: 0, outOfStock: 0, lowStock: 0 } }
       );
+      setExpiryAlerts(
+        expiryAlertsRes.data || {
+          summary: { nearExpiryCount: 0, expiredCount: 0 },
+          rows: [],
+        }
+      );
       setRecentSales((recentSalesRes.data || []).slice(0, 8));
       setHqBranchSummary(hqRes && Array.isArray(hqRes.branches) ? hqRes : null);
+      setMarginErosionAlerts(
+        marginErosionRes || {
+          summary: { belowTargetCount: 0, alertCount: 0, worstGapPct: 0 },
+        }
+      );
+      setInsights({ ...EMPTY_INSIGHTS, ...insightsRes });
     } finally {
       setLoading(false);
     }
@@ -136,7 +232,41 @@ function Dashboard() {
         ok: () => hasPermission("sale.create", p) || hasPermission("sale.view", p),
       },
       { view: "purchases", label: tt("purchases"), hint: tt("dashQaPurchasesHint"), icon: "🧾", ok: () => hasPermission("purchase.view", p) },
-      { view: "dueCollection", label: tt("dashQaDues"), hint: tt("dashQaDuesHint"), icon: "💳", ok: () => hasPermission("report.view", p) },
+      {
+        view: "dueCollection",
+        label: tt("dashQaDues"),
+        hint: tt("dashQaDuesHint"),
+        icon: "💳",
+        ok: () => hasPermission("customer.view", p) || hasPermission("supplier.view", p),
+      },
+      {
+        view: "orderInbox",
+        label: tt("orderInbox"),
+        hint: tt("dashQaOrdersHint"),
+        icon: "📲",
+        ok: () => hasPermission("sale.view", p) || hasPermission("sale.create", p),
+      },
+      {
+        view: "warranty",
+        label: tt("warranty"),
+        hint: tt("dashQaWarrantyHint"),
+        icon: "🛠️",
+        ok: () => hasPermission("customer.view", p),
+      },
+      {
+        view: "loyalty",
+        label: tt("loyalty"),
+        hint: tt("dashQaLoyaltyHint"),
+        icon: "🎁",
+        ok: () => hasPermission("customer.view", p),
+      },
+      {
+        view: "topup",
+        label: tt("topup"),
+        hint: tt("dashQaTopupHint"),
+        icon: "📱",
+        ok: () => hasPermission("topup.view", p) || hasPermission("topup.create", p),
+      },
       { view: "reports", label: tt("reports"), hint: tt("dashQaReportsHint"), icon: "📈", ok: () => hasPermission("report.view", p) },
       { view: "giftCards", label: tt("dashQaWallets"), hint: tt("dashQaGiftHint"), icon: "🎫", ok: () => hasPermission("customer.view", p) },
       { view: "inventory", label: tt("dashQaStock"), hint: tt("dashQaStockHint"), icon: "📦", ok: () => hasPermission("inventory.view", p) },
@@ -145,8 +275,16 @@ function Dashboard() {
     return items.filter((x) => x.ok());
   }, [tt]);
 
-  const navigate = (view) => {
-    window.dispatchEvent(new CustomEvent("bd_pos_navigate", { detail: { view } }));
+  const navigate = (view, extra = {}) => {
+    window.dispatchEvent(new CustomEvent("bd_pos_navigate", { detail: { view, ...extra } }));
+  };
+
+  const goExpiryBatches = () => {
+    navigate("inventory", { inventoryTab: "batches", batchExpiryFilter: "alert" });
+  };
+
+  const goMarginErosion = () => {
+    navigate("reports", { reportsTab: "margin", marginErosionOnly: true });
   };
 
   const openQuoteReminders = (filter) => {
@@ -182,6 +320,7 @@ function Dashboard() {
       { key: "bkash", labelKey: "dashMethodBkash" },
       { key: "nagad", labelKey: "dashMethodNagad" },
       { key: "rocket", labelKey: "dashMethodRocket" },
+      { key: "upay", labelKey: "dashMethodUpay" },
       { key: "card", labelKey: "dashMethodCard" },
       { key: "wallet", labelKey: "dashMethodWallet" },
       { key: "gift", labelKey: "dashMethodGift" },
@@ -198,6 +337,7 @@ function Dashboard() {
       else if (lower.includes("bkash")) totalsByKey.set("bkash", totalsByKey.get("bkash") + amount);
       else if (lower.includes("nagad")) totalsByKey.set("nagad", totalsByKey.get("nagad") + amount);
       else if (lower.includes("rocket")) totalsByKey.set("rocket", totalsByKey.get("rocket") + amount);
+      else if (lower.includes("upay")) totalsByKey.set("upay", totalsByKey.get("upay") + amount);
       else if (lower.includes("card")) totalsByKey.set("card", totalsByKey.get("card") + amount);
       else if (lower.includes("wallet")) totalsByKey.set("wallet", totalsByKey.get("wallet") + amount);
       else if (lower.includes("gift")) totalsByKey.set("gift", totalsByKey.get("gift") + amount);
@@ -221,6 +361,7 @@ function Dashboard() {
     if (key === "bkash" || key.includes("bkash")) return { border: "#f9a8d4", bg: "#fdf2f8", label: "#9d174d", value: "#9d174d", emoji: "📱" };
     if (key === "nagad" || key.includes("nagad")) return { border: "#fdba74", bg: "#fff7ed", label: "#9a3412", value: "#9a3412", emoji: "📲" };
     if (key === "rocket" || key.includes("rocket")) return { border: "#bfdbfe", bg: "#eff6ff", label: "#1d4ed8", value: "#1d4ed8", emoji: "🚀" };
+    if (key === "upay" || key.includes("upay")) return { border: "#fde68a", bg: "#fffbeb", label: "#92400e", value: "#92400e", emoji: "📳" };
     if (key === "card" || key.includes("card")) return { border: "#c7d2fe", bg: "#eef2ff", label: "#4338ca", value: "#4338ca", emoji: "💳" };
     if (key === "wallet" || key.includes("wallet")) return { border: "#ddd6fe", bg: "#f5f3ff", label: "#6d28d9", value: "#6d28d9", emoji: "👛" };
     if (key === "gift" || key.includes("gift")) return { border: "#fecaca", bg: "#fef2f2", label: "#991b1b", value: "#991b1b", emoji: "🎁" };
@@ -233,11 +374,15 @@ function Dashboard() {
       for (const item of sale.items || []) {
         const key = Number(item.productId);
         if (!productMap.has(key)) {
-          productMap.set(key, { productId: key, qty: 0, amount: 0 });
+          productMap.set(key, { productId: key, qty: 0, amount: 0, saleUnit: null, sellByWeight: false });
         }
         const row = productMap.get(key);
-        row.qty += Number(item.qty || 0);
-        row.amount += Number(item.qty || 0) * Number(item.price || 0);
+        const bill = getBillingUnitsForSaleLine(item);
+        row.qty += bill;
+        row.amount += bill * Number(item.price || 0);
+        row.saleUnit = item.saleUnit || item.product?.saleUnit || row.saleUnit;
+        row.sellByWeight =
+          Boolean(item.weightKg > 1e-9) || Boolean(item.product?.sellByWeight) || row.sellByWeight;
       }
     }
     const nameByProduct = new Map(
@@ -355,6 +500,16 @@ function Dashboard() {
                     <span className="dashboard-hq-stat-label">{tt("dashPurchShort")}</span>
                     <span className="dashboard-hq-stat-value">{fmt(b.purchasesToday)}</span>
                   </div>
+                  <div>
+                    <span className="dashboard-hq-stat-label">{tt("dashGroceryRevenueShort")}</span>
+                    <span className="dashboard-hq-stat-value">{fmt(b.groceryRevenueToday || 0)}</span>
+                  </div>
+                  <div>
+                    <span className="dashboard-hq-stat-label">{tt("dashGroceryMarginShort")}</span>
+                    <span className="dashboard-hq-stat-value">
+                      {localizeDigits(Number(b.groceryMarginPctToday || 0).toFixed(1))}%
+                    </span>
+                  </div>
                 </div>
               </div>
             ))}
@@ -383,6 +538,20 @@ function Dashboard() {
             {renderTrend(trends.collections, { isCurrency: true })}
           </div>
         </article>
+        {hasAnyPermission(["topup.view", "topup.create"], getStoredPermissions()) ? (
+          <article className="dashboard-metric dashboard-metric--collections">
+            <div className="dashboard-metric-icon" aria-hidden>
+              📱
+            </div>
+            <div className="dashboard-metric-body">
+              <div className="dashboard-metric-label">{tt("topupTodayCommission")}</div>
+              <div className="dashboard-metric-value">{fmt(topupToday.commissionTotal || 0)}</div>
+              <div className="text-muted" style={{ fontSize: 12 }}>
+                {localizeDigits(String(topupToday.count || 0))} · {tt("topup")}
+              </div>
+            </div>
+          </article>
+        ) : null}
         <article className="dashboard-metric dashboard-metric--purchase">
           <div className="dashboard-metric-icon" aria-hidden>
             🧾
@@ -403,6 +572,125 @@ function Dashboard() {
             {renderTrend(trends.lowStock, { invert: true, isCurrency: false })}
           </div>
         </article>
+        <button
+          type="button"
+          className="dashboard-metric dashboard-metric--stock dashboard-metric--clickable"
+          onClick={goExpiryBatches}
+          title={tt("dashExpiryDrillHint")}
+        >
+          <div className="dashboard-metric-icon" aria-hidden>
+            📅
+          </div>
+          <div className="dashboard-metric-body">
+            <div className="dashboard-metric-label">{tt("dashMetricExpiry")}</div>
+            <div className="dashboard-metric-value">
+              {(expiryAlerts.summary?.nearExpiryCount || 0) + (expiryAlerts.summary?.expiredCount || 0)}
+            </div>
+            <div className="text-muted" style={{ fontSize: 12 }}>
+              {tt("dashExpirySub", {
+                near: expiryAlerts.summary?.nearExpiryCount || 0,
+                expired: expiryAlerts.summary?.expiredCount || 0,
+              })}
+            </div>
+          </div>
+        </button>
+        {hasPermission("report.view", getStoredPermissions()) ? (
+          <button
+            type="button"
+            className="dashboard-metric dashboard-metric--stock dashboard-metric--clickable"
+            onClick={goMarginErosion}
+            title={tt("dashMarginErosionHint")}
+          >
+            <div className="dashboard-metric-icon" aria-hidden>
+              📉
+            </div>
+            <div className="dashboard-metric-body">
+              <div className="dashboard-metric-label">{tt("dashMetricMarginErosion")}</div>
+              <div className="dashboard-metric-value">
+                {marginErosionAlerts.summary?.belowTargetCount || 0}
+              </div>
+              <div className="text-muted" style={{ fontSize: 12 }}>
+                {tt("dashMarginErosionSub", {
+                  alerts: marginErosionAlerts.summary?.alertCount || 0,
+                  gap: Number(marginErosionAlerts.summary?.worstGapPct || 0).toFixed(1),
+                })}
+              </div>
+            </div>
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="dashboard-metric dashboard-metric--collections dashboard-metric--clickable"
+          onClick={() => navigate("dueCollection")}
+          title={tt("dashOpsBakirTitle")}
+        >
+          <div className="dashboard-metric-icon" aria-hidden>
+            📒
+          </div>
+          <div className="dashboard-metric-body">
+            <div className="dashboard-metric-label">{tt("dashMetricBakir")}</div>
+            <div className="dashboard-metric-value">{fmt(insights.bakirKhata?.totalReceivable || 0)}</div>
+            <div className="text-muted" style={{ fontSize: 12 }}>
+              {tt("dashOpsBakirSub", {
+                n: insights.bakirKhata?.customersWithDue || 0,
+                col: insights.bakirKhata?.collectionsToday?.count || 0,
+              })}
+            </div>
+          </div>
+        </button>
+        <button
+          type="button"
+          className="dashboard-metric dashboard-metric--sales dashboard-metric--clickable"
+          onClick={() => navigate("orderInbox")}
+          title={tt("dashOpsOrdersTitle")}
+        >
+          <div className="dashboard-metric-icon" aria-hidden>
+            📲
+          </div>
+          <div className="dashboard-metric-body">
+            <div className="dashboard-metric-label">{tt("dashMetricOrders")}</div>
+            <div className="dashboard-metric-value">{fmtCount(insights.orders?.pending || 0)}</div>
+            <div className="text-muted" style={{ fontSize: 12 }}>
+              ≈ {fmt(insights.orders?.pendingValue || 0)} · {tt("dashOpsOrdersToday")}{" "}
+              {fmtCount(insights.orders?.todayCount || 0)}
+            </div>
+          </div>
+        </button>
+        <button
+          type="button"
+          className="dashboard-metric dashboard-metric--stock dashboard-metric--clickable"
+          onClick={() => navigate("warranty")}
+          title={tt("dashOpsWarrantyTitle")}
+        >
+          <div className="dashboard-metric-icon" aria-hidden>
+            🛠️
+          </div>
+          <div className="dashboard-metric-body">
+            <div className="dashboard-metric-label">{tt("dashMetricWarranty")}</div>
+            <div className="dashboard-metric-value">{fmtCount(insights.warranty?.open || 0)}</div>
+            <div className="text-muted" style={{ fontSize: 12 }}>
+              {tt("dashOpsWarrantyApproved")} {fmtCount(insights.warranty?.approved || 0)} · +{fmtCount(insights.warranty?.todayNew || 0)}{" "}
+              {tt("dashToday").toLowerCase()}
+            </div>
+          </div>
+        </button>
+        <button
+          type="button"
+          className="dashboard-metric dashboard-metric--purchase dashboard-metric--clickable"
+          onClick={() => navigate("loyalty")}
+          title={tt("dashOpsLoyaltyTitle")}
+        >
+          <div className="dashboard-metric-icon" aria-hidden>
+            🎁
+          </div>
+          <div className="dashboard-metric-body">
+            <div className="dashboard-metric-label">{tt("dashMetricLoyaltyCards")}</div>
+            <div className="dashboard-metric-value">{fmtCount(insights.loyalty?.activeCards || 0)}</div>
+            <div className="text-muted" style={{ fontSize: 12 }}>
+              {fmtCount(insights.loyalty?.totalPoints || 0)} {tt("loyaltyCardPoints").toLowerCase()}
+            </div>
+          </div>
+        </button>
       </div>
 
       <div className="dashboard-pills">
@@ -419,6 +707,157 @@ function Dashboard() {
           <span className="dashboard-pill-value">{fmt(stockValuation.totalValue || 0)}</span>
         </div>
       </div>
+
+      <section className="dashboard-pay-section">
+        <div className="dashboard-section-head">
+          <h2 className="dashboard-section-title">{tt("dashOpsTitle")}</h2>
+          <p className="dashboard-section-sub">{tt("dashOpsSub")}</p>
+        </div>
+        <div className="dashboard-insight-grid">
+          <article className="dashboard-insight dashboard-insight--followups">
+            <div className="dashboard-insight-head">
+              <span className="dashboard-insight-emoji" aria-hidden>
+                📒
+              </span>
+              <h3 className="dashboard-insight-title">{tt("dashOpsBakirTitle")}</h3>
+            </div>
+            <ul className="dashboard-insight-list dashboard-insight-list--compact">
+              <li>
+                <span>{tt("dashReceivable")}</span> <strong>{fmt(insights.bakirKhata?.totalReceivable || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsCreditToday")}</span>{" "}
+                <strong>
+                  {fmt(insights.bakirKhata?.creditSalesToday?.amount || 0)} ({fmtCount(insights.bakirKhata?.creditSalesToday?.count || 0)})
+                </strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsLedgerToday")}</span>{" "}
+                <strong>{fmtCount(insights.bakirKhata?.collectionsToday?.count || 0)}</strong> ·{" "}
+                {fmt(insights.bakirKhata?.collectionsToday?.amount || 0)}
+              </li>
+            </ul>
+            {(insights.bakirKhata?.topDebtors || []).length ? (
+              <ul className="dashboard-detail-list" style={{ marginTop: 8 }}>
+                {(insights.bakirKhata.topDebtors || []).slice(0, 3).map((c) => (
+                  <li key={c.id}>
+                    <span className="dashboard-detail-name">{c.name}</span>
+                    <span className="dashboard-detail-meta">{fmt(c.balance || 0)}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-muted" style={{ fontSize: 12, marginTop: 8 }}>
+                {tt("dashOpsNoDebtors")}
+              </p>
+            )}
+            <div className="dashboard-insight-actions">
+              <button type="button" className="btn-secondary btn-sm" onClick={() => navigate("dueCollection")}>
+                {tt("dueCollection")}
+              </button>
+            </div>
+          </article>
+
+          <article className="dashboard-insight dashboard-insight--cashflow">
+            <div className="dashboard-insight-head">
+              <span className="dashboard-insight-emoji" aria-hidden>
+                📲
+              </span>
+              <h3 className="dashboard-insight-title">{tt("dashOpsOrdersTitle")}</h3>
+            </div>
+            <ul className="dashboard-insight-list dashboard-insight-list--compact">
+              <li>
+                <span>{tt("dashOpsOrdersPending")}</span>{" "}
+                <strong>
+                  {fmtCount(insights.orders?.pending || 0)} · {fmt(insights.orders?.pendingValue || 0)}
+                </strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsOrdersWeb")}</span> <strong>{fmtCount(insights.orders?.webStorefrontPending || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsOrdersToday")}</span> <strong>{fmtCount(insights.orders?.todayCount || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsCourierActive")}</span> <strong>{fmtCount(insights.courier?.activeShipments || 0)}</strong>
+              </li>
+            </ul>
+            <div className="dashboard-insight-actions">
+              <button type="button" className="btn-secondary btn-sm" onClick={() => navigate("orderInbox")}>
+                {tt("orderInbox")}
+              </button>
+            </div>
+          </article>
+
+          <article className="dashboard-insight dashboard-insight--health">
+            <div className="dashboard-insight-head">
+              <span className="dashboard-insight-emoji" aria-hidden>
+                🛡️
+              </span>
+              <h3 className="dashboard-insight-title">{tt("dashOpsLoyaltyTitle")}</h3>
+            </div>
+            <ul className="dashboard-insight-list dashboard-insight-list--compact">
+              <li>
+                <span>{tt("dashOpsLoyaltyCards")}</span> <strong>{fmtCount(insights.loyalty?.activeCards || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsLoyaltyPoints")}</span> <strong>{fmtCount(insights.loyalty?.totalPoints || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsKycProducts")}</span> <strong>{fmtCount(insights.compliance?.kycProducts || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsKycCustomers")}</span> <strong>{fmtCount(insights.compliance?.customersWithoutKyc || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsKycSalesToday")}</span> <strong>{fmtCount(insights.compliance?.kycCreditSalesToday || 0)}</strong>
+              </li>
+            </ul>
+            <div className="dashboard-insight-actions">
+              <button type="button" className="btn-secondary btn-sm" onClick={() => navigate("customers")}>
+                {tt("customers")}
+              </button>
+              <button type="button" className="btn-secondary btn-sm" onClick={() => navigate("warranty")}>
+                {tt("warranty")}
+              </button>
+            </div>
+          </article>
+
+          <article className="dashboard-insight dashboard-insight--followups">
+            <div className="dashboard-insight-head">
+              <span className="dashboard-insight-emoji" aria-hidden>
+                🧾
+              </span>
+              <h3 className="dashboard-insight-title">{tt("dashOpsEfdTitle")}</h3>
+            </div>
+            <ul className="dashboard-insight-list dashboard-insight-list--compact">
+              <li>
+                <span>{tt("dashOpsWarrantyOpen")}</span> <strong>{fmtCount(insights.warranty?.open || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsEfdSubmitted")}</span> <strong>{fmtCount(insights.compliance?.efdSubmittedToday || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsEfdPending")}</span> <strong>{fmtCount(insights.compliance?.efdPendingToday || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsRestaurantKot")}</span> <strong>{fmtCount(insights.restaurant?.openKitchenTickets || 0)}</strong>
+              </li>
+              <li>
+                <span>{tt("dashOpsProductionToday")}</span> <strong>{fmtCount(insights.manufacturing?.productionOrdersToday || 0)}</strong>
+              </li>
+            </ul>
+            <div className="dashboard-insight-actions">
+              <button type="button" className="btn-secondary btn-sm" onClick={() => navigate("salesLookup")}>
+                {tt("salesLookup")}
+              </button>
+              <button type="button" className="btn-secondary btn-sm" onClick={() => navigate("settings")}>
+                {tt("settings")}
+              </button>
+            </div>
+          </article>
+        </div>
+      </section>
 
       <div className="dashboard-insight-grid">
         <article className="dashboard-insight dashboard-insight--followups">
@@ -583,7 +1022,13 @@ function Dashboard() {
                   <li key={x.productId}>
                     <span className="dashboard-detail-name">{x.name}</span>
                     <span className="dashboard-detail-meta">
-                      ×{Number(x.qty || 0)} · {fmt(x.amount || 0)}
+                      {formatSaleLineQtyDisplay(
+                        x.sellByWeight
+                          ? { weightKg: x.qty, saleUnit: x.saleUnit || "KG", sellByWeight: true }
+                          : { qty: x.qty, saleUnit: x.saleUnit || "PCS" },
+                        tt
+                      )}{" "}
+                      · {fmt(x.amount || 0)}
                     </span>
                   </li>
                 ))}

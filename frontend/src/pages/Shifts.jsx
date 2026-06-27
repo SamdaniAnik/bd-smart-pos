@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
-import { notifyActionRequired } from "../utils/notify";
+import { notifyActionRequired, notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 /** Bangladesh Taka denominations for drawer close counts */
 const BDT_DENOMINATIONS = [1000, 500, 200, 100, 50, 20, 10, 5, 2, 1];
@@ -34,6 +37,14 @@ function Shifts() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canManageShift = hasPermission("sale.create");
+
+  const requireSaleCreate = () => {
+    if (canManageShift) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "sale.create" }));
+    return false;
+  };
 
   const [currentShift, setCurrentShift] = useState(null);
   const [history, setHistory] = useState([]);
@@ -77,6 +88,7 @@ function Shifts() {
 
   const openShift = async (e) => {
     e.preventDefault();
+    if (!requireSaleCreate()) return;
     await api.post("/shifts/open", { openingCash: Number(openingCash || 0) });
     setOpeningCash("");
     load();
@@ -84,6 +96,7 @@ function Shifts() {
 
   const closeShift = async (e) => {
     e.preventDefault();
+    if (!requireSaleCreate()) return;
     const payload = denomPayload(denomCounts);
     const counted = denomTotal(denomCounts);
     const closingNum = Number(closingCash || 0);
@@ -109,6 +122,7 @@ function Shifts() {
 
   const addMovement = async (e) => {
     e.preventDefault();
+    if (!requireSaleCreate()) return;
     await api.post("/shifts/movement", {
       type: movementType,
       amount: Number(movementAmount || 0),
@@ -128,6 +142,7 @@ function Shifts() {
           <div className="page-subtitle">{tt("shSubtitle")}</div>
         </div>
       </div>
+      <PermissionBanner show={!canManageShift} code="sale.create" tt={tt} />
       {currentShift ? (
         <div className="page-card" style={{ marginBottom: 12 }}>
           <h4>{tt("shOpenShift")}</h4>
@@ -165,10 +180,16 @@ function Shifts() {
             </div>
           ) : null}
           <form onSubmit={addMovement} className="form-grid" style={{ marginBottom: 12 }}>
-            <select className="form-select-sm" value={movementType} onChange={(e) => setMovementType(e.target.value)}>
-              <option value="IN">{tt("shCashIn")}</option>
-              <option value="OUT">{tt("shCashOut")}</option>
-            </select>
+            <SearchSelect
+              className="form-select-sm"
+              value={movementType}
+              onChange={(val) => setMovementType(val || "IN")}
+              options={[
+                { value: "IN", label: tt("shCashIn") },
+                { value: "OUT", label: tt("shCashOut") },
+              ]}
+              isClearable={false}
+            />
             <input
               type="number"
               placeholder={tt("shMovementAmount")}
@@ -180,7 +201,7 @@ function Shifts() {
               value={movementReason}
               onChange={(e) => setMovementReason(e.target.value)}
             />
-            <button type="submit">{tt("shRecordMovement")}</button>
+            <button type="submit" disabled={!canManageShift}>{tt("shRecordMovement")}</button>
           </form>
           <div style={{ margin: "8px 0 12px" }}>
             <strong>{tt("shRecentMovements")}:</strong>
@@ -290,7 +311,7 @@ function Shifts() {
               value={managerApprovalPin}
               onChange={(e) => setManagerApprovalPin(e.target.value)}
             />
-            <button type="submit">{tt("shCloseShift")}</button>
+            <button type="submit" disabled={!canManageShift}>{tt("shCloseShift")}</button>
           </form>
         </div>
       ) : (
@@ -301,7 +322,7 @@ function Shifts() {
             value={openingCash}
             onChange={(e) => setOpeningCash(e.target.value)}
           />
-          <button type="submit">{tt("shOpenShiftAction")}</button>
+          <button type="submit" disabled={!canManageShift}>{tt("shOpenShiftAction")}</button>
         </form>
       )}
 

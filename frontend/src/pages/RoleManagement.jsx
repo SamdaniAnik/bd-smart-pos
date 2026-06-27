@@ -4,6 +4,13 @@ import DataTable from "../components/DataTable";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
 import { notifyPermissionRequired, notifySuccess } from "../utils/notify";
 import { getLang, t } from "../i18n";
+import {
+  APP_PAGES,
+  PAGE_GROUPS,
+  canAccessPage,
+  getRequiredPermissionCodes,
+} from "../config/pagePermissions";
+import SearchSelect from "../components/SearchSelect";
 
 function RoleManagement() {
   const permissionsForUser = getStoredPermissions();
@@ -196,6 +203,26 @@ function RoleManagement() {
       .filter((u) => u.canManageLock || u.canOverrideLock);
   }, [users, financialLockRoleRows]);
 
+  const selectedRolePermissionCodes = useMemo(() => {
+    if (!selectedRoleId) return [];
+    const idSet = new Set(selectedPermissionIds.map(Number));
+    return (permissions || [])
+      .filter((p) => idSet.has(Number(p.id)))
+      .map((p) => String(p.code || ""))
+      .filter(Boolean);
+  }, [selectedRoleId, selectedPermissionIds, permissions]);
+
+  const pageAccessRows = useMemo(() => {
+    return APP_PAGES.map((page) => ({
+      key: page.key,
+      group: page.group,
+      groupLabel: t(uiLang, PAGE_GROUPS.find((g) => g.id === page.group)?.titleKey || "navGroupDaily"),
+      label: t(uiLang, page.labelKey),
+      allowed: canAccessPage(page, selectedRolePermissionCodes, { isAuthenticated: true }),
+      required: getRequiredPermissionCodes(page),
+    }));
+  }, [selectedRolePermissionCodes, uiLang]);
+
   const getMatrixCellChecked = useCallback(
     (roleId, permissionId) => {
       const key = `${roleId}:${permissionId}`;
@@ -261,23 +288,17 @@ function RoleManagement() {
             <button type="submit" disabled={!canManageRbac}>{tt("rmCreateRoleBtn")}</button>
           </form>
           <h4 style={{ marginTop: "14px" }}>{tt("rmAssignPerms")}</h4>
-          <select
+          <SearchSelect
             className="form-select-sm"
             value={selectedRoleId}
-            onChange={(e) => {
-              const nextRoleId = e.target.value;
-              setSelectedRoleId(nextRoleId);
-              const role = roles.find((r) => String(r.id) === String(nextRoleId));
+            onChange={(val) => {
+              setSelectedRoleId(val);
+              const role = roles.find((r) => String(r.id) === String(val));
               setSelectedPermissionIds((role?.rolePermissions || []).map((rp) => rp.permissionId));
             }}
-          >
-            <option value="">{tt("rmPhSelectRole")}</option>
-            {roles.map((role) => (
-              <option key={role.id} value={role.id}>
-                {role.name}
-              </option>
-            ))}
-          </select>
+            placeholder={tt("rmPhSelectRole")}
+            options={roles.map((role) => ({ value: String(role.id), label: role.name }))}
+          />
           <div style={{ maxHeight: "280px", overflow: "auto", border: "1px solid #ddd", borderRadius: "10px", padding: "8px" }}>
             {permissions.map((permission) => (
               <label key={permission.id} style={{ display: "block", marginBottom: "6px" }}>
@@ -295,14 +316,16 @@ function RoleManagement() {
             {tt("rmSavePerms")}
           </button>
           <h4 style={{ marginTop: "14px" }}>{tt("rmApplyTemplate")}</h4>
-          <select className="form-select-sm" value={selectedTemplateName} onChange={(e) => setSelectedTemplateName(e.target.value)}>
-            <option value="">{tt("rmPhSelectTemplate")}</option>
-            {Object.keys(templates).map((templateName) => (
-              <option key={templateName} value={templateName}>
-                {templateName}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={selectedTemplateName}
+            onChange={(val) => setSelectedTemplateName(val)}
+            placeholder={tt("rmPhSelectTemplate")}
+            options={Object.keys(templates).map((templateName) => ({
+              value: templateName,
+              label: templateName,
+            }))}
+          />
           <button style={{ marginTop: "8px" }} onClick={applyTemplate} disabled={!canManageRbac}>
             {tt("rmApplyTemplateBtn")}
           </button>
@@ -318,26 +341,74 @@ function RoleManagement() {
               value={userForm.password}
               onChange={(e) => setUserForm({ ...userForm, password: e.target.value })}
             />
-            <select className="form-select-sm" value={userForm.roleId} onChange={(e) => setUserForm({ ...userForm, roleId: e.target.value })}>
-              <option value="">{tt("rmPhSelectRole")}</option>
-              {roles.map((role) => (
-                <option key={role.id} value={role.id}>
-                  {role.name}
-                </option>
-              ))}
-            </select>
-            <select className="form-select-sm" value={userForm.branchId} onChange={(e) => setUserForm({ ...userForm, branchId: e.target.value })}>
-              <option value="">{tt("rmPhSelectBranch")}</option>
-              {branches.map((branch) => (
-                <option key={branch.id} value={branch.id}>
-                  {branch.name}
-                </option>
-              ))}
-            </select>
+            <SearchSelect
+              className="form-select-sm"
+              value={userForm.roleId}
+              onChange={(val) => setUserForm({ ...userForm, roleId: val })}
+              placeholder={tt("rmPhSelectRole")}
+              options={roles.map((role) => ({ value: String(role.id), label: role.name }))}
+            />
+            <SearchSelect
+              className="form-select-sm"
+              kind="branches"
+              value={userForm.branchId}
+              onChange={(val) => setUserForm({ ...userForm, branchId: val })}
+              placeholder={tt("rmPhSelectBranch")}
+            />
             <button type="submit" disabled={!canManageRbac}>{tt("rmCreateUserBtn")}</button>
           </form>
         </div>
       </div>
+
+      {selectedRoleId ? (
+        <div className="page-card" style={{ marginTop: 14, marginBottom: 12 }}>
+          <h4 style={{ marginTop: 0 }}>{tt("rmPageAccessTitle")}</h4>
+          <p className="text-muted" style={{ marginTop: 0, fontSize: 13 }}>
+            {tt("rmPageAccessHelp")}
+          </p>
+          <div style={{ maxHeight: 360, overflow: "auto" }}>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>{tt("rmPageAccessColPage")}</th>
+                  <th>{tt("rmPageAccessColGroup")}</th>
+                  <th>{tt("rmPageAccessColAccess")}</th>
+                  <th>{tt("pageAccessDeniedRequired")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pageAccessRows.map((row) => (
+                  <tr key={row.key}>
+                    <td>
+                      {row.label}{" "}
+                      <span className="text-muted" style={{ fontSize: 11 }}>
+                        ({row.key})
+                      </span>
+                    </td>
+                    <td>{row.groupLabel}</td>
+                    <td>
+                      <span
+                        className="badge"
+                        style={{
+                          background: row.allowed ? "#dcfce7" : "#fee2e2",
+                          color: row.allowed ? "#166534" : "#991b1b",
+                          border: `1px solid ${row.allowed ? "#86efac" : "#fecaca"}`,
+                        }}
+                      >
+                        {row.allowed ? tt("rmPageAccessGranted") : tt("rmPageAccessDenied")}
+                      </span>
+                    </td>
+                    <td style={{ fontSize: 12, color: "#64748b" }}>
+                      {row.required.length ? row.required.join(" · ") : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
+
       <div className="page-card" style={{ marginTop: 14, marginBottom: 12 }}>
         <h4 style={{ marginTop: 0 }}>{tt("rmMatrixTitle")}</h4>
         <div className="form-grid" style={{ marginBottom: 8 }}>
@@ -346,13 +417,16 @@ function RoleManagement() {
             value={matrixFilter}
             onChange={(e) => setMatrixFilter(e.target.value)}
           />
-          <select className="form-select-sm" value={matrixGroup} onChange={(e) => setMatrixGroup(e.target.value)}>
-            {permissionGroups.map((group) => (
-              <option key={group} value={group}>
-                {group === "all" ? tt("rmAllModules") : group}
-              </option>
-            ))}
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={matrixGroup}
+            onChange={(val) => setMatrixGroup(val || "all")}
+            options={permissionGroups.map((group) => ({
+              value: group,
+              label: group === "all" ? tt("rmAllModules") : group,
+            }))}
+            isClearable={false}
+          />
           <button type="button" className="btn-secondary" onClick={() => setMatrixDraft({})} disabled={!Object.keys(matrixDraft).length}>
             {tt("rmResetUnsaved")}
           </button>
@@ -530,19 +604,14 @@ function RoleManagement() {
             key: "roleId",
             label: tt("rmChangeRole"),
             render: (v, row) => (
-              <select
+              <SearchSelect
                 className="form-select-sm"
-                value={v}
-                onChange={(e) => updateUserRole(row.id, e.target.value)}
-                disabled={!canManageRbac}
-                style={{ marginBottom: 0 }}
-              >
-                {roles.map((role) => (
-                  <option key={role.id} value={role.id}>
-                    {role.name}
-                  </option>
-                ))}
-              </select>
+                value={String(v)}
+                onChange={(val) => updateUserRole(row.id, val)}
+                isDisabled={!canManageRbac}
+                options={roles.map((role) => ({ value: String(role.id), label: role.name }))}
+                isClearable={false}
+              />
             ),
           },
         ]}

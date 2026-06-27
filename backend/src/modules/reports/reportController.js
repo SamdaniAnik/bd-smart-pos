@@ -1,5 +1,19 @@
 const prisma = require("../../utils/prisma");
+const {
+  sendOwnerDigestForBranch,
+  runOwnerDigestCron,
+  buildDigestMetrics,
+} = require("../../utils/ownerDigest");
 const PDFDocument = require("pdfkit");
+const { formatProductStock } = require("../../utils/saleUnitFormat");
+const { getLatestLandedCostByProduct } = require("../../utils/costingUtil");
+const { resolveCategoryDepartment, RETAIL_CATEGORY_SEEDS } = require("../../constants/retailDepartments");
+const {
+  loadBranchLoyaltyBonusMap,
+  getCategoryMultiplier,
+  pointsFromLineRevenue,
+} = require("../../utils/loyaltyAisleBonus");
+const { buildCustomerLoyaltyBalance } = require("../../utils/loyaltyPointsExpiry");
 
 function toCSV(rows) {
   if (!rows.length) return "";
@@ -101,29 +115,6 @@ function calcMarginPct(sellingPrice, unitCost) {
   return ((selling - cost) / selling) * 100;
 }
 
-async function getLatestLandedCostByProduct(branchId) {
-  const logs = await prisma.auditLog.findMany({
-    where: { action: "PURCHASE_CREATE", entity: "Purchase" },
-    orderBy: { createdAt: "desc" },
-    take: 5000,
-  });
-  const map = new Map();
-  for (const log of logs) {
-    const payload = log.payload || {};
-    if (Number(payload.branchId || 0) !== Number(branchId)) continue;
-    const lines = Array.isArray(payload?.landedCostAllocation?.lines) ? payload.landedCostAllocation.lines : [];
-    for (const line of lines) {
-      const productId = Number(line?.productId || 0);
-      if (!productId || map.has(productId)) continue;
-      map.set(productId, {
-        baseUnitCost: Number(line?.baseUnitCost || 0),
-        landedUnitCost: Number(line?.landedUnitCost || 0),
-      });
-    }
-  }
-  return map;
-}
-
 async function buildAdvancedMarginPayload(branchId, query = {}) {
   const { from, to } = parseDateRange(query || {});
   const thresholdPctRaw = Number(query.erosionThresholdPct || 5);
@@ -152,24 +143,38 @@ async function buildAdvancedMarginPayload(branchId, query = {}) {
               : {}),
           },
         },
-        select: { productId: true, qty: true, price: true },
+        select: { productId: true, qty: true, price: true, cost: true, weightKg: true },
       })
     : [];
   const salesByProduct = new Map();
   for (const row of saleItems) {
     const pid = Number(row.productId || 0);
     if (!pid) continue;
-    if (!salesByProduct.has(pid)) salesByProduct.set(pid, { qty: 0, revenue: 0 });
+    const bill =
+      Number(row.weightKg || 0) > 1e-9 ? Number(row.weightKg || 0) : Number(row.qty || 0);
+    const lineCost = Number(row.cost || 0) > 0 ? Number(row.cost) : 0;
+    if (!salesByProduct.has(pid)) {
+      salesByProduct.set(pid, { qty: 0, revenue: 0, cogs: 0, hasRecordedCost: false });
+    }
     const current = salesByProduct.get(pid);
-    current.qty += Number(row.qty || 0);
-    current.revenue += Number(row.qty || 0) * Number(row.price || 0);
+    current.qty += bill;
+    current.revenue += bill * Number(row.price || 0);
+    if (lineCost > 0) {
+      current.cogs += bill * lineCost;
+      current.hasRecordedCost = true;
+    }
     salesByProduct.set(pid, current);
   }
   const rows = products.map((p) => {
     const landedInfo = landedByProduct.get(Number(p.id)) || null;
     const baseUnitCost = Number(landedInfo?.baseUnitCost || p.unitPrice || p.price || 0);
     const landedUnitCost = Number(landedInfo?.landedUnitCost || baseUnitCost);
-    const sales = salesByProduct.get(Number(p.id)) || { qty: 0, revenue: 0 };
+    const sales = salesByProduct.get(Number(p.id)) || {
+      qty: 0,
+      revenue: 0,
+      cogs: 0,
+      hasRecordedCost: false,
+    };
     const soldQty = Number(sales.qty || 0);
     const fallbackSelling = Number(p.price || 0);
     const realizedAvgSellingPrice = soldQty > 0 ? Number(sales.revenue || 0) / soldQty : fallbackSelling;
@@ -177,7 +182,9 @@ async function buildAdvancedMarginPayload(branchId, query = {}) {
     const landedMarginPct = calcMarginPct(realizedAvgSellingPrice, landedUnitCost);
     const marginImpactPct = landedMarginPct - baseMarginPct;
     const realizedRevenue = Number(sales.revenue || 0);
-    const landedCogs = soldQty * landedUnitCost;
+    const landedCogs = sales.hasRecordedCost
+      ? Number(sales.cogs || 0)
+      : soldQty * landedUnitCost;
     const realizedGrossProfit = realizedRevenue - landedCogs;
     const realizedMarginPct = realizedRevenue > 0 ? (realizedGrossProfit / realizedRevenue) * 100 : landedMarginPct;
     return {
@@ -261,6 +268,86 @@ async function buildAdvancedMarginPayload(branchId, query = {}) {
     summary,
     categoryRows: categoryRows.sort((a, b) => Number(a.marginImpactPct || 0) - Number(b.marginImpactPct || 0)),
     rows: rows.sort((a, b) => Number(a.marginImpactPct || 0) - Number(b.marginImpactPct || 0)),
+  };
+}
+
+async function loadCategoryMinMarginMap(branchId) {
+  const seedMap = new Map(
+    RETAIL_CATEGORY_SEEDS.map((s) => [String(s.name || "").trim().toUpperCase(), Number(s.minMarginPct ?? 8)])
+  );
+  const dbMap = new Map();
+  const deptMap = new Map();
+  try {
+    const rows = await prisma.$queryRaw`
+      SELECT name, minMarginPct, department FROM ProductCategory WHERE branchId = ${branchId}
+    `;
+    for (const row of rows) {
+      const key = String(row.name || "").trim().toUpperCase();
+      if (!key) continue;
+      if (row.minMarginPct != null && Number.isFinite(Number(row.minMarginPct))) {
+        dbMap.set(key, Number(row.minMarginPct));
+      }
+      if (row.department) {
+        deptMap.set(key, String(row.department).trim().toUpperCase());
+      }
+    }
+  } catch {
+    /* column may be missing on older DB — seeds still apply */
+  }
+  return { seedMap, dbMap, deptMap };
+}
+
+function resolveMinMarginPct(categoryName, maps) {
+  const key = String(categoryName || "Uncategorized").trim().toUpperCase();
+  if (maps.dbMap.has(key)) return maps.dbMap.get(key);
+  if (maps.seedMap.has(key)) return maps.seedMap.get(key);
+  return 8;
+}
+
+async function buildCategoryMarginErosionPayload(branchId, query = {}) {
+  const marginPayload = await buildAdvancedMarginPayload(branchId, query);
+  const maps = await loadCategoryMinMarginMap(branchId);
+  const rows = (marginPayload.categoryRows || []).map((row) => {
+    const catKey = String(row.category || "Uncategorized").trim().toUpperCase();
+    const minMarginPct = resolveMinMarginPct(row.category, maps);
+    const realizedMarginPct = Number(row.realizedMarginPct || 0);
+    const soldQty = Number(row.soldQty || 0);
+    const gapPct = Number((realizedMarginPct - minMarginPct).toFixed(2));
+    const belowTarget = soldQty > 0 && realizedMarginPct < minMarginPct;
+    const costErosion = Boolean(row.erosionAlert);
+    const categoryRow = maps.deptMap.has(catKey) ? { department: maps.deptMap.get(catKey) } : null;
+    return {
+      category: row.category,
+      department: resolveCategoryDepartment(row.category, categoryRow),
+      soldQty: row.soldQty,
+      revenue: row.revenue,
+      landedCogs: row.landedCogs,
+      realizedGrossProfit: row.realizedGrossProfit,
+      marginImpactPct: row.marginImpactPct,
+      realizedMarginPct: row.realizedMarginPct,
+      minMarginPct,
+      gapPct,
+      belowTarget,
+      costErosion,
+      alert: belowTarget || costErosion,
+    };
+  });
+  const belowTargetRows = rows.filter((r) => r.belowTarget);
+  return {
+    from: marginPayload.from,
+    to: marginPayload.to,
+    erosionThresholdPct: marginPayload.erosionThresholdPct,
+    summary: {
+      categoryCount: rows.length,
+      soldCategoryCount: rows.filter((r) => Number(r.soldQty || 0) > 0).length,
+      belowTargetCount: belowTargetRows.length,
+      costErosionCount: rows.filter((r) => r.costErosion).length,
+      alertCount: rows.filter((r) => r.alert).length,
+      worstGapPct: belowTargetRows.length
+        ? Number(Math.min(...belowTargetRows.map((r) => r.gapPct)).toFixed(2))
+        : 0,
+    },
+    rows: rows.sort((a, b) => Number(a.gapPct || 0) - Number(b.gapPct || 0)),
   };
 }
 
@@ -540,6 +627,236 @@ exports.getDashboardTrends = async (req, res) => {
   }
 };
 
+function startOfToday() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function estimatePendingOrderTotal(cartJson, priceByProductId) {
+  try {
+    const lines = JSON.parse(cartJson || "[]");
+    if (!Array.isArray(lines)) return 0;
+    return lines.reduce((sum, line) => {
+      const productId = Number(line.productId || line.id);
+      const qty = Number(line.qty || 1);
+      const price =
+        line.price != null && !Number.isNaN(Number(line.price))
+          ? Number(line.price)
+          : Number(priceByProductId.get(productId) || 0);
+      return sum + Math.max(0, qty) * price;
+    }, 0);
+  } catch {
+    return 0;
+  }
+}
+
+exports.getDashboardInsights = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const startToday = startOfToday();
+
+    const [
+      customerDueAgg,
+      topDebtors,
+      creditSalesToday,
+      ledgerCreditToday,
+      ledgerCollectionToday,
+      warrantyOpen,
+      warrantyApproved,
+      warrantyToday,
+      pendingOrders,
+      ordersToday,
+      loyaltyCards,
+      loyaltyCardHolders,
+      kycProductCount,
+      customersNoKyc,
+      efdToday,
+      courierActive,
+      openKots,
+      productionToday,
+      requiresKycSalesToday,
+    ] = await Promise.all([
+      prisma.customer.aggregate({
+        where: { branchId, balance: { gt: 0 } },
+        _sum: { balance: true },
+        _count: { id: true },
+      }),
+      prisma.customer.findMany({
+        where: { branchId, balance: { gt: 0 } },
+        orderBy: { balance: "desc" },
+        take: 5,
+        select: { id: true, name: true, phone: true, balance: true },
+      }),
+      prisma.sale.aggregate({
+        where: { branchId, createdAt: { gte: startToday }, dueAmount: { gt: 0 } },
+        _sum: { dueAmount: true, total: true },
+        _count: { id: true },
+      }),
+      prisma.customerCreditLedger.aggregate({
+        where: { branchId, createdAt: { gte: startToday }, entryType: "SALE_CREDIT" },
+        _sum: { amount: true },
+        _count: { id: true },
+      }),
+      prisma.customerCreditLedger.aggregate({
+        where: { branchId, createdAt: { gte: startToday }, entryType: "COLLECTION" },
+        _sum: { amount: true },
+        _count: { id: true },
+      }),
+      prisma.warrantyClaim.count({ where: { branchId, status: "OPEN" } }),
+      prisma.warrantyClaim.count({ where: { branchId, status: "APPROVED" } }),
+      prisma.warrantyClaim.count({ where: { branchId, createdAt: { gte: startToday } } }),
+      prisma.pendingOrder.findMany({
+        where: { branchId, status: "PENDING" },
+        select: { id: true, source: true, cartJson: true, deliveryFee: true, createdAt: true },
+        orderBy: { createdAt: "desc" },
+        take: 100,
+      }),
+      prisma.pendingOrder.count({ where: { branchId, createdAt: { gte: startToday } } }),
+      prisma.customer.count({ where: { branchId, loyaltyCardToken: { not: null } } }),
+      prisma.customer.findMany({
+        where: { branchId, loyaltyCardToken: { not: null } },
+        select: { id: true },
+        take: 80,
+      }),
+      prisma.product.count({ where: { branchId, requiresKyc: true, isActive: true } }),
+      prisma.customer.count({
+        where: {
+          branchId,
+          nidNumber: null,
+          birthCertificateNo: null,
+        },
+      }),
+      prisma.sale.aggregate({
+        where: { branchId, createdAt: { gte: startToday }, efdSubmittedAt: { not: null } },
+        _count: { id: true },
+      }),
+      prisma.courierShipment.count({
+        where: { branchId, status: { in: ["CREATED", "BOOKED", "IN_TRANSIT", "PENDING"] } },
+      }),
+      prisma.kitchenTicket.count({ where: { branchId, status: { in: ["OPEN", "PREPARING", "READY"] } } }),
+      prisma.productionOrder.count({ where: { branchId, createdAt: { gte: startToday } } }),
+      prisma.sale.count({
+        where: {
+          branchId,
+          createdAt: { gte: startToday },
+          dueAmount: { gt: 0 },
+          items: { some: { product: { requiresKyc: true } } },
+        },
+      }),
+    ]);
+
+    const productIds = new Set();
+    for (const order of pendingOrders) {
+      try {
+        const lines = JSON.parse(order.cartJson || "[]");
+        if (Array.isArray(lines)) {
+          for (const line of lines) {
+            const pid = Number(line.productId || line.id);
+            if (pid > 0) productIds.add(pid);
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    const products =
+      productIds.size > 0
+        ? await prisma.product.findMany({
+            where: { branchId, id: { in: [...productIds] } },
+            select: { id: true, price: true },
+          })
+        : [];
+    const priceByProductId = new Map(products.map((p) => [p.id, Number(p.price || 0)]));
+
+    let pendingOrderValue = 0;
+    let webStorefrontPending = 0;
+    for (const order of pendingOrders) {
+      pendingOrderValue +=
+        estimatePendingOrderTotal(order.cartJson, priceByProductId) + Number(order.deliveryFee || 0);
+      if (String(order.source || "").toUpperCase() === "WEB_STORE") webStorefrontPending += 1;
+    }
+
+    const salesTodayCount = await prisma.sale.count({
+      where: { branchId, createdAt: { gte: startToday } },
+    });
+    const efdPendingToday = Math.max(0, salesTodayCount - Number(efdToday._count.id || 0));
+
+    let loyaltyTotalPoints = 0;
+    let loyaltyCustomersWithPoints = 0;
+    await Promise.all(
+      (loyaltyCardHolders || []).map(async (holder) => {
+        const balance = await buildCustomerLoyaltyBalance(prisma, branchId, holder.id);
+        const pts = Number(balance?.availablePoints || 0);
+        if (pts > 0) {
+          loyaltyCustomersWithPoints += 1;
+          loyaltyTotalPoints += pts;
+        }
+      })
+    );
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      bakirKhata: {
+        customersWithDue: customerDueAgg._count.id || 0,
+        totalReceivable: Number(Number(customerDueAgg._sum.balance || 0).toFixed(2)),
+        creditSalesToday: {
+          count: creditSalesToday._count.id || 0,
+          amount: Number(Number(creditSalesToday._sum.dueAmount || 0).toFixed(2)),
+        },
+        ledgerCreditToday: {
+          count: ledgerCreditToday._count.id || 0,
+          amount: Number(Number(ledgerCreditToday._sum.amount || 0).toFixed(2)),
+        },
+        collectionsToday: {
+          count: ledgerCollectionToday._count.id || 0,
+          amount: Number(Math.abs(Number(ledgerCollectionToday._sum.amount || 0)).toFixed(2)),
+        },
+        topDebtors: topDebtors.map((c) => ({
+          id: c.id,
+          name: c.name,
+          phone: c.phone,
+          balance: Number(Number(c.balance || 0).toFixed(2)),
+        })),
+      },
+      warranty: {
+        open: warrantyOpen,
+        approved: warrantyApproved,
+        todayNew: warrantyToday,
+      },
+      orders: {
+        pending: pendingOrders.length,
+        pendingValue: Number(pendingOrderValue.toFixed(2)),
+        webStorefrontPending,
+        todayCount: ordersToday,
+      },
+      loyalty: {
+        activeCards: loyaltyCards,
+        customersWithPoints: loyaltyCustomersWithPoints,
+        totalPoints: Number(loyaltyTotalPoints.toFixed(0)),
+      },
+      compliance: {
+        kycProducts: kycProductCount,
+        customersWithoutKyc: customersNoKyc,
+        kycCreditSalesToday: requiresKycSalesToday,
+        efdSubmittedToday: efdToday._count.id || 0,
+        efdPendingToday,
+      },
+      courier: {
+        activeShipments: courierActive,
+      },
+      restaurant: {
+        openKitchenTickets: openKots,
+      },
+      manufacturing: {
+        productionOrdersToday: productionToday,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
 exports.getVatSummary = async (req, res) => {
   try {
     const branchId = req.branchId;
@@ -670,7 +987,9 @@ exports.exportStockValuationCSV = async (req, res) => {
       product_id: p.productId,
       product_name: p.name,
       category: p.category || "",
+      sale_unit: p.saleUnit || "",
       stock: Number(p.stock || 0).toFixed(2),
+      stock_display: p.stockDisplay || "",
       unit_cost: Number(p.unitCost || 0).toFixed(2),
       base_margin_pct: Number(p.baseMarginPct || 0).toFixed(2),
       landed_margin_pct: Number(p.landedMarginPct || 0).toFixed(2),
@@ -726,7 +1045,8 @@ exports.exportStockValuationPDF = async (req, res) => {
     const rows = (payload.rows || []).map((p) => ({
       name: p.name,
       category: p.category || "-",
-      stock: Number(p.stock || 0).toFixed(2),
+      saleUnit: p.saleUnit || "-",
+      stock: p.stockDisplay || Number(p.stock || 0).toFixed(2),
       unitCost: Number(p.unitCost || 0).toFixed(2),
       marginImpact: `${Number(p.baseMarginPct || 0).toFixed(2)}% -> ${Number(p.landedMarginPct || 0).toFixed(2)}% (${Number(
         p.marginImpactPct || 0
@@ -739,6 +1059,7 @@ exports.exportStockValuationPDF = async (req, res) => {
       [
         { key: "name", label: "Product" },
         { key: "category", label: "Category" },
+        { key: "saleUnit", label: "Sale unit" },
         { key: "stock", label: "Stock" },
         { key: "unitCost", label: "Unit Cost" },
         { key: "marginImpact", label: "Landed vs Base Margin" },
@@ -761,7 +1082,16 @@ async function buildStockValuationPayload(branchId, query = {}) {
       branchId,
       ...(category ? { category: { contains: category } } : {}),
     },
-    select: { id: true, name: true, category: true, stock: true, price: true, unitPrice: true },
+    select: {
+      id: true,
+      name: true,
+      category: true,
+      stock: true,
+      stockKg: true,
+      sellByWeight: true,
+      price: true,
+      unitPrice: true,
+    },
     orderBy: { name: "asc" },
     take: 5000,
   });
@@ -782,11 +1112,15 @@ async function buildStockValuationPayload(branchId, query = {}) {
       const baseMarginPct = calcMarginPct(sellingPrice, baseUnitCost);
       const landedMarginPct = calcMarginPct(sellingPrice, landedUnitCost);
       const profitMargin = landedMarginPct;
+      const stockQty = p.sellByWeight ? Number(p.stockKg || 0) : Number(p.stock || 0);
       return {
         productId: p.id,
         name: p.name,
         category: p.category || "",
-        stock: Number(p.stock || 0),
+        stock: stockQty,
+        stockDisplay: formatProductStock(p),
+        saleUnit: p.sellByWeight ? "KG" : "PCS",
+        sellByWeight: Boolean(p.sellByWeight),
         unitCost,
         baseUnitCost: Number(baseUnitCost.toFixed(4)),
         landedUnitCost: Number(landedUnitCost.toFixed(4)),
@@ -795,7 +1129,7 @@ async function buildStockValuationPayload(branchId, query = {}) {
         baseMarginPct: Number(baseMarginPct.toFixed(2)),
         landedMarginPct: Number(landedMarginPct.toFixed(2)),
         marginImpactPct: Number((landedMarginPct - baseMarginPct).toFixed(2)),
-        valuation: Number((Number(p.stock || 0) * unitCost).toFixed(2)),
+        valuation: Number((stockQty * unitCost).toFixed(2)),
       };
     });
     const totalValue = rows.reduce((sum, r) => sum + Number(r.valuation || 0), 0);
@@ -844,11 +1178,15 @@ async function buildStockValuationPayload(branchId, query = {}) {
     const landedMarginPct = calcMarginPct(sellingPrice, unitCost);
     const profitMargin = landedMarginPct;
     const valuation = qty > 0 ? value : 0;
+    const stockRow = { ...p, stock: qty, stockKg: p.sellByWeight ? qty : p.stockKg };
     return {
       productId: p.id,
       name: p.name,
       category: p.category || "",
       stock: Number(qty.toFixed(2)),
+      stockDisplay: formatProductStock(stockRow),
+      saleUnit: p.saleUnit || p.unitOfMeasure || null,
+      sellByWeight: Boolean(p.sellByWeight),
       unitCost: Number(unitCost.toFixed(2)),
       baseUnitCost: Number(baseUnitCost.toFixed(4)),
       landedUnitCost: Number(unitCost.toFixed(4)),
@@ -1594,34 +1932,85 @@ exports.exportChequeLedgerPDF = async (req, res) => {
   }
 };
 
-exports.getHqBranchSummary = async (req, res) => {
-  try {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const branches = await prisma.branch.findMany({
-      where: { isActive: true },
-      select: { id: true, code: true, name: true },
-      orderBy: { id: "asc" },
-    });
-    const [saleAgg, purchaseAgg] = await Promise.all([
+async function buildHqBranchMetrics(fromInput, toInput) {
+  const start = fromInput ? new Date(fromInput) : new Date();
+  if (!fromInput) start.setHours(0, 0, 0, 0);
+  const end = toInput ? new Date(toInput) : new Date();
+  if (!toInput) end.setHours(23, 59, 59, 999);
+
+  const branches = await prisma.branch.findMany({
+    where: { isActive: true },
+    select: { id: true, code: true, name: true },
+    orderBy: { id: "asc" },
+  });
+  const branchIds = branches.map((b) => b.id);
+  const saleDateWhere = { gte: start, lte: end };
+  const [saleAgg, purchaseAgg, saleItems, categories] = await Promise.all([
       prisma.sale.groupBy({
         by: ["branchId"],
-        where: { createdAt: { gte: start } },
+        where: { createdAt: saleDateWhere },
         _sum: { total: true, paidAmount: true },
         _count: { id: true },
       }),
       prisma.purchase.groupBy({
         by: ["branchId"],
-        where: { createdAt: { gte: start } },
+        where: { createdAt: saleDateWhere },
         _sum: { total: true },
         _count: { id: true },
       }),
+      branchIds.length
+        ? prisma.saleItem.findMany({
+            where: { sale: { branchId: { in: branchIds }, createdAt: saleDateWhere } },
+            select: {
+              qty: true,
+              weightKg: true,
+              price: true,
+              cost: true,
+              sale: { select: { branchId: true } },
+              product: { select: { category: true } },
+            },
+          })
+        : [],
+      branchIds.length
+        ? prisma.productCategory.findMany({
+            where: { branchId: { in: branchIds } },
+            select: { branchId: true, name: true },
+          })
+        : [],
     ]);
+    const categoryByBranch = new Map();
+    for (const c of categories) {
+      const key = `${c.branchId}|${String(c.name || "").trim().toUpperCase()}`;
+      categoryByBranch.set(key, c);
+    }
+    const groceryByBranch = new Map();
+    for (const item of saleItems) {
+      const branchId = Number(item.sale?.branchId || 0);
+      if (!branchId) continue;
+      const categoryName = String(item.product?.category || "").trim();
+      const catRow = categoryByBranch.get(`${branchId}|${categoryName.toUpperCase()}`);
+      const department = resolveCategoryDepartment(categoryName, catRow);
+      if (department !== "GROCERY") continue;
+      const bill =
+        Number(item.weightKg || 0) > 1e-9 ? Number(item.weightKg || 0) : Number(item.qty || 0);
+      const revenue = bill * Number(item.price || 0);
+      const cogs = bill * Number(item.cost || 0);
+      if (!groceryByBranch.has(branchId)) {
+        groceryByBranch.set(branchId, { revenue: 0, cogs: 0, lineCount: 0 });
+      }
+      const agg = groceryByBranch.get(branchId);
+      agg.revenue += revenue;
+      agg.cogs += cogs;
+      agg.lineCount += 1;
+    }
     const saleMap = new Map(saleAgg.map((x) => [x.branchId, x]));
     const purchaseMap = new Map(purchaseAgg.map((x) => [x.branchId, x]));
     const rows = branches.map((b) => {
       const s = saleMap.get(b.id);
       const p = purchaseMap.get(b.id);
+      const g = groceryByBranch.get(b.id) || { revenue: 0, cogs: 0, lineCount: 0 };
+      const groceryGrossProfit = g.revenue - g.cogs;
+      const groceryMarginPct = g.revenue > 0 ? (groceryGrossProfit / g.revenue) * 100 : 0;
       return {
         branchId: b.id,
         code: b.code,
@@ -1631,9 +2020,60 @@ exports.getHqBranchSummary = async (req, res) => {
         saleCountToday: Number(s?._count?.id || 0),
         purchasesToday: Number(p?._sum?.total || 0),
         purchaseCountToday: Number(p?._count?.id || 0),
+        groceryRevenueToday: Number(g.revenue.toFixed(2)),
+        groceryGrossProfitToday: Number(groceryGrossProfit.toFixed(2)),
+        groceryMarginPctToday: Number(groceryMarginPct.toFixed(2)),
+        groceryLineCountToday: g.lineCount,
       };
     });
-    res.json({ asOf: start.toISOString(), branches: rows });
+    return {
+      from: start.toISOString().slice(0, 10),
+      to: end.toISOString().slice(0, 10),
+      branches: rows,
+    };
+}
+
+exports.getHqBranchSummary = async (req, res) => {
+  try {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const payload = await buildHqBranchMetrics(start, null);
+    res.json({ asOf: new Date(start).toISOString(), ...payload });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getHqBranchCompare = async (req, res) => {
+  try {
+    const { from, to } = parseDateRange(req.query || {});
+    const payload = await buildHqBranchMetrics(from, to);
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportHqBranchCompareCSV = async (req, res) => {
+  try {
+    const { from, to } = parseDateRange(req.query || {});
+    const payload = await buildHqBranchMetrics(from, to);
+    const rows = (payload.branches || []).map((b) => ({
+      branch_code: b.code || "",
+      branch_name: b.name || "",
+      sales: Number(b.salesToday || 0).toFixed(2),
+      collections: Number(b.collectionsToday || 0).toFixed(2),
+      sale_count: Number(b.saleCountToday || 0),
+      purchases: Number(b.purchasesToday || 0).toFixed(2),
+      purchase_count: Number(b.purchaseCountToday || 0),
+      grocery_revenue: Number(b.groceryRevenueToday || 0).toFixed(2),
+      grocery_gross_profit: Number(b.groceryGrossProfitToday || 0).toFixed(2),
+      grocery_margin_pct: Number(b.groceryMarginPctToday || 0).toFixed(2),
+      grocery_line_count: Number(b.groceryLineCountToday || 0),
+    }));
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="hq-branch-compare.csv"');
+    res.send(toCSV(rows));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1980,3 +2420,1098 @@ exports.exportTaxRiskDashboardPDF = async (req, res) => {
   }
 };
 
+
+async function buildCategorySalesPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query);
+  const saleItems = await prisma.saleItem.findMany({
+      where: { sale: buildSaleWhere(branchId, from, to) },
+      select: {
+        qty: true,
+        price: true,
+        cost: true,
+        weightKg: true,
+        product: { select: { category: true } },
+      },
+    });
+
+    const byCategory = new Map();
+    for (const row of saleItems) {
+      const category = String(row.product?.category || "").trim() || "Uncategorized";
+      const bill =
+        Number(row.weightKg || 0) > 1e-9 ? Number(row.weightKg || 0) : Number(row.qty || 0);
+      const revenue = bill * Number(row.price || 0);
+      const unitCost = Number(row.cost || 0) > 0 ? Number(row.cost) : 0;
+      const cogs = unitCost > 0 ? bill * unitCost : 0;
+      if (!byCategory.has(category)) {
+        byCategory.set(category, { category, qty: 0, revenue: 0, cogs: 0 });
+      }
+      const agg = byCategory.get(category);
+      agg.qty += bill;
+      agg.revenue += revenue;
+      agg.cogs += cogs;
+    }
+
+    const rows = [...byCategory.values()]
+      .map((r) => {
+        const revenue = Number(r.revenue || 0);
+        const cogs = Number(r.cogs || 0);
+        const grossProfit = revenue - cogs;
+        const marginPct = revenue > 0 ? (grossProfit / revenue) * 100 : 0;
+        return {
+          category: r.category,
+          soldQty: Number(r.qty.toFixed(3)),
+          revenue: Number(revenue.toFixed(2)),
+          cogs: Number(cogs.toFixed(2)),
+          grossProfit: Number(grossProfit.toFixed(2)),
+          marginPct: Number(marginPct.toFixed(2)),
+        };
+      })
+      .sort((a, b) => b.revenue - a.revenue);
+
+  const totalRevenue = rows.reduce((s, r) => s + r.revenue, 0);
+  const totalCogs = rows.reduce((s, r) => s + r.cogs, 0);
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    rows,
+    summary: {
+      categoryCount: rows.length,
+      totalRevenue: Number(totalRevenue.toFixed(2)),
+      totalCogs: Number(totalCogs.toFixed(2)),
+      totalGrossProfit: Number((totalRevenue - totalCogs).toFixed(2)),
+    },
+  };
+}
+
+exports.getCategorySalesReport = async (req, res) => {
+  try {
+    const payload = await buildCategorySalesPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportCategorySalesCSV = async (req, res) => {
+  try {
+    const payload = await buildCategorySalesPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      category: r.category,
+      sold_qty: r.soldQty,
+      revenue: r.revenue,
+      cogs: r.cogs,
+      gross_profit: r.grossProfit,
+      margin_pct: r.marginPct,
+    }));
+    const csv = toCSV(rows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="category-sales.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildDepartmentSalesPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query);
+
+  const [saleItems, categories] = await Promise.all([
+      prisma.saleItem.findMany({
+        where: { sale: buildSaleWhere(branchId, from, to) },
+        select: {
+          qty: true,
+          price: true,
+          cost: true,
+          weightKg: true,
+          product: { select: { category: true } },
+        },
+      }),
+      prisma.productCategory.findMany({
+        where: { branchId },
+        select: { name: true },
+      }),
+    ]);
+
+    const categoryByName = new Map(
+      categories.map((c) => [String(c.name || "").trim().toUpperCase(), c])
+    );
+
+    const byDepartment = new Map();
+    for (const row of saleItems) {
+      const categoryName = String(row.product?.category || "").trim();
+      const categoryRow = categoryByName.get(categoryName.toUpperCase()) || null;
+      const department = resolveCategoryDepartment(categoryName, categoryRow);
+      const bill =
+        Number(row.weightKg || 0) > 1e-9 ? Number(row.weightKg || 0) : Number(row.qty || 0);
+      const revenue = bill * Number(row.price || 0);
+      const unitCost = Number(row.cost || 0) > 0 ? Number(row.cost) : 0;
+      const cogs = unitCost > 0 ? bill * unitCost : 0;
+      if (!byDepartment.has(department)) {
+        byDepartment.set(department, { department, qty: 0, revenue: 0, cogs: 0 });
+      }
+      const agg = byDepartment.get(department);
+      agg.qty += bill;
+      agg.revenue += revenue;
+      agg.cogs += cogs;
+    }
+
+    const rows = [...byDepartment.values()]
+      .map((r) => {
+        const revenue = Number(r.revenue || 0);
+        const cogs = Number(r.cogs || 0);
+        const grossProfit = revenue - cogs;
+        const marginPct = revenue > 0 ? (grossProfit / revenue) * 100 : 0;
+        return {
+          department: r.department,
+          soldQty: Number(r.qty.toFixed(3)),
+          revenue: Number(revenue.toFixed(2)),
+          cogs: Number(cogs.toFixed(2)),
+          grossProfit: Number(grossProfit.toFixed(2)),
+          marginPct: Number(marginPct.toFixed(2)),
+        };
+      })
+      .sort((a, b) => b.revenue - a.revenue);
+
+  const totalRevenue = rows.reduce((s, r) => s + r.revenue, 0);
+  const totalCogs = rows.reduce((s, r) => s + r.cogs, 0);
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    rows,
+    summary: {
+      departmentCount: rows.length,
+      totalRevenue: Number(totalRevenue.toFixed(2)),
+      totalCogs: Number(totalCogs.toFixed(2)),
+      totalGrossProfit: Number((totalRevenue - totalCogs).toFixed(2)),
+    },
+  };
+}
+
+exports.getDepartmentSalesReport = async (req, res) => {
+  try {
+    const payload = await buildDepartmentSalesPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportDepartmentSalesCSV = async (req, res) => {
+  try {
+    const payload = await buildDepartmentSalesPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      department: r.department,
+      sold_qty: r.soldQty,
+      revenue: r.revenue,
+      cogs: r.cogs,
+      gross_profit: r.grossProfit,
+      margin_pct: r.marginPct,
+    }));
+    const csv = toCSV(rows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="department-sales.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+function parseSaleNotesPromotions(notesRaw) {
+  if (!notesRaw || typeof notesRaw !== "string") return { applied: [], discountAmount: 0 };
+  try {
+    const parsed = JSON.parse(notesRaw);
+    const applied = Array.isArray(parsed?.promotions?.applied) ? parsed.promotions.applied : [];
+    return {
+      applied,
+      discountAmount: Number(parsed?.promotions?.discountAmount || parsed?.d || 0),
+    };
+  } catch {
+    return { applied: [], discountAmount: 0 };
+  }
+}
+
+exports.getPromotionRoiReport = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const { from, to } = parseDateRange(req.query || {});
+    const sales = await prisma.sale.findMany({
+      where: buildSaleWhere(branchId, from, to),
+      select: { id: true, notes: true, total: true, discount: true },
+    });
+
+    const byRule = new Map();
+    let salesWithPromo = 0;
+    let unattributedPromoTotal = 0;
+
+    for (const sale of sales) {
+      const { applied, discountAmount } = parseSaleNotesPromotions(sale.notes);
+      const attributed = applied.reduce((s, row) => s + Number(row.amount || 0), 0);
+      if (applied.length > 0) salesWithPromo += 1;
+      if (discountAmount > attributed + 0.01) {
+        unattributedPromoTotal += discountAmount - attributed;
+      }
+      for (const row of applied) {
+        const ruleId = Number(row.ruleId || 0);
+        if (!ruleId) continue;
+        if (!byRule.has(ruleId)) {
+          byRule.set(ruleId, {
+            ruleId,
+            name: String(row.name || `Rule #${ruleId}`),
+            type: String(row.type || ""),
+            redemptionCount: 0,
+            discountTotal: 0,
+          });
+        }
+        const agg = byRule.get(ruleId);
+        agg.redemptionCount += 1;
+        agg.discountTotal += Number(row.amount || 0);
+        if (row.name) agg.name = String(row.name);
+        if (row.type) agg.type = String(row.type);
+      }
+    }
+
+    const ruleIds = [...byRule.keys()];
+    const rules =
+      ruleIds.length > 0
+        ? await prisma.promotionRule.findMany({
+            where: { branchId, id: { in: ruleIds } },
+            select: { id: true, name: true, type: true, category: true, isActive: true },
+          })
+        : [];
+    const ruleMeta = new Map(rules.map((r) => [r.id, r]));
+
+    const rows = [...byRule.values()]
+      .map((r) => {
+        const meta = ruleMeta.get(r.ruleId);
+        return {
+          ruleId: r.ruleId,
+          name: meta?.name || r.name,
+          type: meta?.type || r.type,
+          category: meta?.category || "",
+          isActive: meta?.isActive != null ? Boolean(meta.isActive) : null,
+          redemptionCount: r.redemptionCount,
+          discountTotal: Number(r.discountTotal.toFixed(2)),
+        };
+      })
+      .sort((a, b) => b.discountTotal - a.discountTotal);
+
+    const totalDiscount = rows.reduce((s, r) => s + r.discountTotal, 0);
+    res.json({
+      from: from ? from.toISOString().slice(0, 10) : null,
+      to: to ? to.toISOString().slice(0, 10) : null,
+      rows,
+      summary: {
+        saleCount: sales.length,
+        salesWithPromo,
+        ruleCount: rows.length,
+        totalDiscount: Number(totalDiscount.toFixed(2)),
+        unattributedPromoTotal: Number(unattributedPromoTotal.toFixed(2)),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildHourlyCategorySalesPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query);
+  const categoryFilter = String(query.category || "ALL").trim().toUpperCase();
+
+  const saleItems = await prisma.saleItem.findMany({
+    where: { sale: buildSaleWhere(branchId, from, to) },
+    select: {
+      qty: true,
+      price: true,
+      weightKg: true,
+      sale: { select: { createdAt: true } },
+      product: { select: { category: true } },
+    },
+  });
+
+  const byHourCategory = new Map();
+  for (const row of saleItems) {
+    const category = String(row.product?.category || "").trim() || "Uncategorized";
+    if (categoryFilter !== "ALL" && category.toUpperCase() !== categoryFilter) continue;
+    const createdAt = row.sale?.createdAt ? new Date(row.sale.createdAt) : null;
+    if (!createdAt || Number.isNaN(createdAt.getTime())) continue;
+    const hour = createdAt.getHours();
+    const key = `${hour}|${category}`;
+    const bill =
+      Number(row.weightKg || 0) > 1e-9 ? Number(row.weightKg || 0) : Number(row.qty || 0);
+    const revenue = bill * Number(row.price || 0);
+    if (!byHourCategory.has(key)) {
+      byHourCategory.set(key, { hour, category, qty: 0, revenue: 0 });
+    }
+    const agg = byHourCategory.get(key);
+    agg.qty += bill;
+    agg.revenue += revenue;
+  }
+
+  const rows = [...byHourCategory.values()]
+    .map((r) => ({
+      hour: r.hour,
+      hourLabel: `${String(r.hour).padStart(2, "0")}:00`,
+      category: r.category,
+      soldQty: Number(r.qty.toFixed(3)),
+      revenue: Number(r.revenue.toFixed(2)),
+    }))
+    .sort((a, b) => a.hour - b.hour || b.revenue - a.revenue);
+
+  const hourTotals = Array.from({ length: 24 }, (_, hour) => ({
+    hour,
+    hourLabel: `${String(hour).padStart(2, "0")}:00`,
+    revenue: 0,
+    soldQty: 0,
+  }));
+  for (const row of rows) {
+    const slot = hourTotals[row.hour];
+    if (!slot) continue;
+    slot.revenue += row.revenue;
+    slot.soldQty += row.soldQty;
+  }
+
+  const categories = [...new Set(rows.map((r) => r.category))].sort();
+  const peakHour = hourTotals.reduce(
+    (best, row) => (row.revenue > best.revenue ? row : best),
+    { hour: 0, revenue: 0 }
+  );
+
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    categoryFilter: categoryFilter || "ALL",
+    rows,
+    hourTotals: hourTotals.map((h) => ({
+      hour: h.hour,
+      hourLabel: h.hourLabel,
+      revenue: Number(h.revenue.toFixed(2)),
+      soldQty: Number(h.soldQty.toFixed(3)),
+    })),
+    categories,
+    summary: {
+      peakHour: peakHour.hour,
+      peakHourLabel: `${String(peakHour.hour).padStart(2, "0")}:00`,
+      peakHourRevenue: Number(peakHour.revenue.toFixed(2)),
+      totalRevenue: Number(rows.reduce((s, r) => s + r.revenue, 0).toFixed(2)),
+    },
+  };
+}
+
+exports.getHourlyCategorySalesReport = async (req, res) => {
+  try {
+    const payload = await buildHourlyCategorySalesPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportHourlyCategorySalesCSV = async (req, res) => {
+  try {
+    const payload = await buildHourlyCategorySalesPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      hour: r.hourLabel,
+      category: r.category,
+      sold_qty: r.soldQty,
+      revenue: r.revenue,
+    }));
+    const csv = toCSV(rows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="hourly-category-sales.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildShrinkageByCategoryPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query);
+  const writeOffReasons = await prisma.inventoryAdjustReason.findMany({
+    where: { branchId, isActive: true, accountingImpact: "WRITE_OFF" },
+    select: { code: true },
+  });
+  const reasonCodes = writeOffReasons.map((r) => String(r.code || "").trim()).filter(Boolean);
+  if (!reasonCodes.length) reasonCodes.push("EXPIRED");
+
+  const adjustments = await prisma.stockAdjustment.findMany({
+    where: {
+      branchId,
+      qtyChange: { lt: 0 },
+      reasonCode: { in: reasonCodes },
+      ...(from || to
+        ? {
+            createdAt: {
+              ...(from ? { gte: from } : {}),
+              ...(to ? { lte: to } : {}),
+            },
+          }
+        : {}),
+    },
+    select: { productId: true, qtyChange: true, reasonCode: true },
+  });
+
+  const productIds = [...new Set(adjustments.map((a) => Number(a.productId)).filter((id) => id > 0))];
+  const [products, categories] = await Promise.all([
+    productIds.length
+      ? prisma.product.findMany({
+          where: { id: { in: productIds } },
+          select: { id: true, category: true, unitPrice: true },
+        })
+      : [],
+    prisma.productCategory.findMany({
+      where: { branchId },
+      select: { name: true },
+    }),
+  ]);
+  const productMap = new Map(products.map((p) => [p.id, p]));
+  const categoryByName = new Map(
+    categories.map((c) => [String(c.name || "").trim().toUpperCase(), c])
+  );
+
+  const byCategory = new Map();
+  for (const adj of adjustments) {
+    const product = productMap.get(Number(adj.productId));
+    const category = String(product?.category || "").trim() || "Uncategorized";
+    const catKey = category.toUpperCase();
+    if (!byCategory.has(catKey)) {
+      byCategory.set(catKey, {
+        category,
+        department: resolveCategoryDepartment(category, categoryByName.get(catKey)),
+        adjustmentCount: 0,
+        unitsWrittenOff: 0,
+        estimatedCost: 0,
+      });
+    }
+    const agg = byCategory.get(catKey);
+    const units = Math.abs(Number(adj.qtyChange || 0));
+    agg.adjustmentCount += 1;
+    agg.unitsWrittenOff += units;
+    agg.estimatedCost += units * Number(product?.unitPrice || 0);
+  }
+
+  const rows = [...byCategory.values()]
+    .map((r) => ({
+      category: r.category,
+      department: r.department,
+      adjustmentCount: r.adjustmentCount,
+      unitsWrittenOff: Number(r.unitsWrittenOff.toFixed(3)),
+      estimatedCost: Number(r.estimatedCost.toFixed(2)),
+    }))
+    .sort((a, b) => b.estimatedCost - a.estimatedCost);
+
+  const summary = rows.reduce(
+    (acc, r) => {
+      acc.categoryCount += 1;
+      acc.adjustmentCount += r.adjustmentCount;
+      acc.unitsWrittenOff += r.unitsWrittenOff;
+      acc.estimatedCost += r.estimatedCost;
+      return acc;
+    },
+    { categoryCount: 0, adjustmentCount: 0, unitsWrittenOff: 0, estimatedCost: 0 }
+  );
+  summary.estimatedCost = Number(summary.estimatedCost.toFixed(2));
+  summary.unitsWrittenOff = Number(summary.unitsWrittenOff.toFixed(3));
+
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    reasonCodes,
+    rows,
+    summary,
+  };
+}
+
+exports.getShrinkageByCategoryReport = async (req, res) => {
+  try {
+    const payload = await buildShrinkageByCategoryPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportShrinkageByCategoryCSV = async (req, res) => {
+  try {
+    const payload = await buildShrinkageByCategoryPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      category: r.category,
+      department: r.department,
+      adjustments: r.adjustmentCount,
+      units_written_off: r.unitsWrittenOff,
+      estimated_cost: r.estimatedCost,
+    }));
+    const csv = toCSV(rows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="shrinkage-by-category.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportShrinkageByCategoryPDF = async (req, res) => {
+  try {
+    const payload = await buildShrinkageByCategoryPayload(req.branchId, req.query || {});
+    writePdfTableReport(
+      res,
+      "Shrinkage by Category",
+      [
+        { key: "category", label: "Category" },
+        { key: "department", label: "Department" },
+        { key: "adjustmentCount", label: "Adjustments" },
+        { key: "unitsWrittenOff", label: "Units" },
+        { key: "estimatedCost", label: "Est. Cost" },
+      ],
+      (payload.rows || []).map((row) => ({
+        category: row.category,
+        department: row.department,
+        adjustmentCount: row.adjustmentCount,
+        unitsWrittenOff: Number(row.unitsWrittenOff || 0).toFixed(2),
+        estimatedCost: Number(row.estimatedCost || 0).toFixed(2),
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildSlowMoversPayload(branchId, query = {}) {
+  const days = Math.max(7, Number(query.days || 60));
+  const categoryFilter = String(query.category || "ALL").trim().toUpperCase();
+  const limit = Math.min(500, Math.max(1, Number(query.limit || 200)));
+  const from = new Date();
+  from.setDate(from.getDate() - days);
+
+  const products = await prisma.product.findMany({
+    where: { branchId },
+    select: {
+      id: true,
+      name: true,
+      sku: true,
+      category: true,
+      stock: true,
+      stockKg: true,
+      sellByWeight: true,
+      price: true,
+      unitPrice: true,
+      reorderLevel: true,
+    },
+    take: 3000,
+  });
+
+  const soldGroups = await prisma.saleItem.groupBy({
+    by: ["productId"],
+    where: {
+      sale: { branchId, createdAt: { gte: from } },
+    },
+    _sum: { qty: true },
+  });
+  const soldProductIds = new Set(soldGroups.map((g) => Number(g.productId)));
+
+  const rows = products
+    .filter((p) => {
+      const cat = String(p.category || "").trim().toUpperCase();
+      if (categoryFilter !== "ALL" && cat !== categoryFilter) return false;
+      if (soldProductIds.has(p.id)) return false;
+      const hasStock = p.sellByWeight
+        ? Number(p.stockKg || 0) > 1e-9
+        : Number(p.stock || 0) > 0;
+      return hasStock;
+    })
+    .map((p) => {
+      const stockUnits = p.sellByWeight ? Number(p.stockKg || 0) : Number(p.stock || 0);
+      const unitCost = Number(p.unitPrice || 0);
+      const stockValue = stockUnits * unitCost;
+      return {
+        productId: p.id,
+        name: p.name,
+        sku: p.sku || "",
+        category: p.category || "",
+        stockUnits: Number(stockUnits.toFixed(3)),
+        stockValue: Number(stockValue.toFixed(2)),
+        price: Number(p.price || 0),
+        reorderLevel: Number(p.reorderLevel || 0),
+      };
+    })
+    .sort((a, b) => b.stockValue - a.stockValue)
+    .slice(0, limit);
+
+  return {
+    days,
+    categoryFilter,
+    rows,
+    summary: {
+      slowMoverCount: rows.length,
+      stockValueAtRisk: Number(rows.reduce((s, r) => s + r.stockValue, 0).toFixed(2)),
+    },
+  };
+}
+
+exports.getSlowMoversReport = async (req, res) => {
+  try {
+    const payload = await buildSlowMoversPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportSlowMoversCSV = async (req, res) => {
+  try {
+    const payload = await buildSlowMoversPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      product_id: r.productId,
+      name: r.name,
+      sku: r.sku,
+      category: r.category,
+      stock_units: r.stockUnits,
+      stock_value: r.stockValue,
+      price: r.price,
+    }));
+    const csv = toCSV(rows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="slow-movers.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportSlowMoversPDF = async (req, res) => {
+  try {
+    const payload = await buildSlowMoversPayload(req.branchId, req.query || {});
+    writePdfTableReport(
+      res,
+      "Slow Movers",
+      [
+        { key: "name", label: "Product" },
+        { key: "sku", label: "SKU" },
+        { key: "category", label: "Category" },
+        { key: "stockUnits", label: "Stock" },
+        { key: "stockValue", label: "Stock Value" },
+      ],
+      (payload.rows || []).map((row) => ({
+        name: row.name,
+        sku: row.sku || "",
+        category: row.category || "",
+        stockUnits: Number(row.stockUnits || 0).toFixed(2),
+        stockValue: Number(row.stockValue || 0).toFixed(2),
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildBasketAnalysisPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query || {});
+  const mode = String(query.mode || "product").toLowerCase() === "category" ? "category" : "product";
+  const minCount = Math.max(2, Number(query.minCount || 3));
+  const limit = Math.min(200, Math.max(10, Number(query.limit || 50)));
+
+  const saleItems = await prisma.saleItem.findMany({
+    where: { sale: buildSaleWhere(branchId, from, to) },
+    select: {
+      saleId: true,
+      productId: true,
+      product: { select: { name: true, sku: true, category: true } },
+    },
+  });
+
+  const salesMap = new Map();
+  const productMeta = new Map();
+  const itemSaleCounts = new Map();
+
+  for (const item of saleItems) {
+    const saleId = Number(item.saleId || 0);
+    if (!saleId) continue;
+    if (!salesMap.has(saleId)) salesMap.set(saleId, new Set());
+    let key;
+    if (mode === "category") {
+      key = String(item.product?.category || "").trim().toUpperCase() || "UNCATEGORIZED";
+    } else {
+      key = Number(item.productId || 0);
+      if (!key) continue;
+      if (!productMeta.has(key)) {
+        productMeta.set(key, {
+          name: item.product?.name || "",
+          sku: item.product?.sku || "",
+          category: item.product?.category || "",
+        });
+      }
+    }
+    salesMap.get(saleId).add(key);
+  }
+
+  for (const keys of salesMap.values()) {
+    for (const k of keys) {
+      itemSaleCounts.set(k, (itemSaleCounts.get(k) || 0) + 1);
+    }
+  }
+
+  const pairCounts = new Map();
+  let multiItemSaleCount = 0;
+
+  for (const keys of salesMap.values()) {
+    if (keys.size < 2) continue;
+    multiItemSaleCount += 1;
+    const arr = [...keys].sort((a, b) => {
+      if (typeof a === "string" && typeof b === "string") return a.localeCompare(b);
+      return Number(a) - Number(b);
+    });
+    for (let i = 0; i < arr.length; i += 1) {
+      for (let j = i + 1; j < arr.length; j += 1) {
+        const pairKey = `${arr[i]}|${arr[j]}`;
+        pairCounts.set(pairKey, (pairCounts.get(pairKey) || 0) + 1);
+      }
+    }
+  }
+
+  const rows = [...pairCounts.entries()]
+    .filter(([, count]) => count >= minCount)
+    .map(([pairKey, count]) => {
+      const [rawA, rawB] = pairKey.split("|");
+      const supportPct =
+        multiItemSaleCount > 0 ? Number(((count / multiItemSaleCount) * 100).toFixed(2)) : 0;
+      const salesWithA = itemSaleCounts.get(mode === "category" ? rawA : Number(rawA)) || 0;
+      const salesWithB = itemSaleCounts.get(mode === "category" ? rawB : Number(rawB)) || 0;
+      const confidenceAPct =
+        salesWithA > 0 ? Number(((count / salesWithA) * 100).toFixed(2)) : 0;
+      const confidenceBPct =
+        salesWithB > 0 ? Number(((count / salesWithB) * 100).toFixed(2)) : 0;
+
+      if (mode === "category") {
+        return {
+          itemA: rawA,
+          itemB: rawB,
+          skuA: "",
+          skuB: "",
+          categoryA: rawA,
+          categoryB: rawB,
+          pairCount: count,
+          supportPct,
+          confidenceAPct,
+          confidenceBPct,
+        };
+      }
+
+      const idA = Number(rawA);
+      const idB = Number(rawB);
+      const metaA = productMeta.get(idA) || {};
+      const metaB = productMeta.get(idB) || {};
+      return {
+        productAId: idA,
+        productBId: idB,
+        itemA: metaA.name || `Product #${idA}`,
+        itemB: metaB.name || `Product #${idB}`,
+        skuA: metaA.sku || "",
+        skuB: metaB.sku || "",
+        categoryA: metaA.category || "",
+        categoryB: metaB.category || "",
+        pairCount: count,
+        supportPct,
+        confidenceAPct,
+        confidenceBPct,
+      };
+    })
+    .sort((a, b) => b.pairCount - a.pairCount || b.supportPct - a.supportPct)
+    .slice(0, limit);
+
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    mode,
+    minCount,
+    summary: {
+      saleCount: salesMap.size,
+      multiItemSaleCount,
+      pairCount: rows.length,
+    },
+    rows,
+  };
+}
+
+exports.getBasketAnalysisReport = async (req, res) => {
+  try {
+    const payload = await buildBasketAnalysisPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportBasketAnalysisCSV = async (req, res) => {
+  try {
+    const payload = await buildBasketAnalysisPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      mode: payload.mode,
+      item_a: r.itemA,
+      item_b: r.itemB,
+      sku_a: r.skuA || "",
+      sku_b: r.skuB || "",
+      category_a: r.categoryA || "",
+      category_b: r.categoryB || "",
+      pair_count: r.pairCount,
+      support_pct: r.supportPct,
+      confidence_a_pct: r.confidenceAPct,
+      confidence_b_pct: r.confidenceBPct,
+    }));
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="basket-analysis.csv"');
+    res.send(toCSV(rows));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportBasketAnalysisPDF = async (req, res) => {
+  try {
+    const payload = await buildBasketAnalysisPayload(req.branchId, req.query || {});
+    writePdfTableReport(
+      res,
+      payload.mode === "category" ? "Basket Analysis (Aisles)" : "Basket Analysis (Products)",
+      [
+        { key: "itemA", label: "Item A" },
+        { key: "itemB", label: "Item B" },
+        { key: "pairCount", label: "Together" },
+        { key: "supportPct", label: "Support %" },
+        { key: "confidence", label: "Confidence" },
+      ],
+      (payload.rows || []).map((r) => ({
+        itemA: r.itemA,
+        itemB: r.itemB,
+        pairCount: String(r.pairCount || 0),
+        supportPct: `${Number(r.supportPct || 0).toFixed(1)}%`,
+        confidence: `${Number(r.confidenceAPct || 0).toFixed(0)}% / ${Number(r.confidenceBPct || 0).toFixed(0)}%`,
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function buildLoyaltyByCategoryPayload(branchId, query = {}) {
+  const { from, to } = parseDateRange(query || {});
+  const saleWhere = buildSaleWhere(branchId, from, to);
+  const bonusMap = await loadBranchLoyaltyBonusMap(prisma, branchId);
+  const pointsPer100 = Number(process.env.LOYALTY_POINTS_PER_100 || 1);
+  const items = await prisma.saleItem.findMany({
+    where: { sale: saleWhere },
+    select: {
+      qty: true,
+      weightKg: true,
+      price: true,
+      product: { select: { category: true } },
+    },
+  });
+  const byCategory = new Map();
+  for (const item of items) {
+    const cat =
+      String(item.product?.category || "")
+        .trim()
+        .toUpperCase() || "UNCATEGORIZED";
+    const bill =
+      Number(item.weightKg || 0) > 1e-9 ? Number(item.weightKg || 0) : Number(item.qty || 0);
+    const revenue = bill * Number(item.price || 0);
+    const mult = getCategoryMultiplier(bonusMap, cat);
+    const basePoints = pointsFromLineRevenue(revenue, pointsPer100, 1);
+    const bonusPoints = pointsFromLineRevenue(revenue, pointsPer100, mult) - basePoints;
+    if (!byCategory.has(cat)) {
+      byCategory.set(cat, {
+        category: cat,
+        revenue: 0,
+        lineCount: 0,
+        basePoints: 0,
+        bonusPoints: 0,
+        totalPoints: 0,
+        multiplier: mult,
+      });
+    }
+    const row = byCategory.get(cat);
+    row.revenue += revenue;
+    row.lineCount += 1;
+    row.basePoints += basePoints;
+    row.bonusPoints += Math.max(0, bonusPoints);
+    row.totalPoints += pointsFromLineRevenue(revenue, pointsPer100, mult);
+    row.multiplier = mult;
+  }
+  const rows = [...byCategory.values()]
+    .map((r) => ({
+      category: r.category,
+      revenue: Number(r.revenue.toFixed(2)),
+      lineCount: r.lineCount,
+      basePoints: Math.floor(r.basePoints),
+      bonusPoints: Math.floor(r.bonusPoints),
+      totalPoints: Math.floor(r.totalPoints),
+      multiplier: Number(r.multiplier || 1),
+    }))
+    .sort((a, b) => b.totalPoints - a.totalPoints || b.revenue - a.revenue);
+  return {
+    from: from ? from.toISOString().slice(0, 10) : null,
+    to: to ? to.toISOString().slice(0, 10) : null,
+    aisleBonusActive: Object.keys(bonusMap).length > 0,
+    rows,
+    summary: {
+      categoryCount: rows.length,
+      totalRevenue: Number(rows.reduce((s, r) => s + r.revenue, 0).toFixed(2)),
+      totalPoints: rows.reduce((s, r) => s + r.totalPoints, 0),
+      bonusPoints: rows.reduce((s, r) => s + r.bonusPoints, 0),
+    },
+  };
+}
+
+exports.getLoyaltyByCategoryReport = async (req, res) => {
+  try {
+    const payload = await buildLoyaltyByCategoryPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportLoyaltyByCategoryCSV = async (req, res) => {
+  try {
+    const payload = await buildLoyaltyByCategoryPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((r) => ({
+      category: r.category,
+      revenue: r.revenue,
+      line_count: r.lineCount,
+      multiplier: r.multiplier,
+      base_points: r.basePoints,
+      bonus_points: r.bonusPoints,
+      total_points: r.totalPoints,
+    }));
+    const csv = toCSV(rows);
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="loyalty-by-category.csv"');
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportLoyaltyByCategoryPDF = async (req, res) => {
+  try {
+    const payload = await buildLoyaltyByCategoryPayload(req.branchId, req.query || {});
+    writePdfTableReport(
+      res,
+      "Loyalty by Category",
+      [
+        { key: "category", label: "Category" },
+        { key: "revenue", label: "Revenue" },
+        { key: "multiplier", label: "Multiplier" },
+        { key: "basePoints", label: "Base Pts" },
+        { key: "bonusPoints", label: "Bonus Pts" },
+        { key: "totalPoints", label: "Total Pts" },
+      ],
+      (payload.rows || []).map((r) => ({
+        category: r.category,
+        revenue: Number(r.revenue || 0).toFixed(2),
+        multiplier: `${Number(r.multiplier || 1).toFixed(1)}x`,
+        basePoints: String(r.basePoints || 0),
+        bonusPoints: String(r.bonusPoints || 0),
+        totalPoints: String(r.totalPoints || 0),
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getCategoryMarginErosionReport = async (req, res) => {
+  try {
+    const payload = await buildCategoryMarginErosionPayload(req.branchId, req.query || {});
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportCategoryMarginErosionCSV = async (req, res) => {
+  try {
+    const payload = await buildCategoryMarginErosionPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || []).map((row) => ({
+      category: row.category,
+      department: row.department,
+      sold_qty: Number(row.soldQty || 0).toFixed(2),
+      revenue: Number(row.revenue || 0).toFixed(2),
+      realized_margin_pct: Number(row.realizedMarginPct || 0).toFixed(2),
+      min_margin_pct: Number(row.minMarginPct || 0).toFixed(2),
+      gap_pct: Number(row.gapPct || 0).toFixed(2),
+      margin_impact_pct: Number(row.marginImpactPct || 0).toFixed(2),
+      below_target: row.belowTarget ? "YES" : "NO",
+      cost_erosion: row.costErosion ? "YES" : "NO",
+      alert: row.alert ? "YES" : "NO",
+    }));
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="category-margin-erosion.csv"');
+    res.send(toCSV(rows));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.exportCategoryMarginErosionPDF = async (req, res) => {
+  try {
+    const payload = await buildCategoryMarginErosionPayload(req.branchId, req.query || {});
+    const rows = (payload.rows || [])
+      .filter((row) => row.alert)
+      .map((row) => ({
+        category: row.category,
+        realized: `${Number(row.realizedMarginPct || 0).toFixed(1)}%`,
+        target: `${Number(row.minMarginPct || 0).toFixed(1)}%`,
+        gap: `${Number(row.gapPct || 0).toFixed(1)}%`,
+        alert: row.belowTarget ? "Below target" : "Cost erosion",
+      }));
+    writePdfTableReport(
+      res,
+      "Category Margin Erosion Alerts",
+      [
+        { key: "category", label: "Aisle / Category" },
+        { key: "realized", label: "Realized %" },
+        { key: "target", label: "Min %" },
+        { key: "gap", label: "Gap" },
+        { key: "alert", label: "Reason" },
+      ],
+      rows
+    );
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getOwnerDigestPreview = async (req, res) => {
+  try {
+    const metrics = await buildDigestMetrics(req.branchId);
+    res.json(metrics);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.sendOwnerDigest = async (req, res) => {
+  try {
+    const result = await sendOwnerDigestForBranch(req.branchId);
+    res.json({ message: "Owner digest sent", ...result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+};
+
+exports.runOwnerDigestCron = async (req, res) => {
+  try {
+    const token = String(req.headers["x-automation-token"] || req.query?.token || "").trim();
+    const expected = String(process.env.OWNER_DIGEST_AUTOMATION_TOKEN || "").trim();
+    if (!expected) return res.status(503).json({ error: "OWNER_DIGEST_AUTOMATION_TOKEN is not configured" });
+    if (!token || token !== expected) return res.status(401).json({ error: "Invalid automation token" });
+    const branchIdRaw = Number(req.query?.branchId || req.body?.branchId || 0);
+    const hourRaw = req.query?.hour != null ? Number(req.query.hour) : null;
+    const result = await runOwnerDigestCron({
+      branchId: branchIdRaw > 0 ? branchIdRaw : null,
+      hour: Number.isFinite(hourRaw) ? hourRaw : null,
+    });
+    res.json({ message: "Owner digest cron completed", ...result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};

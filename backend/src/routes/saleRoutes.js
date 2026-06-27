@@ -5,6 +5,7 @@ const {
   checkout,
   saleReturn,
   getRecentSales,
+  getPosTopProducts,
   getTodaySummary,
   getTodaySettlement,
   exportTodaySettlementMethodCSV,
@@ -39,6 +40,7 @@ const { requireAuth, requirePermission } = require("../middleware/auth");
 router.post("/checkout", requireAuth, requirePermission("sale.create"), checkout);
 router.post("/:id/return", requireAuth, requirePermission("sale.return"), saleReturn);
 router.get("/recent", requireAuth, requirePermission("sale.view"), getRecentSales);
+router.get("/pos/top-products", requireAuth, requirePermission("sale.create"), getPosTopProducts);
 router.get("/lookup/by-invoice", requireAuth, requirePermission("sale.view"), getSaleByInvoiceLookup);
 router.get("/customer/recent-sales", requireAuth, requirePermission("sale.view"), getCustomerRecentSales);
 router.get("/summary/today", requireAuth, requirePermission("sale.view"), getTodaySummary);

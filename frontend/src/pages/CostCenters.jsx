@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
-import { notifySuccess } from "../utils/notify";
+import { notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 const emptyForm = { code: "", name: "", isActive: true };
 const thisMonth = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
@@ -18,6 +21,14 @@ export default function CostCenters() {
     };
   }, []);
   const tt = useMemo(() => (key, params) => t(uiLang, key, params), [uiLang]);
+  const { hasPermission } = usePermissions();
+  const canManageCostCenters = hasPermission("costcenter.manage");
+
+  const requireCostCenterManage = () => {
+    if (canManageCostCenters) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "costcenter.manage" }));
+    return false;
+  };
 
   const [rows, setRows] = useState([]);
   const [summary, setSummary] = useState([]);
@@ -88,6 +99,7 @@ export default function CostCenters() {
 
   const create = async (e) => {
     e.preventDefault();
+    if (!requireCostCenterManage()) return;
     await api.post("/cost-centers", {
       code: form.code,
       name: form.name,
@@ -99,6 +111,7 @@ export default function CostCenters() {
   };
 
   const toggleActive = async (row) => {
+    if (!requireCostCenterManage()) return;
     await api.patch(`/cost-centers/${row.id}`, {
       isActive: !row.isActive,
     });
@@ -108,6 +121,7 @@ export default function CostCenters() {
 
   const saveBudget = async (e) => {
     e.preventDefault();
+    if (!requireCostCenterManage()) return;
     await api.post("/cost-centers/budgets", {
       costCenterId: Number(budgetForm.costCenterId),
       periodKey,
@@ -157,6 +171,8 @@ export default function CostCenters() {
         </div>
       </div>
 
+      <PermissionBanner show={!canManageCostCenters} code="costcenter.manage" tt={tt} />
+
       <form onSubmit={create} className="form-grid" style={{ marginBottom: 14 }}>
         <label>
           {tt("colCode")}
@@ -175,7 +191,7 @@ export default function CostCenters() {
           {tt("statusActive")}
         </label>
         <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="submit">{tt("ccCreateCostCenter")}</button>
+          <button type="submit" disabled={!canManageCostCenters}>{tt("ccCreateCostCenter")}</button>
         </div>
       </form>
 
@@ -196,7 +212,7 @@ export default function CostCenters() {
               <td>{r.name}</td>
               <td>{r.isActive ? tt("statusActive") : tt("statusInactive")}</td>
               <td>
-                <button type="button" className="btn-secondary btn-sm" onClick={() => toggleActive(r)}>
+                <button type="button" className="btn-secondary btn-sm" disabled={!canManageCostCenters} onClick={() => toggleActive(r)}>
                   {r.isActive ? tt("invDeactivate") : tt("invActivate")}
                 </button>
               </td>
@@ -299,21 +315,15 @@ export default function CostCenters() {
       <form onSubmit={saveBudget} className="form-grid" style={{ marginBottom: 12 }}>
         <label>
           {tt("expCostCenter")}
-          <select
+          <SearchSelect
             className="form-select-sm"
-            required
             value={budgetForm.costCenterId}
-            onChange={(e) => setBudgetForm((p) => ({ ...p, costCenterId: e.target.value }))}
-          >
-            <option value="">{tt("ccSelect")}</option>
-            {rows
+            onChange={(val) => setBudgetForm((p) => ({ ...p, costCenterId: val }))}
+            placeholder={tt("ccSelect")}
+            options={rows
               .filter((r) => r.isActive)
-              .map((r) => (
-                <option key={r.id} value={r.id}>
-                  {r.code} - {r.name}
-                </option>
-              ))}
-          </select>
+              .map((r) => ({ value: r.id, label: `${r.code} - ${r.name}` }))}
+          />
         </label>
         <label>
           {tt("ccExpenseBudget")}
@@ -340,7 +350,7 @@ export default function CostCenters() {
           <input value={budgetForm.note} onChange={(e) => setBudgetForm((p) => ({ ...p, note: e.target.value }))} />
         </label>
         <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="submit">{tt("ccSaveBudget")}</button>
+          <button type="submit" disabled={!canManageCostCenters}>{tt("ccSaveBudget")}</button>
         </div>
       </form>
 

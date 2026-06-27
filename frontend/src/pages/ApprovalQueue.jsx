@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
+import SearchSelect from "../components/SearchSelect";
 
 const APPROVAL_FOCUS_KEY = "bd_pos_approval_focus_id";
 
@@ -99,28 +100,38 @@ function ApprovalQueue() {
         />
         <input type="date" value={filters.from} onChange={(e) => setFilters((p) => ({ ...p, from: e.target.value }))} />
         <input type="date" value={filters.to} onChange={(e) => setFilters((p) => ({ ...p, to: e.target.value }))} />
-        <select className="form-select-sm" value={filters.action} onChange={(e) => setFilters((p) => ({ ...p, action: e.target.value }))}>
-          <option value="">All Actions</option>
-          <option value="APPROVAL_DISCOUNT">Discount Approval</option>
-          <option value="APPROVAL_REDEMPTION">Redemption Approval</option>
-          <option value="APPROVAL_RETURN">Return Approval</option>
-          <option value="APPROVAL_STOCK_COUNT">Stock Count Approval</option>
-          <option value="APPROVAL_STOCK_ADJUSTMENT">Stock Write-off Approval</option>
-          <option value="APPROVAL_VENDOR_BILL">Vendor Bill Approval</option>
-          <option value="APPROVAL_PETTY_CASH_CLAIM">Petty Cash Claim Approval</option>
-          <option value="APPROVAL_HOLD_DISCARD">Held Cart Discard (other cashier)</option>
-          <option value="APPROVAL_HOLD_RESUME">Held Cart Resume (other cashier)</option>
-          <option value="APPROVAL_CREDIT_LIMIT">Credit limit override</option>
-          <option value="APPROVAL_FINANCIAL_PERIOD_REOPEN">Fiscal period reopen</option>
-          <option value="APPROVAL_MANUAL_JOURNAL_HIGH_VALUE">High-value manual journal</option>
-        </select>
-        <select className="form-select-sm" value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
-          <option value="">All Status</option>
-          <option value="APPROVED">Approved</option>
-          <option value="REJECTED">Rejected</option>
-          <option value="PENDING">Pending</option>
-          <option value="REVIEWED">Reviewed</option>
-        </select>
+        <SearchSelect
+          className="form-select-sm"
+          value={filters.action}
+          onChange={(val) => setFilters((p) => ({ ...p, action: val }))}
+          placeholder="All Actions"
+          options={[
+            { value: "APPROVAL_DISCOUNT", label: "Discount Approval" },
+            { value: "APPROVAL_REDEMPTION", label: "Redemption Approval" },
+            { value: "APPROVAL_RETURN", label: "Return Approval" },
+            { value: "APPROVAL_STOCK_COUNT", label: "Stock Count Approval" },
+            { value: "APPROVAL_STOCK_ADJUSTMENT", label: "Stock Write-off Approval" },
+            { value: "APPROVAL_VENDOR_BILL", label: "Vendor Bill Approval" },
+            { value: "APPROVAL_PETTY_CASH_CLAIM", label: "Petty Cash Claim Approval" },
+            { value: "APPROVAL_HOLD_DISCARD", label: "Held Cart Discard (other cashier)" },
+            { value: "APPROVAL_HOLD_RESUME", label: "Held Cart Resume (other cashier)" },
+            { value: "APPROVAL_CREDIT_LIMIT", label: "Credit limit override" },
+            { value: "APPROVAL_FINANCIAL_PERIOD_REOPEN", label: "Fiscal period reopen" },
+            { value: "APPROVAL_MANUAL_JOURNAL_HIGH_VALUE", label: "High-value manual journal" },
+          ]}
+        />
+        <SearchSelect
+          className="form-select-sm"
+          value={filters.status}
+          onChange={(val) => setFilters((p) => ({ ...p, status: val }))}
+          placeholder="All Status"
+          options={[
+            { value: "APPROVED", label: "Approved" },
+            { value: "REJECTED", label: "Rejected" },
+            { value: "PENDING", label: "Pending" },
+            { value: "REVIEWED", label: "Reviewed" },
+          ]}
+        />
         <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
           <input
             type="checkbox"

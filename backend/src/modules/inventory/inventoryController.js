@@ -1,4 +1,7 @@
 const prisma = require("../../utils/prisma");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
+const { formatProductStock } = require("../../utils/saleUnitFormat");
+const { getLatestLandedCostByProduct } = require("../../utils/costingUtil");
 const { writeAuditLog } = require("../../utils/audit");
 const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const PDFDocument = require("pdfkit");
@@ -81,29 +84,6 @@ function calcMarginPct(sellingPrice, unitCost) {
   const cost = Number(unitCost || 0);
   if (!(selling > 0)) return 0;
   return ((selling - cost) / selling) * 100;
-}
-
-async function getLatestLandedCostByProduct(branchId) {
-  const logs = await prisma.auditLog.findMany({
-    where: { action: "PURCHASE_CREATE", entity: "Purchase" },
-    orderBy: { createdAt: "desc" },
-    take: 5000,
-  });
-  const map = new Map();
-  for (const log of logs) {
-    const payload = log.payload || {};
-    if (Number(payload.branchId || 0) !== Number(branchId)) continue;
-    const lines = Array.isArray(payload?.landedCostAllocation?.lines) ? payload.landedCostAllocation.lines : [];
-    for (const line of lines) {
-      const productId = Number(line?.productId || 0);
-      if (!productId || map.has(productId)) continue;
-      map.set(productId, {
-        baseUnitCost: Number(line?.baseUnitCost || 0),
-        landedUnitCost: Number(line?.landedUnitCost || 0),
-      });
-    }
-  }
-  return map;
 }
 
 async function getReasonMap(tx, branchId) {
@@ -291,10 +271,38 @@ async function getStockCountSessions(req) {
 exports.getStockLedger = async (req, res) => {
   try {
     const branchId = req.branchId;
+    const lq = parseListQuery(req, {
+      searchableFields: ["refType"],
+      relationSearch: {
+        productName: { relation: "product", field: "name" },
+        warehouseName: { relation: "warehouse", field: "name" },
+      },
+      filterableFields: ["refType"],
+      sortableFields: ["id", "inQty", "outQty", "createdAt"],
+      defaultSort: "createdAt",
+      defaultSortDir: "desc",
+    });
+    const where = { branchId };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    if (lq.paged) {
+      const [items, total] = await prisma.$transaction([
+        prisma.stockLedger.findMany({
+          where,
+          include: { product: true, warehouse: true },
+          orderBy: lq.orderBy,
+          skip: lq.skip,
+          take: lq.take,
+        }),
+        prisma.stockLedger.count({ where }),
+      ]);
+      return res.json(pagedResult({ data: items, total, page: lq.page, pageSize: lq.pageSize }));
+    }
+
     const items = await prisma.stockLedger.findMany({
-      where: { branchId },
+      where,
       include: { product: true, warehouse: true },
-      orderBy: { createdAt: "desc" },
+      orderBy: lq.orderBy || { createdAt: "desc" },
       take: 200,
     });
     res.json(items);
@@ -999,7 +1007,7 @@ exports.getLowStockAlerts = async (req, res) => {
         return {
           ...p,
           kind: p.sellByWeight ? "WEIGHT" : "SIMPLE",
-          stockDisplay: p.sellByWeight ? `${Number(stock).toFixed(3)} kg` : stock,
+          stockDisplay: formatProductStock(p),
           status,
           shortageQty,
           severityScore: reorderLevel > 0 ? shortageQty / reorderLevel : 0,
@@ -2044,6 +2052,7 @@ exports.createInventoryBatch = async (req, res) => {
   try {
     const branchId = req.branchId;
     const productId = Number(req.body?.productId);
+    const productVariantId = Number(req.body?.productVariantId || 0) || null;
     const batchCode = String(req.body?.batchCode || "").trim();
     const qtyOnHand = Math.max(0, Math.floor(Number(req.body?.qtyOnHand || 0)));
     const unitCost = Number(req.body?.unitCost || 0);
@@ -2052,14 +2061,21 @@ exports.createInventoryBatch = async (req, res) => {
     if (Number.isNaN(productId) || !productId) return res.status(400).json({ error: "Invalid productId" });
     if (!batchCode) return res.status(400).json({ error: "Batch code is required" });
     if (!Number.isFinite(unitCost) || unitCost < 0) return res.status(400).json({ error: "Invalid unit cost" });
-    const product = await prisma.product.findFirst({ where: { id: productId, branchId }, select: { id: true, price: true } });
+    const product = await prisma.product.findFirst({
+      where: { id: productId, branchId },
+      select: { id: true, price: true, hasVariants: true, batchTracked: true },
+    });
     if (!product) return res.status(404).json({ error: "Product not found in branch" });
+    if (product.hasVariants && !productVariantId) {
+      return res.status(400).json({ error: "productVariantId required for variant products" });
+    }
 
     const created = await prisma.$transaction(async (tx) => {
       const batch = await tx.inventoryBatch.create({
         data: {
           branchId,
           productId,
+          productVariantId,
           batchCode,
           expiryDate,
           qtyOnHand,
@@ -2072,10 +2088,17 @@ exports.createInventoryBatch = async (req, res) => {
         action: "INVENTORY_BATCH_DB_CREATE",
         entity: "InventoryBatch",
         entityId: batch.id,
-        payload: { branchId, productId, batchCode, qtyOnHand },
+        payload: { branchId, productId, productVariantId, batchCode, qtyOnHand },
       });
       if (qtyOnHand > 0) {
-        await tx.product.update({ where: { id: product.id }, data: { stock: { increment: qtyOnHand } } });
+        if (productVariantId) {
+          await tx.productVariant.update({
+            where: { id: productVariantId },
+            data: { stock: { increment: qtyOnHand } },
+          });
+        } else {
+          await tx.product.update({ where: { id: product.id }, data: { stock: { increment: qtyOnHand } } });
+        }
         await tx.stockLedger.create({
           data: {
             branchId,
@@ -2208,6 +2231,102 @@ exports.updateInventoryBatchQty = async (req, res) => {
   } catch (error) {
     if (respondFiscalBlocked(res, error)) return;
     res.status(500).json({ error: error.message });
+  }
+};
+
+exports.writeOffExpiredBatch = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const id = Number(req.params.id);
+    const note = String(req.body?.note || "Expired batch spoilage").trim();
+    const managerApprovalPin = String(req.body?.managerApprovalPin || "");
+    if (Number.isNaN(id)) return res.status(400).json({ error: "Invalid batch id" });
+
+    const tableRow = await prisma.inventoryBatch.findFirst({ where: { id, branchId } });
+    if (!tableRow) return res.status(404).json({ error: "Batch not found" });
+
+    const qty = Math.floor(Number(tableRow.qtyOnHand || 0));
+    if (qty <= 0) return res.status(400).json({ error: "Batch has no quantity to write off" });
+
+    const product = await prisma.product.findFirst({
+      where: { id: tableRow.productId, branchId },
+      select: { id: true, name: true, price: true, stock: true },
+    });
+    if (!product) return res.status(404).json({ error: "Product not found" });
+    if (Number(product.stock || 0) < qty) {
+      return res.status(400).json({ error: "Product stock is lower than batch quantity" });
+    }
+
+    await ensureOpenFiscalPeriod(branchId, new Date());
+
+    await prisma.$transaction(async (tx) => {
+      const reasonMap = await getReasonMap(tx, branchId);
+      const reasonRule = reasonMap.get("EXPIRED") || null;
+      const unitPrice = Number(tableRow.unitCost || product.price || 0);
+      if (
+        reasonRule &&
+        requiresWriteOffApproval({ reasonRule, qty: -qty, unitPrice }) &&
+        managerApprovalPin !== getManagerPin()
+      ) {
+        const error = new Error("Manager approval PIN required for high-value write-off");
+        error.httpStatus = 403;
+        throw error;
+      }
+
+      await tx.inventoryBatch.update({
+        where: { id: tableRow.id },
+        data: { qtyOnHand: 0, status: "DEPLETED" },
+      });
+      await tx.product.update({
+        where: { id: product.id },
+        data: { stock: { decrement: qty } },
+      });
+      const adjustment = await tx.stockAdjustment.create({
+        data: {
+          branchId,
+          productId: product.id,
+          qtyChange: -qty,
+          reason: note || reasonRule?.label || "Expired batch spoilage",
+          reasonCode: reasonRule?.code || "EXPIRED",
+        },
+      });
+      if (reasonRule) {
+        const journalId = await upsertAdjustmentJournal(tx, {
+          adjustmentId: adjustment.id,
+          branchId,
+          qty: -qty,
+          unitPrice,
+          productName: product.name,
+          reason: reasonRule,
+        });
+        if (journalId) {
+          await tx.stockAdjustment.update({ where: { id: adjustment.id }, data: { journalId } });
+        }
+      }
+      await tx.stockLedger.create({
+        data: {
+          branchId,
+          productId: product.id,
+          refType: "BATCH_SPOILAGE",
+          refId: tableRow.id,
+          inQty: 0,
+          outQty: qty,
+          unitCost: unitPrice,
+        },
+      });
+    });
+
+    await writeAuditLog({
+      userId: req.user?.id || null,
+      action: "INVENTORY_BATCH_SPOILAGE",
+      entity: "InventoryBatch",
+      entityId: id,
+      payload: { qty, note, batchCode: tableRow.batchCode },
+    });
+    res.json({ message: "Expired batch written off", qty });
+  } catch (error) {
+    if (respondFiscalBlocked(res, error)) return;
+    res.status(error.httpStatus || 400).json({ error: error.message });
   }
 };
 
@@ -2453,6 +2572,155 @@ exports.getReorderSuggestions = async (req, res) => {
     });
   } catch (error) {
     if (respondFiscalBlocked(res, error)) return;
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getPosExpiryWarnings = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const productIds = String(req.query.productIds || "")
+      .split(",")
+      .map((x) => Number(x.trim()))
+      .filter((x) => x > 0);
+    const days = Math.max(1, Number(req.query.days || 7));
+    if (!productIds.length) {
+      return res.json({ warnings: [], params: { days } });
+    }
+
+    const batches = await prisma.inventoryBatch.findMany({
+      where: {
+        branchId,
+        productId: { in: productIds },
+        qtyOnHand: { gt: 0 },
+        expiryDate: { not: null },
+      },
+      include: { product: { select: { id: true, name: true } } },
+      orderBy: [{ expiryDate: "asc" }],
+    });
+
+    const now = Date.now();
+    const nowDate = new Date();
+    const byProduct = new Map();
+    for (const batch of batches) {
+      const daysToExpiry = Math.ceil(
+        (new Date(batch.expiryDate).getTime() - now) / (24 * 60 * 60 * 1000)
+      );
+      if (daysToExpiry > days) continue;
+      const pid = Number(batch.productId);
+      const prev = byProduct.get(pid);
+      if (prev && Number(prev.daysToExpiry) <= daysToExpiry) continue;
+      const isExpired = daysToExpiry < 0;
+      const suggestedMarkdownPct = isExpired ? 50 : daysToExpiry <= 3 ? 30 : daysToExpiry <= 7 ? 20 : 10;
+      byProduct.set(pid, {
+        productId: pid,
+        productName: batch.product?.name || `Product #${pid}`,
+        batchCode: batch.batchCode,
+        expiryDate: batch.expiryDate,
+        daysToExpiry,
+        isExpired,
+        severity: isExpired ? "expired" : daysToExpiry <= 3 ? "critical" : "warning",
+        suggestedMarkdownPct,
+        activeMarkdownPct: 0,
+      });
+    }
+
+    if (byProduct.size) {
+      const promoRows = await prisma.promotionRule.findMany({
+        where: {
+          branchId,
+          isActive: true,
+          type: "PRODUCT_PERCENT",
+          productId: { in: [...byProduct.keys()] },
+        },
+        select: { productId: true, discountValue: true, startsAt: true, endsAt: true },
+      });
+      for (const promo of promoRows) {
+        if (promo.startsAt && new Date(promo.startsAt) > nowDate) continue;
+        if (promo.endsAt && new Date(promo.endsAt) < nowDate) continue;
+        const pid = Number(promo.productId || 0);
+        const row = byProduct.get(pid);
+        if (!row) continue;
+        row.activeMarkdownPct = Math.max(
+          Number(row.activeMarkdownPct || 0),
+          Number(promo.discountValue || 0)
+        );
+      }
+    }
+
+    res.json({ warnings: [...byProduct.values()], params: { days } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getBatchTraceability = async (req, res) => {
+  try {
+    const branchId = req.branchId;
+    const batchId = Number(req.query.batchId || 0);
+    const batchCode = String(req.query.batchCode || "").trim();
+    const productId = Number(req.query.productId || 0);
+
+    let batch = null;
+    if (batchId > 0) {
+      batch = await prisma.inventoryBatch.findFirst({
+        where: { id: batchId, branchId },
+        include: { product: true, productVariant: true },
+      });
+    } else if (batchCode && productId > 0) {
+      batch = await prisma.inventoryBatch.findFirst({
+        where: { branchId, productId, batchCode },
+        include: { product: true, productVariant: true },
+      });
+    }
+    if (!batch) {
+      return res.status(404).json({ error: "Batch not found" });
+    }
+
+    const saleLinks = await prisma.saleItemBatch.findMany({
+      where: { batchId: batch.id },
+      include: {
+        saleItem: {
+          include: {
+            sale: {
+              select: {
+                id: true,
+                invoiceNo: true,
+                createdAt: true,
+                total: true,
+              },
+            },
+            product: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: { id: "desc" },
+      take: 500,
+    });
+
+    res.json({
+      batch: {
+        id: batch.id,
+        batchCode: batch.batchCode,
+        expiryDate: batch.expiryDate,
+        qtyOnHand: batch.qtyOnHand,
+        unitCost: batch.unitCost,
+        productId: batch.productId,
+        productName: batch.product?.name || null,
+        variantLabel: batch.productVariant?.label || null,
+        note: batch.note,
+      },
+      sales: saleLinks.map((link) => ({
+        saleId: link.saleItem?.sale?.id,
+        invoiceNo: link.saleItem?.sale?.invoiceNo,
+        soldAt: link.saleItem?.sale?.createdAt,
+        qty: link.qty,
+        productName: link.saleItem?.product?.name,
+        linePrice: link.saleItem?.price,
+        lineCost: link.saleItem?.cost,
+      })),
+    });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };

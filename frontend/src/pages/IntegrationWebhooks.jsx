@@ -1,9 +1,23 @@
 import { useEffect, useState } from "react";
 import api from "../services/api";
 import DataTable from "../components/DataTable";
-import { consumeGlobalSubmitError, notifySuccess, notifyError } from "../utils/notify";
+import { consumeGlobalSubmitError, notifyError, notifySuccess, notifyPermissionRequired } from "../utils/notify";
+import { getLang, t } from "../i18n";
+import usePermissions from "../hooks/usePermissions";
+import PermissionBanner from "../components/PermissionBanner";
 
 export default function IntegrationWebhooks() {
+  const lang = getLang();
+  const tt = (key, params) => t(lang, key, params);
+  const { hasPermission } = usePermissions();
+  const canManageWebhooks = hasPermission("rbac.manage");
+
+  const requireRbacManage = () => {
+    if (canManageWebhooks) return true;
+    notifyPermissionRequired(tt("permNeedCode", { code: "rbac.manage" }));
+    return false;
+  };
+
   const [rows, setRows] = useState([]);
   const [deliveries, setDeliveries] = useState([]);
   const [replayBusyId, setReplayBusyId] = useState(null);
@@ -31,6 +45,7 @@ export default function IntegrationWebhooks() {
 
   const create = async (e) => {
     e.preventDefault();
+    if (!requireRbacManage()) return;
     setBusy(true);
     try {
       const evRaw = form.events.trim();
@@ -67,6 +82,7 @@ export default function IntegrationWebhooks() {
   };
 
   const replayDelivery = async (row) => {
+    if (!requireRbacManage()) return;
     if (!row?.canReplay) return;
     setReplayBusyId(row.id);
     try {
@@ -81,12 +97,14 @@ export default function IntegrationWebhooks() {
   };
 
   const toggle = async (row) => {
+    if (!requireRbacManage()) return;
     await api.put(`/integration/webhooks/${row.id}`, { isActive: !row.isActive });
     load();
     loadDeliveries();
   };
 
   const remove = async (row) => {
+    if (!requireRbacManage()) return;
     if (!window.confirm("Remove this webhook endpoint?")) return;
     await api.delete(`/integration/webhooks/${row.id}`);
     load();
@@ -105,6 +123,8 @@ export default function IntegrationWebhooks() {
           </div>
         </div>
       </div>
+
+      <PermissionBanner show={!canManageWebhooks} code="rbac.manage" tt={tt} messageKey="permBannerManage" />
 
       <form onSubmit={create} className="form-grid page-card" style={{ maxWidth: 640, marginTop: 16 }}>
         <label>
@@ -131,7 +151,7 @@ export default function IntegrationWebhooks() {
             onChange={(e) => setForm((f) => ({ ...f, events: e.target.value }))}
           />
         </label>
-        <button type="submit" disabled={busy}>
+        <button type="submit" disabled={busy || !canManageWebhooks}>
           Add webhook
         </button>
       </form>
@@ -151,10 +171,10 @@ export default function IntegrationWebhooks() {
                   Events: {Array.isArray(r.events) ? r.events.join(", ") : JSON.stringify(r.events)}
                 </p>
                 <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
-                  <button type="button" className="btn-secondary btn-sm" onClick={() => toggle(r)}>
+                  <button type="button" className="btn-secondary btn-sm" disabled={!canManageWebhooks} onClick={() => toggle(r)}>
                     {r.isActive ? "Pause" : "Resume"}
                   </button>
-                  <button type="button" className="btn-danger btn-sm" onClick={() => remove(r)}>
+                  <button type="button" className="btn-danger btn-sm" disabled={!canManageWebhooks} onClick={() => remove(r)}>
                     Delete
                   </button>
                 </div>
@@ -222,7 +242,7 @@ export default function IntegrationWebhooks() {
                 <button
                   type="button"
                   className="btn-secondary btn-sm"
-                  disabled={!row.canReplay || replayBusyId === row.id}
+                  disabled={!row.canReplay || replayBusyId === row.id || !canManageWebhooks}
                   onClick={() => replayDelivery(row)}
                 >
                   {replayBusyId === row.id ? "…" : "Replay"}

@@ -1,11 +1,32 @@
 const prisma = require("../utils/prisma");
+const { formatSaleLineQty, getBillingUnitsForLine } = require("../utils/saleUnitFormat");
 const { dispatchBranchWebhooks } = require("../utils/webhooks");
 const { getSocketInstance } = require("../socket");
 const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../utils/fiscal");
 const { writeAuditLog } = require("../utils/audit");
 const { generateMushak63 } = require("../modules/nbr/mushak63");
+const { getPaymentSession, verifyPayment, refundPayment, isMfsMethod } = require("../modules/payments/mfsPaymentService");
+const { submitSaleToEfd } = require("../modules/efd/efdService");
 const PDFDocument = require("pdfkit");
 const XLSX = require("xlsx");
+const {
+  getLatestLandedCostByProduct,
+  resolveSaleLineUnitCost,
+  executeFefoPlan,
+} = require("../utils/costingUtil");
+const {
+  loadBranchLoyaltyBonusMap,
+  getCategoryMultiplier,
+  pointsFromLineRevenue,
+} = require("../utils/loyaltyAisleBonus");
+const { buildCustomerLoyaltyBalance } = require("../utils/loyaltyPointsExpiry");
+const { sendSms, renderSmsTemplate } = require("../utils/smsGateway");
+const { recordCreditLedgerEntry, customerHasKyc } = require("../utils/bakirKhata");
+const { validateImei } = require("../utils/imei");
+const { resolveImeiAvailability } = require("../modules/imei/imeiController");
+
+const DUE_SALE_SMS_TEMPLATE =
+  "প্রিয় {name}, {store} এ ইনভয়েস {invoice} এ ৳{due} বকেয়া রেকর্ড হয়েছে। ধন্যবাদ।";
 
 function generateInvoiceNo() {
   const now = new Date();
@@ -284,6 +305,50 @@ function pointsFromAmount(amount) {
   return Math.floor(Number(amount || 0) / 100) * pointsPer100;
 }
 
+async function computeEarnedPointsFromSaleItems(tx, branchId, customerId, bonusMap) {
+  const sales = await tx.sale.findMany({
+    where: { branchId, customerId },
+    select: { id: true },
+  });
+  if (!sales.length) return 0;
+  const { pointsPer100 } = getLoyaltyConfig();
+  const items = await tx.saleItem.findMany({
+    where: { saleId: { in: sales.map((s) => s.id) } },
+    select: {
+      qty: true,
+      weightKg: true,
+      price: true,
+      product: { select: { category: true } },
+    },
+  });
+  let points = 0;
+  for (const item of items) {
+    const bill =
+      Number(item.weightKg || 0) > 1e-9 ? Number(item.weightKg || 0) : Number(item.qty || 0);
+    const revenue = bill * Number(item.price || 0);
+    const mult = getCategoryMultiplier(bonusMap, item.product?.category);
+    points += pointsFromLineRevenue(revenue, pointsPer100, mult);
+  }
+  return Math.floor(points);
+}
+
+function computeCartEarnedPoints(cart, productMap, bonusMap) {
+  const { pointsPer100 } = getLoyaltyConfig();
+  let points = 0;
+  for (const item of cart || []) {
+    const prod = productMap.get(Number(item.id));
+    const bill =
+      Number(item.weightKg || 0) > 1e-9
+        ? Number(item.weightKg || 0)
+        : Number(item.qty || item.quantity || 0);
+    const price = Number(item.price || prod?.price || 0);
+    const revenue = bill * price;
+    const mult = getCategoryMultiplier(bonusMap, prod?.category || item.category);
+    points += pointsFromLineRevenue(revenue, pointsPer100, mult);
+  }
+  return Math.floor(points);
+}
+
 function getPointValueInCurrency() {
   return Number(process.env.LOYALTY_BDT_PER_POINT || 1);
 }
@@ -308,23 +373,20 @@ function parseRedeemedPointsFromNotes(notes) {
 async function buildCustomerLoyalty(tx, branchId, customerId) {
   const customer = await tx.customer.findFirst({ where: { id: customerId, branchId } });
   if (!customer) return null;
-  const sales = await tx.sale.findMany({
-    where: { branchId, customerId },
-    select: { total: true, notes: true },
-  });
-  const totalSpent = sales.reduce((sum, row) => sum + Number(row.total || 0), 0);
-  const earnedPoints = pointsFromAmount(totalSpent);
-  const redeemedPoints = sales.reduce((sum, row) => sum + parseRedeemedPointsFromNotes(row.notes), 0);
-  const points = Math.max(0, earnedPoints - redeemedPoints);
+  const balance = await buildCustomerLoyaltyBalance(tx, branchId, customerId);
   return {
     customerId,
     customerName: customer.name,
-    totalSpent,
-    points,
-    earnedPoints,
-    redeemedPoints,
-    tier: getTierFromPoints(points),
-    orders: sales.length,
+    totalSpent: balance.totalSpent,
+    points: balance.availablePoints,
+    earnedPoints: balance.earnedPoints,
+    redeemedPoints: balance.redeemedPoints,
+    expiredPoints: balance.expiredPoints,
+    expiringSoonPoints: balance.expiringSoonPoints,
+    pointsExpiryDays: balance.pointsExpiryDays,
+    tier: getTierFromPoints(balance.earnedPoints),
+    orders: balance.orders,
+    aisleBonusActive: balance.aisleBonusActive,
   };
 }
 
@@ -398,6 +460,17 @@ function sanitizeSaleNotesPayload(notesPayload = {}, maxLen = getSaleNotesMaxLen
             couponCodeId: Number(notesPayload.coupon.couponCodeId || 0),
             code: String(notesPayload.coupon.code || "").slice(0, 32),
             discount: Number(notesPayload.coupon.discount || 0),
+          }
+        : undefined,
+    restaurant:
+      notesPayload?.restaurant && typeof notesPayload.restaurant === "object"
+        ? {
+            serviceMode: String(notesPayload.restaurant.serviceMode || "").slice(0, 16),
+            tableId:
+              notesPayload.restaurant.tableId != null ? Number(notesPayload.restaurant.tableId) : null,
+            tableName: notesPayload.restaurant.tableName
+              ? String(notesPayload.restaurant.tableName).slice(0, 64)
+              : null,
           }
         : undefined,
   };
@@ -475,18 +548,26 @@ function buildVatBreakdownSnapshot(cart, productMap, overrideMap, variantMap) {
     const bill = getCartLineBillingUnits(item, p);
     const lineNet = netUnit * bill;
     const rate = Number(p.vatRate || 0);
-    const lineVat = (lineNet * rate) / 100;
+    const sdRate = Number(p.sdRate || 0);
+    const lineSd = (lineNet * sdRate) / 100;
+    const lineVat = ((lineNet + lineSd) * rate) / 100;
     rows.push({
       productId: p.id,
       name: displayName,
       nameBn: p.nameBn || null,
       hsCode: p.hsCode || null,
-      unit: p.unitOfMeasure || (p.sellByWeight ? "KG" : "PCS"),
+      unit:
+        (item.saleUnit && String(item.saleUnit).trim()) ||
+        p.saleUnit ||
+        p.unitOfMeasure ||
+        (p.sellByWeight ? "KG" : "PCS"),
       qty: bill,
       sellByWeight: Boolean(p.sellByWeight),
       weightKg: p.sellByWeight ? Number(item.weightKg || bill) : null,
       variantId: vid || null,
       netAmount: Math.round(lineNet * 100) / 100,
+      sdRate,
+      sdAmount: Math.round(lineSd * 100) / 100,
       vatRate: rate,
       vatAmount: Math.round(lineVat * 100) / 100,
     });
@@ -494,63 +575,12 @@ function buildVatBreakdownSnapshot(cart, productMap, overrideMap, variantMap) {
   return rows;
 }
 
-async function allocateFefoBatchesForSale(tx, branchId, saleItems, productMap, cartLines) {
-  const allocations = [];
-  const lines = Array.isArray(cartLines) ? cartLines : [];
-  for (let i = 0; i < (saleItems || []).length; i += 1) {
-    const saleItem = saleItems[i];
-    const cartHint = lines[i];
-    const prod = productMap.get(Number(saleItem.productId));
-    if (!prod || !prod.batchTracked) continue;
-    if (
-      prod.hasVariants ||
-      prod.sellByWeight ||
-      Number(cartHint?.variantId || 0) > 0 ||
-      Number(cartHint?.weightKg ?? 0) > 1e-9
-    ) {
-      continue;
-    }
-    let qtyNeeded = Number(saleItem.qty || 0);
-    if (!Number.isFinite(qtyNeeded) || qtyNeeded <= 0) continue;
-    qtyNeeded = Math.ceil(qtyNeeded - 1e-9);
-    const batches = await tx.inventoryBatch.findMany({
-      where: { branchId, productId: saleItem.productId, qtyOnHand: { gt: 0 } },
-      orderBy: [{ expiryDate: "asc" }, { id: "asc" }],
-    });
-    for (const b of batches) {
-      if (qtyNeeded <= 0) break;
-      const onHand = Number(b.qtyOnHand || 0);
-      if (onHand <= 0) continue;
-      const consumeQty = Math.min(qtyNeeded, onHand);
-      const nextQty = onHand - consumeQty;
-      await tx.inventoryBatch.update({
-        where: { id: b.id },
-        data: { qtyOnHand: nextQty },
-      });
-      allocations.push({
-        saleItemId: saleItem.id,
-        batchId: b.id,
-        productId: saleItem.productId,
-        productName: prod.name || `Product#${saleItem.productId}`,
-        batchCode: b.batchCode,
-        expiryDate: b.expiryDate,
-        consumeQty,
-        unitCost: Number(b.unitCost || prod.price || 0),
-      });
-      qtyNeeded -= consumeQty;
-    }
-    if (qtyNeeded > 0) {
-      const productName = prod.name || `Product#${saleItem.productId}`;
-      throw new Error(
-        `Batch stock mismatch for ${productName}. FEFO allocation missing ${qtyNeeded}. Add batch stock or disable batch tracking.`
-      );
-    }
-  }
-  return allocations;
+function isDigitalMethod(method) {
+  return ["BKASH", "NAGAD", "ROCKET", "UPAY", "CARD"].includes(String(method || "").toUpperCase());
 }
 
-function isDigitalMethod(method) {
-  return ["BKASH", "NAGAD", "ROCKET", "CARD"].includes(String(method || "").toUpperCase());
+function isCodMethod(method) {
+  return String(method || "").toUpperCase() === "COD";
 }
 
 function isPromotionActiveNow(rule, now = new Date()) {
@@ -722,6 +752,54 @@ function computePromotionDiscount({ activePromotions, cart, productMap, override
       for (let i = 0; i < bundleCount; i += 1) {
         const start = i * bundleSize;
         const regular = categoryItems.slice(start, start + bundleSize).reduce((sum, x) => sum + Number(x || 0), 0);
+        if (regular > bundlePrice) {
+          amount += regular - bundlePrice;
+        }
+      }
+      if (amount <= 0) continue;
+      discount += amount;
+      applied.push({
+        ruleId: rule.id,
+        type: rule.type,
+        name: rule.name,
+        amount,
+        bundleCount,
+        bundleSize,
+      });
+    }
+
+    if (rule.type === "MIX_MATCH_FIXED") {
+      const bundleSize = Math.max(2, Number(rule.buyQty || 2));
+      const bundlePrice = Number(rule.bundlePrice || rule.discountValue || 0);
+      const eligibleIds = new Set(
+        String(rule.bundleProductIds || "")
+          .split(",")
+          .map((x) => Number(x.trim()))
+          .filter((x) => !Number.isNaN(x) && x > 0)
+      );
+      if (eligibleIds.size < 2 || bundlePrice <= 0) continue;
+      const unitPrices = [];
+      for (let ci = 0; ci < (cart || []).length; ci += 1) {
+        const item = cart[ci];
+        const pid = Number(item.id);
+        if (!eligibleIds.has(pid)) continue;
+        const dbProduct = productMap.get(pid);
+        if (!dbProduct) continue;
+        const unit = Number((overrideMap.get(ci)?.appliedUnitPrice ?? dbProduct.price) || 0);
+        const bill = getCartLineBillingUnits(item, dbProduct);
+        const wholeSlots = Math.max(0, Math.floor(Number(bill) + 1e-9));
+        for (let i = 0; i < wholeSlots; i += 1) {
+          unitPrices.push(unit);
+        }
+      }
+      if (unitPrices.length < bundleSize) continue;
+      unitPrices.sort((a, b) => b - a);
+      const bundleCount = Math.floor(unitPrices.length / bundleSize);
+      if (bundleCount <= 0) continue;
+      let amount = 0;
+      for (let i = 0; i < bundleCount; i += 1) {
+        const start = i * bundleSize;
+        const regular = unitPrices.slice(start, start + bundleSize).reduce((sum, x) => sum + Number(x || 0), 0);
         if (regular > bundlePrice) {
           amount += regular - bundlePrice;
         }
@@ -1080,7 +1158,26 @@ exports.checkout = async (req, res) => {
       giftCardRedemptions: giftCardRedemptionsRaw,
       walletRedeemAmount: walletRedeemAmountRaw,
       couponCode: couponCodeRaw,
+      prescriptionId: prescriptionIdRaw,
+      mfsPaymentId: mfsPaymentIdRaw,
+      fulfillmentType: fulfillmentTypeRaw,
+      deliveryFee: deliveryFeeRaw,
+      deliveryAddress: deliveryAddressRaw,
+      deliveryDistrict: deliveryDistrictRaw,
+      deliveryArea: deliveryAreaRaw,
+      deliveryLandmark: deliveryLandmarkRaw,
+      courierName: courierNameRaw,
+      trackingId: trackingIdRaw,
+      orderSource: orderSourceRaw,
+      pendingOrderId: pendingOrderIdRaw,
+      restaurantServiceMode: restaurantServiceModeRaw,
+      restaurantTableId: restaurantTableIdRaw,
+      restaurantTableName: restaurantTableNameRaw,
     } = req.body;
+    const prescriptionId =
+      prescriptionIdRaw != null && prescriptionIdRaw !== ""
+        ? Number(prescriptionIdRaw)
+        : null;
     const holdCartAuditLogId =
       holdCartAuditLogIdRaw != null && holdCartAuditLogIdRaw !== ""
         ? Number(holdCartAuditLogIdRaw)
@@ -1120,6 +1217,64 @@ exports.checkout = async (req, res) => {
           })
         : [];
     const variantMap = new Map(dbVariants.map((v) => [v.id, v]));
+
+    const requiresKycProduct = [...productMap.values()].some((p) => p.requiresKyc);
+    if (requiresKycProduct) {
+      const custPhone = customer?.phone ? String(customer.phone).trim() : "";
+      const custId = customer?.id ? Number(customer.id) : null;
+      let custRow = null;
+      if (custId && !Number.isNaN(custId)) {
+        custRow = await prisma.customer.findFirst({ where: { id: custId, branchId } });
+      } else if (custPhone) {
+        custRow = await prisma.customer.findFirst({ where: { phone: custPhone, branchId } });
+      }
+      const noteNid = String(buyerBinOrNidNoteRaw || "").trim();
+      if (!custRow || !customerHasKyc(custRow)) {
+        if (noteNid.length < 10) {
+          return res.status(400).json({
+            error:
+              "NID or birth certificate KYC required for SIM/financial products. Capture KYC on the customer profile or enter buyer NID on checkout.",
+          });
+        }
+      }
+    }
+
+    const serialsInCart = new Set();
+    for (const item of cart) {
+      const dbProduct = productMap.get(Number(item.id));
+      const unitTracked = dbProduct?.trackSerial || dbProduct?.trackImei;
+      if (!unitTracked) continue;
+      const serial = String(item.serialNumber || "").trim();
+      if (!serial) {
+        return res.status(400).json({ error: `Serial/IMEI is required for ${dbProduct.name}` });
+      }
+      if (Number(item.qty || 1) !== 1) {
+        return res.status(400).json({ error: `Serial-tracked products must be sold one unit at a time (${dbProduct.name})` });
+      }
+      if (serialsInCart.has(serial)) {
+        return res.status(400).json({ error: `Duplicate serial/IMEI in cart: ${serial}` });
+      }
+      serialsInCart.add(serial);
+      // IMEI-tracked handsets must carry a structurally valid (Luhn) IMEI and
+      // must not already be sold/blocked in the IMEI registry.
+      if (dbProduct.trackImei) {
+        const v = validateImei(serial);
+        if (!v.ok) {
+          return res.status(400).json({ error: `Invalid IMEI for ${dbProduct.name}: ${serial}` });
+        }
+        const availability = await resolveImeiAvailability(branchId, v.normalized);
+        if (!availability.available) {
+          return res.status(400).json({
+            error: availability.reason === "blocked" ? `IMEI is blocked: ${v.normalized}` : `IMEI already sold: ${v.normalized}`,
+          });
+        }
+      }
+      const sold = await prisma.saleItem.findFirst({
+        where: { serialNumber: serial, sale: { branchId } },
+        select: { id: true },
+      });
+      if (sold) return res.status(400).json({ error: `Serial/IMEI already sold: ${serial}` });
+    }
 
     for (const item of cart) {
       const dbProduct = productMap.get(Number(item.id));
@@ -1206,6 +1361,7 @@ exports.checkout = async (req, res) => {
       return sum + perUnit * bill;
     }, 0);
     const subTotal = Math.max(0, grossSubTotal - predefinedDiscount);
+    let sdAmountRaw = 0;
     const vatAmount = cart.reduce((sum, item, idx) => {
       const dbProduct = productMap.get(Number(item.id));
       if (!dbProduct) return sum;
@@ -1214,8 +1370,13 @@ exports.checkout = async (req, res) => {
       const bill = getCartLineBillingUnits(item, dbProduct);
       const perUnitDiscount = Math.min(unit, getPerUnitPredefinedDiscount(dbProduct));
       const netUnitPrice = Math.max(0, unit - perUnitDiscount);
-      return sum + (netUnitPrice * bill * Number(dbProduct.vatRate || 0)) / 100;
+      const lineNet = netUnitPrice * bill;
+      // SD (Supplementary Duty) is charged on the value, then VAT applies on (value + SD).
+      const lineSd = (lineNet * Number(dbProduct.sdRate || 0)) / 100;
+      sdAmountRaw += lineSd;
+      return sum + ((lineNet + lineSd) * Number(dbProduct.vatRate || 0)) / 100;
     }, 0);
+    const sdAmount = Math.round(sdAmountRaw * 100) / 100;
     const manualDiscountType = discountType || (discount ? "AMOUNT" : "AMOUNT");
     if (!["PERCENT", "AMOUNT"].includes(manualDiscountType)) {
       return res.status(400).json({ error: "Discount type must be PERCENT or AMOUNT" });
@@ -1311,6 +1472,10 @@ exports.checkout = async (req, res) => {
     let customerLoyaltyContext = null;
     const customerName = String(customer?.name || "").trim();
     const customerPhone = String(customer?.phone || "").trim();
+    const customerDistrict = String(customer?.district || "").trim();
+    const customerArea = String(customer?.area || "").trim();
+    const customerLandmark = String(customer?.landmark || "").trim();
+    const customerBuyerBin = String(customer?.buyerBin || "").trim();
     const hasCustomerIdentity = Boolean(customerName || customerPhone);
     let existingCustomerForLoyalty = null;
     if (hasCustomerIdentity) {
@@ -1431,12 +1596,63 @@ exports.checkout = async (req, res) => {
         promotionSummary.amount +
         couponDiscountAmount
     );
-    const total = Math.max(0, subTotal + vatAmount - discountAmount);
+    const total = Math.max(0, subTotal + sdAmount + vatAmount - discountAmount);
+    const fulfillmentRaw = String(fulfillmentTypeRaw || "PICKUP").toUpperCase();
+    const fulfillmentType = ["DELIVERY", "DINE_IN", "TAKEAWAY"].includes(fulfillmentRaw)
+      ? fulfillmentRaw
+      : "PICKUP";
+    const deliveryFee =
+      fulfillmentType === "DELIVERY" ? Math.max(0, Number(deliveryFeeRaw || 0)) : 0;
+    const totalWithDelivery = Math.max(0, total + deliveryFee);
+    const deliveryAddress =
+      fulfillmentType === "DELIVERY" && deliveryAddressRaw
+        ? String(deliveryAddressRaw).trim().slice(0, 500)
+        : null;
+    const deliveryDistrict =
+      fulfillmentType === "DELIVERY" && deliveryDistrictRaw
+        ? String(deliveryDistrictRaw).trim().slice(0, 191)
+        : null;
+    const deliveryArea =
+      fulfillmentType === "DELIVERY" && deliveryAreaRaw
+        ? String(deliveryAreaRaw).trim().slice(0, 191)
+        : null;
+    const deliveryLandmark =
+      fulfillmentType === "DELIVERY" && deliveryLandmarkRaw
+        ? String(deliveryLandmarkRaw).trim().slice(0, 191)
+        : null;
+    const courierName = courierNameRaw ? String(courierNameRaw).trim().slice(0, 191) : null;
+    const trackingId = trackingIdRaw ? String(trackingIdRaw).trim().slice(0, 191) : null;
+    const orderSource = orderSourceRaw ? String(orderSourceRaw).trim().slice(0, 32) : null;
+    const restaurantTableId =
+      restaurantTableIdRaw != null && restaurantTableIdRaw !== ""
+        ? Number(restaurantTableIdRaw)
+        : null;
+    const restaurantMeta =
+      orderSource === "RESTAURANT" || restaurantServiceModeRaw
+        ? {
+            serviceMode: String(restaurantServiceModeRaw || fulfillmentType || "TAKEAWAY")
+              .trim()
+              .slice(0, 16),
+            tableId: restaurantTableId && !Number.isNaN(restaurantTableId) ? restaurantTableId : null,
+            tableName: restaurantTableNameRaw
+              ? String(restaurantTableNameRaw).trim().slice(0, 64)
+              : null,
+          }
+        : null;
+    const pendingOrderId =
+      pendingOrderIdRaw != null && pendingOrderIdRaw !== "" ? Number(pendingOrderIdRaw) : null;
     const splitPayments = normalizePaymentBreakdown(paymentBreakdown);
     const splitPaidAmount = splitPayments.reduce((sum, line) => sum + line.amount, 0);
     const hasSplitPayments = splitPayments.length > 0;
     const normalizedMethod = String(paymentMethod || "Cash");
-    if (!hasSplitPayments && isDigitalMethod(normalizedMethod) && !String(paymentChannel || "").trim()) {
+    const isCodSale = !hasSplitPayments && isCodMethod(normalizedMethod);
+    if (isCodSale && String(fulfillmentType || "").toUpperCase() !== "DELIVERY") {
+      return res.status(400).json({ error: "COD payment requires delivery fulfillment" });
+    }
+    if (isCodSale && !String(customerName || "").trim()) {
+      return res.status(400).json({ error: "Customer name is required for COD delivery" });
+    }
+    if (!hasSplitPayments && !isCodSale && isDigitalMethod(normalizedMethod) && !String(paymentChannel || "").trim()) {
       return res.status(400).json({ error: `Transaction/reference ID is required for ${normalizedMethod} payment` });
     }
     if (hasSplitPayments) {
@@ -1449,13 +1665,46 @@ exports.checkout = async (req, res) => {
         });
       }
     }
+
+    const mfsPaymentId = String(mfsPaymentIdRaw || "").trim();
+    if (mfsPaymentId) {
+      const mfsSession = await getPaymentSession(mfsPaymentId);
+      if (!mfsSession || Number(mfsSession.branchId) !== Number(branchId)) {
+        return res.status(400).json({ error: "MFS payment session not found or expired" });
+      }
+      if (mfsSession.status !== "VERIFIED") {
+        const trxForVerify = String(paymentChannel || "").trim();
+        if (!trxForVerify) {
+          return res.status(400).json({ error: "Verify MFS payment before checkout (TrxID required)" });
+        }
+        try {
+          await verifyPayment({ paymentId: mfsPaymentId, trxId: trxForVerify });
+        } catch (mfsErr) {
+          return res.status(400).json({ error: mfsErr.message || "MFS payment verification failed" });
+        }
+      } else if (
+        String(paymentChannel || "").trim() &&
+        mfsSession.trxId &&
+        String(paymentChannel).trim().toUpperCase() !== String(mfsSession.trxId).toUpperCase()
+      ) {
+        return res.status(400).json({ error: "TrxID does not match verified MFS payment session" });
+      }
+      if (Math.abs(Number(mfsSession.amount) - Number(totalWithDelivery)) > 0.05) {
+        return res.status(400).json({ error: "MFS verified amount does not match sale total" });
+      }
+      if (!hasSplitPayments && isMfsMethod(normalizedMethod) && mfsSession.method !== normalizedMethod) {
+        return res.status(400).json({ error: `MFS session method (${mfsSession.method}) does not match payment method` });
+      }
+    }
     const giftCardRedemptions = normalizeGiftCardRedemptions(giftCardRedemptionsRaw);
     const walletRedeemRequest = Math.max(0, Number(walletRedeemAmountRaw || 0));
     if (walletRedeemRequest > 0 && !hasCustomerIdentity) {
       return res.status(400).json({ error: "Customer identity is required for wallet redemption" });
     }
-    const buyerBinOrNidNote = String(buyerBinOrNidNoteRaw || "").trim().slice(0, 120) || null;
+    const buyerBinOrNidNote =
+      String(buyerBinOrNidNoteRaw || customerBuyerBin || "").trim().slice(0, 120) || null;
     const vatRowsForSnapshot = buildVatBreakdownSnapshot(cart, productMap, overrideMap, variantMap);
+    const landedByProduct = await getLatestLandedCostByProduct(branchId);
 
     let resultSale = null;
     let loyaltySnapshot = null;
@@ -1472,10 +1721,27 @@ exports.checkout = async (req, res) => {
               branchId,
               name: customerName,
               phone: customerPhone || null,
+              district: customerDistrict || null,
+              area: customerArea || null,
+              landmark: customerLandmark || null,
+              buyerBin: customerBuyerBin || null,
               balance: 0,
               storedValueBalance: 0,
             },
           });
+        } else if (existingCustomer) {
+          const patch = {};
+          if (customerDistrict) patch.district = customerDistrict;
+          if (customerArea) patch.area = customerArea;
+          if (customerLandmark) patch.landmark = customerLandmark;
+          if (customerBuyerBin) patch.buyerBin = customerBuyerBin;
+          if (Object.keys(patch).length) {
+            try {
+              await tx.customer.update({ where: { id: existingCustomer.id }, data: patch });
+            } catch (e) {
+              if (e.code !== "P2022") throw e;
+            }
+          }
         }
         customerId = existingCustomer?.id || null;
       }
@@ -1483,7 +1749,7 @@ exports.checkout = async (req, res) => {
         throw new Error("Customer record required for wallet redemption");
       }
 
-      let billRemain = total;
+      let billRemain = totalWithDelivery;
       const appliedGifts = [];
       for (const g of giftCardRedemptions) {
         const card = await tx.giftCard.findFirst({
@@ -1527,7 +1793,8 @@ exports.checkout = async (req, res) => {
       }
 
       const internalOwed = Math.max(0, billRemain);
-      const internalCashPaid = hasSplitPayments ? splitPaidAmount : Number(paidAmount ?? internalOwed);
+      let internalCashPaid = hasSplitPayments ? splitPaidAmount : Number(paidAmount ?? internalOwed);
+      if (isCodSale) internalCashPaid = 0;
       if (internalCashPaid < 0) throw new Error("Paid amount cannot be negative");
       if (hasSplitPayments && splitPaidAmount > internalOwed + 0.01) {
         throw new Error("Total split payment cannot exceed amount owed after gift/wallet");
@@ -1627,6 +1894,12 @@ exports.checkout = async (req, res) => {
       const giftTotal = appliedGifts.reduce((sum, g) => sum + g.amount, 0);
       const salePaidAmountTotal = internalCashPaid + giftTotal + walletTake;
 
+      const aisleBonusMap = await loadBranchLoyaltyBonusMap(tx, branchId);
+      const pointsEarnedThisSale =
+        customerId || customerName
+          ? computeCartEarnedPoints(cart, productMap, aisleBonusMap)
+          : 0;
+
       const notesPayload = {
         freeText: notes ? String(notes) : "",
         paymentBreakdown: splitPayments,
@@ -1636,6 +1909,8 @@ exports.checkout = async (req, res) => {
           tierDiscountAmount,
           redeemedPoints: requestedRedeemPoints,
           redeemedAmount: redeemDiscountAmount,
+          pointsEarnedThisSale,
+          aisleBonusActive: Object.keys(aisleBonusMap).length > 0,
         },
         promotions: {
           discountAmount: promotionSummary.amount,
@@ -1656,19 +1931,59 @@ exports.checkout = async (req, res) => {
               discount: couponDiscountAmount,
             }
           : undefined,
+        ...(restaurantMeta ? { restaurant: restaurantMeta } : {}),
       };
       const serializedSaleNotes = sanitizeSaleNotesPayload(notesPayload);
       const mushakDocumentNo = await nextMushakDocumentNo(tx, branchId);
+
+      if (prescriptionId != null && !Number.isNaN(prescriptionId)) {
+        const rx = await tx.prescription.findFirst({
+          where: { id: prescriptionId, branchId, status: { in: ["OPEN", "PARTIAL"] } },
+        });
+        if (!rx) {
+          throw new Error("Prescription not found or not open for dispensing");
+        }
+      }
+
+      const branchCosting = await tx.branch.findUnique({
+        where: { id: branchId },
+        select: { costingMethod: true },
+      });
+      // Dispensing expired (already past expiry) batch stock is blocked unless a
+      // manager approves via PIN. The same anti-fraud PIN gates the override.
+      const wantsExpiredOverride =
+        req.body?.allowExpiredBatches === true || req.body?.dispenseExpiredStock === true;
+      const expiredOverrideApproved =
+        wantsExpiredOverride && String(managerApprovalPin || "") === getManagerApprovalPin();
+
+      const lineCostPlans = [];
+      for (const item of cart) {
+        const prod = productMap.get(Number(item.id));
+        const bill = getCartLineBillingUnits(item, prod);
+        const resolved = await resolveSaleLineUnitCost(tx, {
+          branchId,
+          product: prod,
+          cartItem: item,
+          billingUnits: bill,
+          costingMethod: branchCosting?.costingMethod,
+          landedByProduct,
+          allowExpired: expiredOverrideApproved,
+        });
+        lineCostPlans.push({ ...resolved, billingUnits: bill });
+      }
 
       resultSale = await tx.sale.create({
         data: {
           branchId,
           cashierId: req.user?.id || null,
           invoiceNo: generateInvoiceNo(),
+          prescriptionId:
+            prescriptionId != null && !Number.isNaN(prescriptionId) ? prescriptionId : null,
           subTotal,
           vatAmount,
+          sdAmount,
           discount: discountAmount,
-          total,
+          total: totalWithDelivery,
           paidAmount: salePaidAmountTotal,
           dueAmount,
           paymentMethod: hasSplitPayments ? "Split" : paymentMethod || "Cash",
@@ -1680,6 +1995,19 @@ exports.checkout = async (req, res) => {
           vatBreakdownSnapshot: vatRowsForSnapshot,
           couponCodeId: couponRowPre ? couponRowPre.id : null,
           couponDiscount: couponDiscountAmount,
+          fulfillmentType,
+          deliveryFee,
+          deliveryAddress,
+          deliveryDistrict,
+          deliveryArea,
+          deliveryLandmark,
+          courierName,
+          trackingId,
+          orderSource,
+          pendingOrderId:
+            pendingOrderId != null && !Number.isNaN(pendingOrderId) ? pendingOrderId : null,
+          codStatus: isCodSale ? "PENDING" : null,
+          codExpectedAmount: isCodSale ? totalWithDelivery : 0,
           items: {
             create: cart.map((item, idx) => {
               const prod = productMap.get(Number(item.id));
@@ -1688,19 +2016,222 @@ exports.checkout = async (req, res) => {
               const weightKgVal = prod?.sellByWeight
                 ? Math.max(0, Number(item.weightKg ?? getCartLineBillingUnits(item, prod)))
                 : null;
+              const saleUnitRaw = item.saleUnit != null ? String(item.saleUnit).trim() : "";
+              const serialNumber = item.serialNumber ? String(item.serialNumber).trim().slice(0, 64) : null;
+              const warrantyDays = Number(prod?.warrantyDays || 0);
+              const warrantyUntil =
+                serialNumber && warrantyDays > 0
+                  ? new Date(Date.now() + warrantyDays * 24 * 60 * 60 * 1000)
+                  : null;
+              const lineSdRate = Number(prod?.sdRate || 0);
+              const lineUnit = Number(row?.appliedUnitPrice ?? prod.price);
+              const lineBill = getCartLineBillingUnits(item, prod);
+              const linePerUnitDisc = Math.min(lineUnit, getPerUnitPredefinedDiscount(prod));
+              const lineNetAmt = Math.max(0, lineUnit - linePerUnitDisc) * lineBill;
+              const lineSdAmt = Math.round(((lineNetAmt * lineSdRate) / 100) * 100) / 100;
               return {
                 productId: Number(item.id),
                 productVariantId: vidCreate,
                 qty: Number(item.qty ?? 1),
                 weightKg: weightKgVal,
+                saleUnit: saleUnitRaw || prod.saleUnit || prod.unitOfMeasure || null,
                 price: Number(row?.appliedUnitPrice ?? prod.price),
-                cost: Number(prod.price),
+                cost: Number(lineCostPlans[idx]?.unitCost ?? prod.unitPrice ?? 0),
+                sdRate: lineSdRate,
+                sdAmount: lineSdAmt,
+                serialNumber,
+                warrantyUntil,
               };
             }),
           },
         },
         include: { items: true, customer: true },
       });
+
+      // Register sold IMEIs into the handset registry (mark SOLD, link the sale).
+      for (const soldItem of resultSale.items) {
+        const prodForImei = productMap.get(Number(soldItem.productId));
+        if (!prodForImei?.trackImei) continue;
+        const imei = String(soldItem.serialNumber || "").trim();
+        if (!imei) continue;
+        await tx.imeiRecord.upsert({
+          where: { branchId_imei: { branchId, imei } },
+          create: {
+            branchId,
+            imei,
+            productId: soldItem.productId,
+            status: "SOLD",
+            saleId: resultSale.id,
+            saleItemId: soldItem.id,
+            customerId: customerId || null,
+            soldAt: new Date(),
+            createdById: req.user?.id || null,
+          },
+          update: {
+            status: "SOLD",
+            productId: soldItem.productId,
+            saleId: resultSale.id,
+            saleItemId: soldItem.id,
+            customerId: customerId || null,
+            soldAt: new Date(),
+          },
+        });
+      }
+
+      if (dueAmount > 0 && customerId) {
+        const custAfter = await tx.customer.findUnique({ where: { id: customerId } });
+        await recordCreditLedgerEntry(tx, {
+          branchId,
+          customerId,
+          entryType: "SALE_CREDIT",
+          amount: dueAmount,
+          balanceAfter: Number(custAfter?.balance || 0),
+          saleId: resultSale.id,
+          note: `Invoice ${resultSale.invoiceNo}`,
+          createdById: req.user?.id || null,
+        });
+      }
+
+      if (pendingOrderId != null && !Number.isNaN(pendingOrderId)) {
+        await tx.pendingOrder.updateMany({
+          where: {
+            id: pendingOrderId,
+            branchId,
+            status: { in: ["PENDING", "LOADED"] },
+          },
+          data: { status: "COMPLETED", saleId: resultSale.id },
+        });
+      }
+
+      if (restaurantMeta?.tableId) {
+        // Link this table's open KOTs to the bill and close them out.
+        await tx.kitchenTicket.updateMany({
+          where: {
+            branchId,
+            tableId: restaurantMeta.tableId,
+            status: { in: ["OPEN", "PREPARING", "READY"] },
+            saleId: null,
+          },
+          data: { status: "SERVED", saleId: resultSale.id },
+        });
+        await tx.restaurantTable.updateMany({
+          where: { id: restaurantMeta.tableId, branchId },
+          data: { status: "FREE" },
+        });
+      }
+
+      if (restaurantMeta) {
+        // Cook-to-order: restaurant sales of recipe-backed items consume raw
+        // ingredients. The finished item's stock is restored (net zero) because
+        // it was produced on demand, not taken from pre-made stock.
+        const mfgQtyByProduct = new Map();
+        for (const item of cart) {
+          const prod = productMap.get(Number(item.id));
+          if (!prod?.isManufactured || prod.sellByWeight) continue;
+          const qty = Number(item.qty ?? 1);
+          if (qty > 0) {
+            mfgQtyByProduct.set(prod.id, (mfgQtyByProduct.get(prod.id) || 0) + qty);
+          }
+        }
+        if (mfgQtyByProduct.size) {
+          const recipes = await tx.manufacturingRecipe.findMany({
+            where: {
+              branchId,
+              isActive: true,
+              finishedProductId: { in: [...mfgQtyByProduct.keys()] },
+            },
+            include: {
+              lines: {
+                include: {
+                  rawProduct: {
+                    select: { id: true, name: true, sellByWeight: true, unitPrice: true },
+                  },
+                },
+              },
+            },
+          });
+          for (const recipe of recipes) {
+            const soldQty = mfgQtyByProduct.get(recipe.finishedProductId) || 0;
+            if (!soldQty || !recipe.lines.length) continue;
+            const batches = soldQty / (Number(recipe.yieldQty) || 1);
+            const consumption = [];
+            let materialCost = 0;
+            for (const line of recipe.lines) {
+              const raw = line.rawProduct;
+              const needQty = Number(line.qtyRequired) * batches;
+              if (needQty <= 0) continue;
+              const rawUnitCost = Number(raw.unitPrice || 0);
+              if (raw.sellByWeight) {
+                await tx.product.update({
+                  where: { id: raw.id },
+                  data: { stockKg: { decrement: needQty } },
+                });
+                await tx.stockLedger.create({
+                  data: {
+                    branchId,
+                    productId: raw.id,
+                    refType: "SALE_PRODUCTION",
+                    refId: resultSale.id,
+                    outQty: 0,
+                    outWeightKg: needQty,
+                    unitCost: rawUnitCost,
+                  },
+                });
+              } else {
+                const needInt = Math.ceil(needQty - 1e-9);
+                await tx.product.update({
+                  where: { id: raw.id },
+                  data: { stock: { decrement: needInt } },
+                });
+                await tx.stockLedger.create({
+                  data: {
+                    branchId,
+                    productId: raw.id,
+                    refType: "SALE_PRODUCTION",
+                    refId: resultSale.id,
+                    outQty: needInt,
+                    unitCost: rawUnitCost,
+                  },
+                });
+              }
+              materialCost += needQty * rawUnitCost;
+              consumption.push({
+                rawProductId: raw.id,
+                name: raw.name,
+                qty: Number(needQty.toFixed(4)),
+                unitCost: rawUnitCost,
+              });
+            }
+            await tx.product.update({
+              where: { id: recipe.finishedProductId },
+              data: { stock: { increment: soldQty } },
+            });
+            await tx.stockLedger.create({
+              data: {
+                branchId,
+                productId: recipe.finishedProductId,
+                refType: "SALE_PRODUCTION",
+                refId: resultSale.id,
+                inQty: soldQty,
+                unitCost: soldQty > 0 ? Number((materialCost / soldQty).toFixed(4)) : 0,
+              },
+            });
+            await tx.productionOrder.create({
+              data: {
+                branchId,
+                recipeId: recipe.id,
+                productionNo: `AUTO-${resultSale.invoiceNo}-${recipe.id}`,
+                batchCount: Number(batches.toFixed(4)),
+                finishedQty: soldQty,
+                status: "COMPLETED",
+                consumptionJson: JSON.stringify(consumption),
+                notes: `Auto cook-to-order · invoice ${resultSale.invoiceNo}`,
+                createdById: req.user?.id || null,
+              },
+            });
+          }
+        }
+      }
 
       if (couponRowPre) {
         const refreshedCoupon = await tx.couponCode.findFirst({
@@ -1728,7 +2259,10 @@ exports.checkout = async (req, res) => {
             method: String(line.method || "Cash"),
             channel: line.channel || null,
             amount: line.amount,
-            meta: {},
+            meta:
+              isMfsMethod(line.method) && mfsPaymentId
+                ? { mfsPaymentId, trxId: line.channel || null }
+                : {},
           });
         }
       } else {
@@ -1737,7 +2271,10 @@ exports.checkout = async (req, res) => {
           method: normalizedMethod,
           channel: paymentChannel || null,
           amount: internalCashPaid,
-          meta: {},
+          meta:
+            isMfsMethod(normalizedMethod) && mfsPaymentId
+              ? { mfsPaymentId, trxId: paymentChannel || null }
+              : {},
         });
       }
       for (const g of appliedGifts) {
@@ -1786,7 +2323,19 @@ exports.checkout = async (req, res) => {
         });
       }
 
-      const fefoAllocations = await allocateFefoBatchesForSale(tx, branchId, resultSale.items, productMap, cart);
+      const fefoAllocations = [];
+      for (let fi = 0; fi < resultSale.items.length; fi += 1) {
+        const plan = lineCostPlans[fi]?.fefoPlan;
+        if (!plan) continue;
+        const saleItem = resultSale.items[fi];
+        const prod = productMap.get(Number(saleItem.productId));
+        const allocs = await executeFefoPlan(tx, plan, {
+          saleItemId: saleItem.id,
+          productId: saleItem.productId,
+          productName: prod?.name || `Product#${saleItem.productId}`,
+        });
+        fefoAllocations.push(...allocs);
+      }
       for (const alloc of fefoAllocations) {
         await tx.saleItemBatch.create({
           data: {
@@ -1802,7 +2351,7 @@ exports.checkout = async (req, res) => {
             refType: "SALE_BATCH",
             refId: resultSale.id,
             outQty: Number(alloc.consumeQty || 0),
-            unitCost: Number(alloc.unitCost || productMap.get(Number(alloc.productId))?.price || 0),
+            unitCost: Number(alloc.unitCost || 0),
           },
         });
       }
@@ -1811,7 +2360,8 @@ exports.checkout = async (req, res) => {
         const item = cart[li];
         const dbProduct = productMap.get(Number(item.id));
         const vidLine = Number(item.variantId || 0) || null;
-        const unitCostBase = Number(dbProduct.price);
+        const unitCostBase = Number(lineCostPlans[li]?.unitCost ?? dbProduct.unitPrice ?? 0);
+        const skipSaleLedger = Boolean(lineCostPlans[li]?.fefoPlan);
 
         if (vidLine) {
           const dec = Math.max(1, Math.ceil(Number(item.qty ?? 1) - 1e-9));
@@ -1819,16 +2369,18 @@ exports.checkout = async (req, res) => {
             where: { id: vidLine },
             data: { stock: { decrement: dec } },
           });
-          await tx.stockLedger.create({
-            data: {
-              branchId,
-              productId: Number(item.id),
-              refType: "SALE",
-              refId: resultSale.id,
-              outQty: dec,
-              unitCost: unitCostBase,
-            },
-          });
+          if (!skipSaleLedger) {
+            await tx.stockLedger.create({
+              data: {
+                branchId,
+                productId: Number(item.id),
+                refType: "SALE",
+                refId: resultSale.id,
+                outQty: dec,
+                unitCost: unitCostBase,
+              },
+            });
+          }
           continue;
         }
 
@@ -1857,16 +2409,18 @@ exports.checkout = async (req, res) => {
           where: { id: Number(item.id) },
           data: { stock: { decrement: decQty } },
         });
-        await tx.stockLedger.create({
-          data: {
-            branchId,
-            productId: Number(item.id),
-            refType: "SALE",
-            refId: resultSale.id,
-            outQty: decQty,
-            unitCost: unitCostBase,
-          },
-        });
+        if (!skipSaleLedger) {
+          await tx.stockLedger.create({
+            data: {
+              branchId,
+              productId: Number(item.id),
+              refType: "SALE",
+              refId: resultSale.id,
+              outQty: decQty,
+              unitCost: unitCostBase,
+            },
+          });
+        }
       }
 
       if (fefoAllocations.length) {
@@ -1890,6 +2444,49 @@ exports.checkout = async (req, res) => {
         });
       }
 
+      if (prescriptionId != null && !Number.isNaN(prescriptionId)) {
+        // Partial dispense / refill tracking: increment dispensedQty per line by
+        // the quantity actually sold in this checkout, then derive the status
+        // (DISPENSED when every line is fully dispensed, otherwise PARTIAL).
+        const rxLines = await tx.prescriptionLine.findMany({ where: { prescriptionId } });
+        const soldMap = new Map();
+        for (const item of cart) {
+          const key = `${Number(item.id)}|${Number(item.variantId || 0)}`;
+          soldMap.set(key, (soldMap.get(key) || 0) + Number(item.qty || 0));
+        }
+        let allFull = true;
+        let anyDispensed = false;
+        for (const rl of rxLines) {
+          const key = `${rl.productId}|${Number(rl.productVariantId || 0)}`;
+          const soldForLine = soldMap.get(key) || 0;
+          const prevDispensed = Number(rl.dispensedQty || 0);
+          if (soldForLine > 0) {
+            const newDispensed = Math.min(Number(rl.qty || 0), prevDispensed + soldForLine);
+            if (newDispensed !== prevDispensed) {
+              anyDispensed = true;
+              await tx.prescriptionLine.update({
+                where: { id: rl.id },
+                data: { dispensedQty: newDispensed },
+              });
+            }
+            if (newDispensed < Number(rl.qty || 0)) allFull = false;
+          } else if (prevDispensed < Number(rl.qty || 0)) {
+            allFull = false;
+          }
+        }
+        const newStatus = allFull ? "DISPENSED" : anyDispensed ? "PARTIAL" : "OPEN";
+        await tx.prescription.update({
+          where: { id: prescriptionId },
+          data: {
+            status: newStatus,
+            saleId: resultSale.id,
+            ...(newStatus === "DISPENSED"
+              ? { dispensedAt: new Date(), dispensedById: req.user?.id || null }
+              : {}),
+          },
+        });
+      }
+
       const accounts = await tx.account.findMany({ where: { branchId } });
       const map = new Map(accounts.map((a) => [a.code, a]));
       const cash = map.get("1100");
@@ -1898,11 +2495,10 @@ exports.checkout = async (req, res) => {
       const cogs = map.get("5100");
       const inventory = map.get("1300");
       if (cash && receivable && revenue && cogs && inventory) {
-        const cogsAmount = cart.reduce((sum, item) => {
-          const prodLine = productMap.get(Number(item.id));
-          const billLine = prodLine ? getCartLineBillingUnits(item, prodLine) : 0;
-          return sum + Number(prodLine?.price || 0) * billLine;
-        }, 0);
+        const cogsAmount = lineCostPlans.reduce(
+          (sum, lc) => sum + Number(lc.unitCost || 0) * Number(lc.billingUnits || 0),
+          0
+        );
         await tx.journal.create({
           data: {
             branchId,
@@ -2027,8 +2623,62 @@ exports.checkout = async (req, res) => {
       req.log?.warn?.({ err: mushakErr, saleId: resultSale.id }, "Mushak 6.3 emission failed");
     }
 
+    try {
+      const branchRow = await prisma.branch.findUnique({ where: { id: branchId } });
+      if (branchRow && saleOut) {
+        const efdResult = await submitSaleToEfd({ sale: saleOut, branch: branchRow });
+        if (efdResult.ok) {
+          await prisma.sale.update({
+            where: { id: saleOut.id },
+            data: {
+              efdFiscalInvoiceNo: efdResult.fiscalInvoiceNo || null,
+              efdQrPayload: efdResult.qrPayload || null,
+              efdVerificationUrl: efdResult.verificationUrl || null,
+              efdSubmittedAt: new Date(),
+              efdProvider: efdResult.provider || null,
+            },
+          });
+          saleOut.efdFiscalInvoiceNo = efdResult.fiscalInvoiceNo;
+          saleOut.efdQrPayload = efdResult.qrPayload;
+          saleOut.efdVerificationUrl = efdResult.verificationUrl;
+          saleOut.efdSubmittedAt = new Date();
+          saleOut.efdProvider = efdResult.provider;
+        }
+      }
+    } catch (efdErr) {
+      req.log?.warn?.({ err: efdErr, saleId: resultSale.id }, "EFD submission failed");
+    }
+
+    if (loyaltySnapshot && saleOut?.notes) {
+      try {
+        const notesPayload = JSON.parse(saleOut.notes);
+        loyaltySnapshot.pointsEarnedThisSale = Number(notesPayload?.loyalty?.pointsEarnedThisSale || 0);
+        loyaltySnapshot.aisleBonusActive = Boolean(notesPayload?.loyalty?.aisleBonusActive);
+      } catch {
+        loyaltySnapshot.pointsEarnedThisSale = 0;
+      }
+    }
+
     res.json({ message: "Sale completed", sale: saleOut, loyalty: loyaltySnapshot });
     process.nextTick(() => {
+      const dueAmt = Number(saleOut?.dueAmount || 0);
+      const phone = String(saleOut?.customer?.phone || "").trim();
+      if (dueAmt > 0 && phone) {
+        prisma.branch
+          .findUnique({ where: { id: branchId }, select: { name: true } })
+          .then((branchRow) =>
+            sendSms({
+              to: phone,
+              message: renderSmsTemplate(DUE_SALE_SMS_TEMPLATE, {
+                name: saleOut.customer?.name || "গ্রাহক",
+                store: branchRow?.name || "আমাদের দোকান",
+                invoice: saleOut.invoiceNo || String(saleOut.id),
+                due: dueAmt.toFixed(2),
+              }),
+            })
+          )
+          .catch(() => {});
+      }
       dispatchBranchWebhooks({
         prisma,
         branchId,
@@ -3013,7 +3663,14 @@ exports.saleReturn = async (req, res) => {
         returnRows.push({ productId: Number(item.productId), qty, amount: lineAmount });
         await tx.product.update({ where: { id: Number(item.productId) }, data: { stock: { increment: qty } } });
         await tx.stockLedger.create({
-          data: { branchId, productId: Number(item.productId), refType: "SALE_RETURN", refId: saleId, inQty: qty, unitCost: original.price },
+          data: {
+            branchId,
+            productId: Number(item.productId),
+            refType: "SALE_RETURN",
+            refId: saleId,
+            inQty: qty,
+            unitCost: Number(original.cost ?? original.price ?? 0),
+          },
         });
       }
 
@@ -3022,14 +3679,45 @@ exports.saleReturn = async (req, res) => {
       });
       return saleReturn;
     });
+    // Attempt MFS refund (bKash/Nagad/aggregator) for the refunded amount when the
+    // original sale was paid via a persisted MFS session. Defaults on; pass
+    // refundMfs:false to record the return without refunding the wallet.
+    let mfsRefund = null;
+    const wantRefund = req.body?.refundMfs !== false;
+    if (wantRefund && Number(created?.amount) > 0) {
+      const mfsPay = await prisma.salePayment.findFirst({
+        where: { saleId, method: { in: ["bKash", "Nagad", "Rocket", "Upay"] } },
+      });
+      const refPaymentId = mfsPay?.meta?.mfsPaymentId;
+      if (refPaymentId) {
+        try {
+          const r = await refundPayment({
+            paymentId: refPaymentId,
+            amount: created.amount,
+            reason: reason || "Sale return",
+            branchId,
+          });
+          mfsRefund = {
+            status: r.session.status,
+            refundTrxId: r.session.refundTrxId,
+            refundedAmount: r.session.refundedAmount,
+            manual: r.manual,
+            simulated: r.simulated,
+          };
+        } catch (refundErr) {
+          mfsRefund = { error: refundErr.message };
+        }
+      }
+    }
+
     await writeAuditLog({
       userId: req.user?.id || null,
       action: "SALE_RETURN_CREATE",
       entity: "SaleReturn",
       entityId: created.id,
-      payload: { saleId, amount: created.amount },
+      payload: { saleId, amount: created.amount, mfsRefund },
     });
-    res.status(201).json(created);
+    res.status(201).json({ ...created, mfsRefund });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3040,11 +3728,93 @@ exports.getRecentSales = async (req, res) => {
     const branchId = getBranchId(req);
     const sales = await prisma.sale.findMany({
       where: { branchId },
-      include: { customer: true, items: true },
+      include: {
+        customer: true,
+        items: { include: { product: { select: { sellByWeight: true } } } },
+      },
       orderBy: { createdAt: "desc" },
       take: 20,
     });
     res.json(sales);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.getPosTopProducts = async (req, res) => {
+  try {
+    const branchId = getBranchId(req);
+    const days = Math.max(1, Number(req.query.days || 30));
+    const limit = Math.min(24, Math.max(1, Number(req.query.limit || 12)));
+    const from = new Date();
+    from.setDate(from.getDate() - days);
+
+    const saleItems = await prisma.saleItem.findMany({
+      where: {
+        sale: {
+          branchId,
+          createdAt: { gte: from },
+        },
+      },
+      select: {
+        productId: true,
+        qty: true,
+        weightKg: true,
+        price: true,
+        product: {
+          select: {
+            id: true,
+            name: true,
+            category: true,
+            price: true,
+            stock: true,
+            stockKg: true,
+            sellByWeight: true,
+            hasVariants: true,
+          },
+        },
+      },
+    });
+
+    const byProduct = new Map();
+    for (const row of saleItems) {
+      const pid = Number(row.productId || 0);
+      if (!pid || !row.product) continue;
+      const bill =
+        Number(row.weightKg || 0) > 1e-9
+          ? Number(row.weightKg)
+          : Number(row.qty || 0);
+      if (!byProduct.has(pid)) {
+        byProduct.set(pid, {
+          productId: pid,
+          soldQty: 0,
+          revenue: 0,
+          product: row.product,
+        });
+      }
+      const agg = byProduct.get(pid);
+      agg.soldQty += bill;
+      agg.revenue += bill * Number(row.price || 0);
+    }
+
+    const rows = [...byProduct.values()]
+      .sort((a, b) => b.soldQty - a.soldQty)
+      .slice(0, limit)
+      .map((r) => ({
+        productId: r.productId,
+        soldQty: Number(r.soldQty.toFixed(3)),
+        revenue: Number(r.revenue.toFixed(2)),
+        name: r.product?.name || `Product #${r.productId}`,
+        category: r.product?.category || "",
+        price: Number(r.product?.price || 0),
+        stock: Number(r.product?.stock || 0),
+        stockKg: Number(r.product?.stockKg || 0),
+        sellByWeight: Boolean(r.product?.sellByWeight),
+        hasVariants: Boolean(r.product?.hasVariants),
+        saleUnit: r.product?.sellByWeight ? "KG" : "PCS",
+      }));
+
+    res.json({ days, limit, rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3124,7 +3894,10 @@ exports.getCustomerRecentSales = async (req, res) => {
             qty: true,
             price: true,
             weightKg: true,
-            product: { select: { name: true } },
+            saleUnit: true,
+            product: {
+              select: { name: true, sellByWeight: true },
+            },
             productVariant: { select: { label: true } },
           },
         },
@@ -3142,12 +3915,13 @@ exports.getCustomerRecentSales = async (req, res) => {
         const nm = String(it.product?.name || "").trim() || "Item";
         const vl = String(it.productVariant?.label || "").trim();
         const label = vl ? `${nm} (${vl})` : nm;
-        const kg = Number(it.weightKg ?? 0);
-        const billQty =
-          Number.isFinite(kg) && kg > 1e-9 ? kg : Number(it.qty || 0);
+        const billQty = getBillingUnitsForLine(it, it.product);
+        const qtyFmt = formatSaleLineQty(it, it.product);
         return {
           label,
           qty: billQty,
+          qtyDisplay: qtyFmt.display,
+          saleUnit: it.saleUnit || it.product?.saleUnit || it.product?.unitOfMeasure || null,
           unitPrice: Number(it.price || 0),
           lineTotal: billQty * Number(it.price || 0),
         };
@@ -3233,7 +4007,24 @@ exports.getSaleInvoice = async (req, res) => {
       where: { id, branchId },
       include: {
         customer: true,
-        items: { include: { product: true, productVariant: true } },
+        items: {
+          include: {
+            product: true,
+            productVariant: true,
+            batchAllocations: {
+              include: {
+                batch: {
+                  select: {
+                    id: true,
+                    batchCode: true,
+                    expiryDate: true,
+                    unitCost: true,
+                  },
+                },
+              },
+            },
+          },
+        },
         salePayments: true,
       },
     });
@@ -3296,22 +4087,25 @@ exports.getSaleMushakPdf = async (req, res) => {
       doc.text(`Customer: ${sale.customer.name}${sale.customer.phone ? ` · ${sale.customer.phone}` : ""}`);
     }
     doc.moveDown();
-    doc.text(`Subtotal: ${Number(sale.subTotal || 0).toFixed(2)}  VAT: ${Number(sale.vatAmount || 0).toFixed(2)}  Discount: ${Number(sale.discount || 0).toFixed(2)}`);
+    doc.text(`Subtotal: ${Number(sale.subTotal || 0).toFixed(2)}  SD: ${Number(sale.sdAmount || 0).toFixed(2)}  VAT: ${Number(sale.vatAmount || 0).toFixed(2)}  Discount: ${Number(sale.discount || 0).toFixed(2)}`);
     doc.text(`Total: ${Number(sale.total || 0).toFixed(2)}  Paid: ${Number(sale.paidAmount || 0).toFixed(2)}  Due: ${Number(sale.dueAmount || 0).toFixed(2)}`);
     doc.moveDown();
     const snap = sale.vatBreakdownSnapshot;
     const lines = Array.isArray(snap) ? snap : snap && typeof snap === "object" ? Object.values(snap) : [];
     if (lines.length) {
-      doc.fontSize(9).text("Line VAT breakdown");
+      doc.fontSize(9).text("Line SD & VAT breakdown");
       lines.forEach((row, idx) => {
+        const sdRate = Number(row.sdRate || 0);
+        const sdPart = sdRate > 0 ? ` | SD ${sdRate.toFixed(2)}% = ${Number(row.sdAmount || 0).toFixed(2)}` : "";
         doc.text(
-          `${idx + 1}. ${row.name || row.productId} × ${row.qty} | net ${Number(row.netAmount || 0).toFixed(2)} @ ${Number(row.vatRate || 0).toFixed(2)}% VAT = ${Number(row.vatAmount || 0).toFixed(2)}`
+          `${idx + 1}. ${row.name || row.productId} × ${row.qty} | net ${Number(row.netAmount || 0).toFixed(2)}${sdPart} @ ${Number(row.vatRate || 0).toFixed(2)}% VAT = ${Number(row.vatAmount || 0).toFixed(2)}`
         );
       });
     } else if (sale.items?.length) {
       sale.items.forEach((row, idx) => {
+        const qtyFmt = formatSaleLineQty(row, row.product);
         doc.text(
-          `${idx + 1}. ${row.product?.name || row.productId} × ${row.qty} @ ${Number(row.price || 0).toFixed(2)}`
+          `${idx + 1}. ${row.product?.name || row.productId} × ${qtyFmt.display} @ ${Number(row.price || 0).toFixed(2)}`
         );
       });
     }

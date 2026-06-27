@@ -1,6 +1,7 @@
 const prisma = require("../../utils/prisma");
 const { ensureOpenFiscalPeriod, respondFiscalBlocked } = require("../../utils/fiscal");
 const { writeAuditLog } = require("../../utils/audit");
+const { parseListQuery, pagedResult } = require("../../utils/listQuery");
 
 function parseDate(value) {
   if (!value) return null;
@@ -22,17 +23,35 @@ exports.listAssets = async (req, res) => {
   try {
     const branchId = req.branchId;
     const status = String(req.query?.status || "").trim().toUpperCase();
+    const lq = parseListQuery(req, {
+      searchableFields: ["assetCode", "name", "category"],
+      sortableFields: ["id", "name", "assetCode", "cost", "status", "createdAt"],
+      defaultSort: "id",
+      defaultSortDir: "desc",
+    });
+    const include = {
+      depreciationEntries: {
+        orderBy: { id: "desc" },
+        take: 3,
+      },
+    };
+    const where = {
+      branchId,
+      ...(status ? { status } : {}),
+    };
+    if (lq.searchClauses.length) where.AND = lq.searchClauses;
+
+    if (lq.paged) {
+      const [paged, total] = await prisma.$transaction([
+        prisma.asset.findMany({ where, include, orderBy: lq.orderBy, skip: lq.skip, take: lq.take }),
+        prisma.asset.count({ where }),
+      ]);
+      return res.json(pagedResult({ data: paged, total, page: lq.page, pageSize: lq.pageSize }));
+    }
+
     const rows = await prisma.asset.findMany({
-      where: {
-        branchId,
-        ...(status ? { status } : {}),
-      },
-      include: {
-        depreciationEntries: {
-          orderBy: { id: "desc" },
-          take: 3,
-        },
-      },
+      where,
+      include,
       orderBy: [{ status: "asc" }, { id: "desc" }],
       take: 1000,
     });

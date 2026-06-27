@@ -1,5 +1,6 @@
 import axios from "axios";
-import { notifyError } from "../utils/notify";
+import { getLang, t } from "../i18n";
+import { notifyError, notifyPermissionRequired } from "../utils/notify";
 
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:5001/api",
@@ -44,11 +45,25 @@ function shouldRedirect401OnResponse(error) {
   return !AUTH_401_NO_SESSION_REDIRECT.some((p) => url.includes(p));
 }
 
+function getForbiddenMessage(error) {
+  const data = error?.response?.data;
+  const code =
+    data?.requiredPermission ||
+    (Array.isArray(data?.requiredPermissions) ? data.requiredPermissions[0] : null);
+  const lang = getLang();
+  if (code) return t(lang, "apiForbiddenWithCode", { code: String(code) });
+  return t(lang, "apiForbidden");
+}
+
 api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (shouldRedirect401OnResponse(error)) {
       clearSessionAndReload();
+      return Promise.reject(error);
+    }
+    if (error?.response?.status === 403 && !error?.config?.skipGlobalErrorToast) {
+      notifyPermissionRequired(getForbiddenMessage(error));
       return Promise.reject(error);
     }
     const method = String(error?.config?.method || "").toLowerCase();

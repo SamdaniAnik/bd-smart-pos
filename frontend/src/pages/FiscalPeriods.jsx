@@ -3,6 +3,7 @@ import api from "../services/api";
 import { notifyActionRequired, notifySuccess } from "../utils/notify";
 import { getStoredPermissions, hasPermission } from "../utils/permissions";
 import { getLang, t } from "../i18n";
+import SearchSelect from "../components/SearchSelect";
 
 function formatDate(value) {
   if (!value) return "-";
@@ -175,11 +176,17 @@ export default function FiscalPeriods() {
         </label>
         <label>
           {tt("fpStatusFilter")}
-          <select className="form-select-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-            <option value="ALL">{tt("fpAll")}</option>
-            <option value="OPEN">{tt("fpOpenOnly")}</option>
-            <option value="CLOSED">{tt("fpClosedOnly")}</option>
-          </select>
+          <SearchSelect
+            className="form-select-sm"
+            value={statusFilter}
+            onChange={(val) => setStatusFilter(val || "ALL")}
+            options={[
+              { value: "ALL", label: tt("fpAll") },
+              { value: "OPEN", label: tt("fpOpenOnly") },
+              { value: "CLOSED", label: tt("fpClosedOnly") },
+            ]}
+            isClearable={false}
+          />
         </label>
       </div>
       {canManage ? (

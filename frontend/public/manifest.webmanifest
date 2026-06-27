@@ -1,0 +1,35 @@
+{
+  "name": "BD Smart POS",
+  "short_name": "BD POS",
+  "description": "Bangladesh-focused retail and pharmacy point of sale",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#1d4ed8",
+  "orientation": "any",
+  "lang": "bn",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Open POS",
+      "short_name": "POS",
+      "description": "Quick checkout",
+      "url": "/#pos",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "Restaurant KOT",
+      "short_name": "KOT",
+      "description": "Kitchen order tickets",
+      "url": "/#restaurant",
+      "icons": [{ "src": "/favicon.svg", "sizes": "any" }]
+    }
+  ]
+}

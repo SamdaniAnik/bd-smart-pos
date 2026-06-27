@@ -3,7 +3,7 @@ const bcrypt = require("bcrypt");
 const { writeAuditLog } = require("../../utils/audit");
 
 const roleTemplates = {
-  Cashier: ["sale.view", "sale.create", "product.view", "customer.view"],
+  Cashier: ["sale.view", "sale.create", "product.view", "customer.view", "topup.view", "topup.create", "fcommerce.view"],
   Manager: [
     "sale.view",
     "sale.create",
@@ -21,6 +21,11 @@ const roleTemplates = {
     "asset.view",
     "costcenter.view",
     "pettycash.view",
+    "topup.view",
+    "topup.create",
+    "topup.manage",
+    "fcommerce.view",
+    "fcommerce.manage",
   ],
   Accountant: [
     "accounting.view",

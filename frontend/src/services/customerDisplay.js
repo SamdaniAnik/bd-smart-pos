@@ -115,6 +115,7 @@ export function publishCustomerDisplayCleared(extra = {}) {
       subTotal: 0,
       vatAmount: 0,
       totalDiscount: 0,
+      promoSavings: 0,
       total: 0,
       paid: 0,
       due: 0,

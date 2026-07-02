@@ -21,3 +21,8 @@ cd frontend && npm install && npm run dev
 ```
 
 See [backend/README.md](./backend/README.md) for API and automation notes.
+
+## Deploy (production)
+
+- **Frontend (Vercel):** [docs/DEPLOY_VERCEL.md](./docs/DEPLOY_VERCEL.md)
+- **Backend:** host `backend/` on Railway, Render, Fly.io, or a VPS with MySQL — not Vercel serverless (Socket.IO + long-running Express).

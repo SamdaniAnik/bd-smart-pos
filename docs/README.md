@@ -3,6 +3,7 @@
 | Document | Audience | Language |
 |----------|----------|----------|
 | **[USER_GUIDE_BN.md](./USER_GUIDE_BN.md)** | Shop owners, managers, cashiers, staff | **বাংলা** |
+| **[DEPLOY_VERCEL.md](./DEPLOY_VERCEL.md)** | Developers — Vercel frontend + API hosting | English |
 | [backend/README.md](../backend/README.md) | Developers / IT setup | English |
 
 ## Quick links (বাংলা গাইড)

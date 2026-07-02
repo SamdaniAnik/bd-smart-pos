@@ -37,6 +37,18 @@ function readList(key, { defaultValue = [] } = {}) {
     .filter(Boolean);
 }
 
+/** Express `trust proxy` — accepts true/1 for PaaS (Railway, Render), not raw "true" string. */
+function parseTrustProxy(raw) {
+  if (raw === undefined || raw === "") return "loopback";
+  const v = String(raw).trim().toLowerCase();
+  if (v === "false" || v === "0" || v === "no" || v === "off") return false;
+  if (v === "true" || v === "yes" || v === "on") return 1;
+  if (v === "loopback") return "loopback";
+  const n = Number.parseInt(v, 10);
+  if (Number.isFinite(n) && String(n) === v) return n;
+  return String(raw).trim();
+}
+
 const jwtSecret = readString("JWT_SECRET", { required: isProd, defaultValue: "dev_secret_do_not_use_in_prod" });
 if (jwtSecret === "dev_secret_do_not_use_in_prod" && isProd) {
   throw new Error("[config] JWT_SECRET must be set to a strong random value in production.");
@@ -77,7 +89,7 @@ const config = Object.freeze({
   jwtExpiresIn: readString("JWT_EXPIRES_IN", { defaultValue: "24h" }),
   databaseUrl,
   allowedOrigins,
-  trustProxy: readString("TRUST_PROXY", { defaultValue: "loopback" }),
+  trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
   rateLimit: {
     loginWindowMs: readInt("RATE_LIMIT_LOGIN_WINDOW_MS", { defaultValue: 15 * 60 * 1000 }),
     loginMax: readInt("RATE_LIMIT_LOGIN_MAX", { defaultValue: 10 }),

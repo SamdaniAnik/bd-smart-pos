@@ -56,7 +56,7 @@ const io = new Server(server, {
 
 setSocketInstance(io);
 
-if (config.trustProxy) {
+if (config.trustProxy !== false) {
   app.set("trust proxy", config.trustProxy);
 }
 

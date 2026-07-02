@@ -45,12 +45,34 @@ node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 
 ### Run migrations (once)
 
-On the backend host shell:
+**Render free tier has no Shell** — either run from your Mac (below) or set **Start Command** to:
+
+```bash
+npx prisma migrate deploy && node src/server.js
+```
+
+From your machine (paste Railway `MYSQL_PUBLIC_URL`):
 
 ```bash
 cd backend
+DATABASE_URL="mysql://..." npx prisma migrate deploy
+```
+
+On the backend host shell (Railway / Render Starter):
+
+```bash
 npx prisma migrate deploy
 ```
+
+**If a migration failed** (e.g. `InventoryBatch doesn't exist`):
+
+```bash
+cd backend
+DATABASE_URL="mysql://..." npx prisma migrate resolve --rolled-back 20260517140000_pharmacy_batches_prescriptions
+DATABASE_URL="mysql://..." npx prisma migrate deploy
+```
+
+Pull latest `main` first — it includes `20260517130000_inventory_batch_foundation` which creates `InventoryBatch` before the pharmacy migration.
 
 Optional demo data:
 
